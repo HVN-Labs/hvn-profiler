@@ -23,6 +23,11 @@ use serde::Deserialize;
 pub mod zmq_source;
 pub use zmq_source::ZmqSource;
 
+#[cfg(feature = "mavlink-source")]
+pub mod mavlink_source;
+#[cfg(feature = "mavlink-source")]
+pub use mavlink_source::MavlinkSource;
+
 // ─── Sample / trait ────────────────────────────────────────────────────────
 
 /// A single flattened telemetry sample. One envelope from the streamer
@@ -50,11 +55,22 @@ pub trait Source: Send {
 /// Construct a source from a URI.
 ///
 /// Supported schemes:
-/// - `mock://`           — synthetic sine wave
-/// - `zmq://host:port`   — subscribe to a ZMQ PUB streamer
+/// - `mock://`               — synthetic sine wave
+/// - `zmq://host:port`       — subscribe to a ZMQ PUB streamer
+/// - `mavlink://host:port`   — direct MAVLink UDP, **bind/listen** (`udpin`).
+///   The default for real drones / ArduPilot SITL: the vehicle sends to us.
+/// - `mavlinkout://host:port`— direct MAVLink UDP, **connect/send-first**
+///   (`udpout`), for setups where the profiler must initiate.
+///
+/// The two `mavlink*` schemes require the `mavlink-source` feature (on by
+/// default in the shipped binary).
 pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
     if uri == "mock://" || uri.starts_with("mock://") {
         Ok(Box::new(MockSource::default()))
+    } else if let Some(rest) = uri.strip_prefix("mavlinkout://") {
+        mavlink_from_addr("udpout", rest)
+    } else if let Some(rest) = uri.strip_prefix("mavlink://") {
+        mavlink_from_addr("udpin", rest)
     } else if let Some(rest) = uri.strip_prefix("zmq://") {
         // `host:port` → `tcp://host:port` for zeromq's connect string.
         let endpoint = format!("tcp://{}", rest.trim_end_matches('/'));
@@ -65,6 +81,26 @@ pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
         log::warn!("Source '{uri}' not recognised — using mock://");
         Ok(Box::new(MockSource::default()))
     }
+}
+
+/// Build a [`MavlinkSource`] from a UDP `scheme` (`"udpin"` / `"udpout"`) and
+/// a trailing `host:port`. Gated on the `mavlink-source` feature.
+#[cfg(feature = "mavlink-source")]
+fn mavlink_from_addr(scheme: &str, rest: &str) -> Result<Box<dyn Source>> {
+    let conn_str = format!("{scheme}:{}", rest.trim_end_matches('/'));
+    let src = MavlinkSource::connect(&conn_str)
+        .with_context(|| format!("opening MAVLink source at {conn_str}"))?;
+    Ok(Box::new(src))
+}
+
+/// Stub used when the `mavlink-source` feature is compiled out: surface a
+/// clear error rather than silently falling back to `mock://`.
+#[cfg(not(feature = "mavlink-source"))]
+fn mavlink_from_addr(_scheme: &str, _rest: &str) -> Result<Box<dyn Source>> {
+    anyhow::bail!(
+        "this binary was built without the `mavlink-source` feature; \
+         rebuild with `--features mavlink-source` to use mavlink:// sources"
+    )
 }
 
 // ─── MockSource ────────────────────────────────────────────────────────────

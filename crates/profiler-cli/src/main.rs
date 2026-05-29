@@ -1,8 +1,10 @@
-//! hvn-profiler v0.3.0 — JSON-driven 2D grid + 3D trajectory view.
+//! hvn-profiler v0.4.0 — JSON-driven 2D grid + 3D trajectory view.
 //!
-//! Backends (unchanged from v0.1.0):
-//! - `mock://`            → synthetic sine wave (v0.0.1 demo, preserved)
-//! - `zmq://host:port`    → subscribe to the HVN-SITL msgpack streamer
+//! Backends:
+//! - `mock://`              → synthetic sine wave (v0.0.1 demo, preserved)
+//! - `zmq://host:port`      → subscribe to the HVN-SITL msgpack streamer
+//! - `mavlink://host:port`  → direct MAVLink UDP (udpin / listen): real drone or ArduPilot SITL, no Python streamer (v0.4.0)
+//! - `mavlinkout://host:port` → direct MAVLink UDP (udpout / send-first)
 //!
 //! Rendering:
 //! - With `--template <PATH>`: load the JSON template. A top toolbar offers a
@@ -41,9 +43,11 @@ const PREFERRED_KEY: &str = "accel[0]";
 struct Cli {
     /// Telemetry source URI.
     ///
-    /// Supported in v0.1.0:
-    /// - `mock://`             — synthetic sine wave (default)
-    /// - `zmq://host:port`     — subscribe to the SITL msgpack streamer
+    /// Supported:
+    /// - `mock://`               — synthetic sine wave (default)
+    /// - `zmq://host:port`       — subscribe to the SITL msgpack streamer
+    /// - `mavlink://host:port` — direct MAVLink UDP, bind/listen (udpin)
+    /// - `mavlinkout://host:port` — direct MAVLink UDP, send-first (udpout)
     #[arg(long, default_value = "mock://")]
     source: String,
 

@@ -22,5 +22,10 @@ env_logger = { workspace = true }
 log = { workspace = true }
 
 profiler-render   = { workspace = true }
-profiler-source   = { workspace = true }
+# `mavlink-source` is enabled by default here so the shipped `hvn-profiler`
+# binary supports `--source mavlink://…` out of the box (the point of v0.4.0:
+# direct real-drone telemetry). Enabling it adds the `mavlink` crate's dialect
+# codegen build step (~one-time ~25 s on a cold build); steady-state rebuilds
+# are unaffected. See profiler-source's `mavlink-source` feature.
+profiler-source   = { workspace = true, features = ["mavlink-source"] }
 profiler-template = { workspace = true }
