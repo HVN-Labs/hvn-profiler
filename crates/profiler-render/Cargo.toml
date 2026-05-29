@@ -11,3 +11,5 @@ description = "egui_plot wrappers + GPU-friendly trace storage for hvn-profiler.
 [dependencies]
 egui = { workspace = true }
 egui_plot = { workspace = true }
+profiler-template = { workspace = true }
+log = { workspace = true }

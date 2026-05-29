@@ -1,0 +1,213 @@
+{
+  "name": "hvn-default",
+  "description": "HVN-SITL default 7x3 sensor grid + 3D trajectory panel. Mirrors the legacy hard-coded layout exactly: rows 0-4 are raw sensors (DT -> AP), rows 5-6 are drone outputs (AP estimate / controller). The right side hosts the 3D trajectory with truth/gps/ekf/dead-reckon trails.",
+  "figsize": [19, 16],
+  "grid": {"rows": 7, "cols": 3},
+  "subplots_adjust": {"left": 0.045, "right": 0.68, "top": 0.93, "bottom": 0.07, "hspace": 0.80, "wspace": 0.45},
+  "sections": [
+    {"label": "Raw Sensors  (DT → AP)", "anchor_row": 0, "anchor_col": 0, "color": "#345"},
+    {"label": "Drone Outputs  (AP estimate / controller)", "anchor_row": 5, "anchor_col": 0, "color": "#754", "tint_rows_from": 5, "tint_color": "#fbf7ea"}
+  ],
+  "cells": [
+    {
+      "row": 0, "col": 0,
+      "title": "Accel fx [m/s²]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_raw_imu[0]", "fallback": "accel[0]", "lw": 0.8, "color": "C0"}],
+      "label_mode": "off",
+      "label_metadata": {"source_path": "RAW_IMU.xacc", "units": "mg → m/s²"}
+    },
+    {
+      "row": 0, "col": 1,
+      "title": "Accel fy [m/s²]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_raw_imu[1]", "fallback": "accel[1]", "lw": 0.8, "color": "C1"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 0, "col": 2,
+      "title": "Accel fz [m/s²]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_raw_imu[2]", "fallback": "accel[2]", "lw": 0.8, "color": "C2"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 0,
+      "title": "Gyro p [rad/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_raw_imu[3]", "fallback": "gyro[0]", "lw": 0.8, "color": "C3"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 1,
+      "title": "Gyro q [rad/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_raw_imu[4]", "fallback": "gyro[1]", "lw": 0.8, "color": "C4"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 2,
+      "title": "Gyro r [rad/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_raw_imu[5]", "fallback": "gyro[2]", "lw": 0.8, "color": "C5"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 2, "col": 0,
+      "title": "Altitude [m]",
+      "primitive": "overlay",
+      "sources": [
+        {"key": "gps_alt", "label": "GPS", "color": "C6", "lw": 1.0, "marker": ".", "markersize": 4},
+        {"key": "baro_alt", "label": "Baro", "color": "C8", "lw": 0.8},
+        {"key": "state_alt", "fallback": "ap_vfr_alt", "label": "State", "color": "C3", "lw": 0.8, "linestyle": "--"}
+      ],
+      "legend": {"fontsize": 6, "loc": "upper left"},
+      "label_mode": "off"
+    },
+    {
+      "row": 2, "col": 1,
+      "title": "GPS vel N [m/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_vel_ned[0]", "fallback": "gps_vn", "lw": 1.0, "color": "C7", "marker": ".", "markersize": 4}],
+      "label_mode": "off"
+    },
+    {
+      "row": 2, "col": 2,
+      "title": "",
+      "primitive": "scalar",
+      "sources": [],
+      "visible": false
+    },
+    {
+      "row": 3, "col": 0,
+      "title": "Wind vN [m/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "wind_ned[0]", "lw": 0.9, "color": "C9"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 3, "col": 1,
+      "title": "Wind vE [m/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "wind_ned[1]", "lw": 0.9, "color": "C0"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 3, "col": 2,
+      "title": "Wind vD [m/s]",
+      "primitive": "scalar",
+      "sources": [{"key": "wind_ned[2]", "lw": 0.9, "color": "C1"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 4, "col": 0,
+      "title": "Mag [mGauss]",
+      "primitive": "mag_interference",
+      "sources": [
+        {"key": "mag_xyz", "scale": 1000.0, "clean_key": "mag_clean_xyz",
+         "components": [
+           {"label": "mx", "color": "C0", "lw": 0.8},
+           {"label": "my", "color": "C1", "lw": 0.8},
+           {"label": "mz", "color": "C2", "lw": 0.8}
+         ],
+         "magnitude": {"label": "|B|", "color": "k", "lw": 1.0},
+         "interference": {"label": "interf", "color": "m", "lw": 0.8, "linestyle": ":"}
+        }
+      ],
+      "legend": {"fontsize": 6, "loc": "upper left", "ncol": 2},
+      "label_mode": "off"
+    },
+    {
+      "row": 4, "col": 1,
+      "title": "Baro p [hPa]",
+      "primitive": "scalar",
+      "sources": [{"key": "baro_pressure", "lw": 0.8, "color": "C1"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 4, "col": 2,
+      "title": "Baro T [°C]",
+      "primitive": "scalar",
+      "sources": [{"key": "baro_temp", "lw": 0.8, "color": "C2"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 5, "col": 0,
+      "title": "Roll [deg]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_attitude[0]", "fallback": "euler[0]", "transform": "rad_to_deg", "lw": 0.9, "color": "C0"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 5, "col": 1,
+      "title": "Pitch [deg]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_attitude[1]", "fallback": "euler[1]", "transform": "rad_to_deg", "lw": 0.9, "color": "C1"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 5, "col": 2,
+      "title": "Yaw [deg]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_attitude[2]", "fallback": "euler[2]", "transform": "rad_to_deg", "lw": 0.9, "color": "C2"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 6, "col": 0,
+      "title": "PSC errN [m]",
+      "primitive": "diff",
+      "sources": [{"key": "pos_target_ned[0]", "minus": "pos_ekf_ned[0]", "lw": 0.9, "color": "#d62728"}],
+      "zero_reference_line": true,
+      "status_text": {
+        "position": [0.0, 1.0],
+        "offset": [0, 14],
+        "fontsize": 9,
+        "states": {
+          "waiting": {"text": "PSC: waiting for autopilot…", "color": "#888"},
+          "live": {"text": "PSC: live (AP streaming position target)", "color": "#2a7"},
+          "stale": {"text": "PSC: no recent target — switch to Loiter / Guided / Auto / PosHold", "color": "#a72"}
+        }
+      },
+      "label_mode": "off"
+    },
+    {
+      "row": 6, "col": 1,
+      "title": "PSC errE [m]",
+      "primitive": "diff",
+      "sources": [{"key": "pos_target_ned[1]", "minus": "pos_ekf_ned[1]", "lw": 0.9, "color": "#1f77b4"}],
+      "zero_reference_line": true,
+      "label_mode": "off"
+    },
+    {
+      "row": 6, "col": 2,
+      "title": "PSC errD [m]",
+      "primitive": "diff",
+      "sources": [{"key": "pos_target_ned[2]", "minus": "pos_ekf_ned[2]", "lw": 0.9, "color": "#ff7f0e"}],
+      "zero_reference_line": true,
+      "label_mode": "off"
+    }
+  ],
+  "view_3d": {
+    "axes_rect": [0.72, 0.42, 0.26, 0.50],
+    "title": "3D trajectory  (E, N, Up) [m]",
+    "xlabel": "E",
+    "ylabel": "N",
+    "zlabel": "Up",
+    "rpy_text_pos": [0.02, -0.08],
+    "trails": [
+      {"name": "truth", "label": "truth (sim)", "color": "#2ca02c",
+       "sources": {"x": "pos_truth_ned[1]", "y": "pos_truth_ned[0]", "z_neg": "pos_truth_ned[2]"}},
+      {"name": "gps",   "label": "gps",         "color": "#1f77b4",
+       "sources": {"x": "pos_gps_ned[1]",   "y": "pos_gps_ned[0]",   "z_neg": "pos_gps_ned[2]"}},
+      {"name": "ekf",   "label": "ekf (AP)",    "color": "#d62728",
+       "sources": {"x": "pos_ekf_ned[1]",   "y": "pos_ekf_ned[0]",   "z_neg": "pos_ekf_ned[2]"}},
+      {"name": "dr",    "label": "imu-dr",      "color": "#ff7f0e",
+       "deadreckon": {"accel": "accel", "quat": "quat_wxyz", "seed_from": "pos_truth_ned"}}
+    ],
+    "checkboxes_rect": [0.74, 0.14, 0.16, 0.16],
+    "checkboxes_title": "trails",
+    "trail_slider_rect": [0.74, 0.34, 0.22, 0.02],
+    "trail_slider_initial": 0.25
+  },
+  "view_slider": {"rect": [0.10, 0.03, 0.45, 0.02], "min_window_s": 2.0, "valinit": 0.85, "label": "view:  full ◀──▶ live"}
+}

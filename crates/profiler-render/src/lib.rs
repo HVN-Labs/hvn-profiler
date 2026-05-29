@@ -10,6 +10,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
+pub mod panels;
+pub use panels::{render_template_grid, GridStats};
+
 /// Build-time crate version, for logging from the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -17,8 +20,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_WINDOW_S: f64 = 60.0;
 
 /// Sanity check used by the CLI smoke test.
-pub fn hello() -> &'static str {
-    "profiler-render v0.1.0"
+pub fn hello() -> String {
+    format!("profiler-render v{VERSION}")
 }
 
 /// Per-key ring buffer of `[t, value]` points with time-based retention.
@@ -88,6 +91,30 @@ impl TraceStore {
             .unwrap_or_default()
     }
 
+    /// Latest (most recent) value stored for `key`, or `None` if empty.
+    pub fn latest(&self, key: &str) -> Option<f64> {
+        self.traces.get(key).and_then(|q| q.back()).map(|p| p[1])
+    }
+
+    /// `(min, max)` of the values stored for `key` over the current window,
+    /// or `None` if the key has no points.
+    pub fn min_max(&self, key: &str) -> Option<(f64, f64)> {
+        let q = self.traces.get(key)?;
+        let mut it = q.iter();
+        let first = it.next()?[1];
+        let (mut lo, mut hi) = (first, first);
+        for p in it {
+            let v = p[1];
+            if v < lo {
+                lo = v;
+            }
+            if v > hi {
+                hi = v;
+            }
+        }
+        Some((lo, hi))
+    }
+
     /// All known keys, alphabetical.
     pub fn keys(&self) -> Vec<String> {
         let mut k: Vec<String> = self.traces.keys().cloned().collect();
@@ -130,7 +157,8 @@ mod tests {
 
     #[test]
     fn hello_is_versioned() {
-        assert!(hello().contains("v0.1.0"));
+        assert!(hello().starts_with("profiler-render v"));
+        assert!(hello().contains(VERSION));
     }
 
     #[test]
