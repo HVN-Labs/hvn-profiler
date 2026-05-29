@@ -7,8 +7,8 @@
 //! - Y auto-scales to the data visible in the rolling window.
 //! - X shows the latest `window_s` seconds (matches the `TraceStore`).
 //! - Has NO interactive controls (drag / zoom / scroll disabled) — the 2D
-//!   panels are static auto-scaling by design. Live controls are reserved for
-//!   the 3D view (v0.5.0+).
+//!   panels are static auto-scaling by design. Live controls are exclusive to
+//!   the 3D view (see `crate::view3d`); 2D panels stay control-free.
 //!
 //! Per-panel `label_mode` overlays (`data` / `metadata`) are drawn as text in
 //! the panel's top-left corner.

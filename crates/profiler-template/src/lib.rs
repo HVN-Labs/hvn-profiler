@@ -1,8 +1,8 @@
 //! profiler-template — JSON template loader for hvn-profiler.
 //!
 //! Templates describe a 2D panel grid (`grid.rows` × `grid.cols`), one
-//! [`Cell`] per visible panel, plus a [`View3d`] block that v0.2.0 parses but
-//! does **not** render (3D lands in v0.5.0).
+//! [`Cell`] per visible panel, plus a [`View3d`] block consumed by the 3D
+//! trajectory renderer since v0.3.0 (`profiler_render::view3d`).
 //!
 //! The schema is shared with HVN-SITL (`templates/hvn-default.json`,
 //! `templates/real-drone.json`). Every struct derives `serde(default)`
@@ -40,9 +40,13 @@ pub struct Template {
     /// One entry per panel in the grid.
     #[serde(default)]
     pub cells: Vec<Cell>,
-    /// 3D trajectory view block. Parsed-but-unrendered in v0.2.0.
+    /// 3D trajectory view block. Rendered since v0.3.0.
     #[serde(default)]
     pub view_3d: Option<View3d>,
+    /// Top-level view-slider config (`full ◀──▶ live`). The 3D renderer reads
+    /// `min_window_s` / `valinit` from here.
+    #[serde(default)]
+    pub view_slider: Option<ViewSlider>,
 }
 
 /// 2D grid dimensions.
@@ -213,8 +217,9 @@ pub struct CellSource {
 
 // ─── view_3d (parsed but unrendered) ─────────────────────────────────────────
 
-/// 3D trajectory view block. v0.2.0 parses this so deserialization of full
-/// SITL templates succeeds, but renders nothing. v0.5.0 will consume it.
+/// 3D trajectory view block, consumed by the 3D renderer since v0.3.0
+/// (`profiler_render::view3d`). `sources` (direct trails) and `deadreckon`
+/// (synthesised trails) are typed; unknown keys (rects, etc.) flow into `extra`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct View3d {
     #[serde(default)]
@@ -227,9 +232,21 @@ pub struct View3d {
     pub zlabel: String,
     #[serde(default)]
     pub trails: Vec<Trail3d>,
+    /// Initial trail-length fraction (0..1) of the buffer to display.
+    #[serde(default = "default_trail_initial")]
+    pub trail_slider_initial: f64,
+    /// View slider config (maps 0..1 → visible time window). Lives at the
+    /// template top level in the SITL schema, but we expose it here for the
+    /// 3D renderer's convenience; the `Template` also re-parses it.
+    #[serde(default)]
+    pub view_slider: Option<ViewSlider>,
     /// Anything else (rects, slider config) is kept opaque for now.
     #[serde(flatten, default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_trail_initial() -> f64 {
+    0.25
 }
 
 /// One 3D trail definition.
@@ -243,10 +260,78 @@ pub struct Trail3d {
     pub color: String,
     /// Direct source bindings (`x`/`y`/`z_neg`). Absent for dead-reckon trails.
     #[serde(default)]
-    pub sources: Option<serde_json::Value>,
+    pub sources: Option<Trail3dSources>,
     /// Dead-reckon synthesis config. Absent for direct trails.
     #[serde(default)]
-    pub deadreckon: Option<serde_json::Value>,
+    pub deadreckon: Option<Trail3dDeadreckon>,
+}
+
+/// Direct `(E, N, Up)` source bindings for a 3D trail.
+///
+/// `x` → East, `y` → North, `z_neg` → the NED-down key whose value is negated
+/// to obtain Up (`Up = -D`). Each is a fully-qualified scalar store key such
+/// as `"pos_truth_ned[1]"`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Trail3dSources {
+    #[serde(default)]
+    pub x: String,
+    #[serde(default)]
+    pub y: String,
+    #[serde(default)]
+    pub z_neg: String,
+}
+
+/// Dead-reckon synthesis config for a 3D trail. The trail position is
+/// double-integrated from body-frame `accel` rotated into NED by `quat`
+/// (scalar-first `[w,x,y,z]`), seeded at the first `seed_from` position.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Trail3dDeadreckon {
+    /// Vector base key for body-frame acceleration (gravity-excluded), e.g.
+    /// `"accel"` → reads `accel[0..2]`.
+    #[serde(default)]
+    pub accel: String,
+    /// Vector base key for the orientation quaternion, scalar-first
+    /// `[w,x,y,z]`, e.g. `"quat_wxyz"` → reads `quat_wxyz[0..3]`.
+    #[serde(default)]
+    pub quat: String,
+    /// Vector base key for the seed position (NED), e.g. `"pos_truth_ned"`.
+    #[serde(default)]
+    pub seed_from: String,
+}
+
+/// `view_slider` config — maps the 0..1 view fraction onto a visible time
+/// window. `0.0` shows the full history; `1.0` shows only `min_window_s`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewSlider {
+    /// Shortest visible window (seconds) at fraction `1.0`.
+    #[serde(default = "default_min_window_s")]
+    pub min_window_s: f64,
+    /// Initial slider value (0..1).
+    #[serde(default = "default_view_valinit")]
+    pub valinit: f64,
+    #[serde(default)]
+    pub label: String,
+    /// Anything else (rect, etc.) kept opaque.
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_min_window_s() -> f64 {
+    2.0
+}
+fn default_view_valinit() -> f64 {
+    0.85
+}
+
+impl Default for ViewSlider {
+    fn default() -> Self {
+        Self {
+            min_window_s: default_min_window_s(),
+            valinit: default_view_valinit(),
+            label: String::new(),
+            extra: serde_json::Map::new(),
+        }
+    }
 }
 
 // ─── loaders ─────────────────────────────────────────────────────────────────
@@ -342,6 +427,30 @@ mod tests {
         let v = t.view_3d.as_ref().expect("view_3d present");
         assert_eq!(v.trails.len(), 4);
         assert_eq!(v.trails[0].name, "truth");
+    }
+
+    #[test]
+    fn view_3d_typed_sources_and_deadreckon() {
+        let t = Template::from_path(fixture("hvn-default.json")).unwrap();
+        let v = t.view_3d.as_ref().expect("view_3d present");
+        // truth/gps/ekf carry typed (E,N,Up) source bindings.
+        let truth = &v.trails[0];
+        let src = truth.sources.as_ref().expect("truth has sources");
+        assert_eq!(src.x, "pos_truth_ned[1]");
+        assert_eq!(src.y, "pos_truth_ned[0]");
+        assert_eq!(src.z_neg, "pos_truth_ned[2]");
+        assert!(truth.deadreckon.is_none());
+        // dr carries a typed deadreckon block, no direct sources.
+        let dr = v.trails.iter().find(|tr| tr.name == "dr").unwrap();
+        let dk = dr.deadreckon.as_ref().expect("dr has deadreckon");
+        assert_eq!(dk.accel, "accel");
+        assert_eq!(dk.quat, "quat_wxyz");
+        assert_eq!(dk.seed_from, "pos_truth_ned");
+        assert!(dr.sources.is_none());
+        // top-level view_slider parses (min_window_s + valinit).
+        let vs = t.view_slider.as_ref().expect("view_slider present");
+        assert!((vs.min_window_s - 2.0).abs() < 1e-9);
+        assert!((vs.valinit - 0.85).abs() < 1e-9);
     }
 
     #[test]

@@ -11,7 +11,9 @@
 use std::collections::{HashMap, VecDeque};
 
 pub mod panels;
+pub mod view3d;
 pub use panels::{render_template_grid, GridStats};
+pub use view3d::{render_view3d, OrbitCamera, View3dState, View3dStats};
 
 /// Build-time crate version, for logging from the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -149,6 +151,47 @@ impl TraceStore {
     pub fn latest_ts(&self) -> f64 {
         self.latest_ts
     }
+
+    /// Reconstruct a time-aligned vector trail from three scalar component
+    /// keys, returning `(t, [x, y, z])` per sample.
+    ///
+    /// The three components are emitted from the same envelope, so their ring
+    /// buffers are index- and timestamp-aligned. We index-align over the
+    /// shortest of the three and take the timestamp from the first key. Used by
+    /// the 3D view to rebuild `pos_*_ned` / `accel` / `quat` vectors out of the
+    /// per-scalar store.
+    pub fn vec3(&self, kx: &str, ky: &str, kz: &str) -> Vec<(f64, [f64; 3])> {
+        let (ax, ay, az) = match (
+            self.traces.get(kx),
+            self.traces.get(ky),
+            self.traces.get(kz),
+        ) {
+            (Some(x), Some(y), Some(z)) => (x, y, z),
+            _ => return Vec::new(),
+        };
+        let n = ax.len().min(ay.len()).min(az.len());
+        (0..n)
+            .map(|i| (ax[i][0], [ax[i][1], ay[i][1], az[i][1]]))
+            .collect()
+    }
+
+    /// Reconstruct a time-aligned 4-vector (e.g. a quaternion `w,x,y,z`) from
+    /// four scalar component keys: `(t, [a, b, c, d])` per sample.
+    pub fn vec4(&self, k0: &str, k1: &str, k2: &str, k3: &str) -> Vec<(f64, [f64; 4])> {
+        let (a, b, c, d) = match (
+            self.traces.get(k0),
+            self.traces.get(k1),
+            self.traces.get(k2),
+            self.traces.get(k3),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => return Vec::new(),
+        };
+        let n = a.len().min(b.len()).min(c.len()).min(d.len());
+        (0..n)
+            .map(|i| (a[i][0], [a[i][1], b[i][1], c[i][1], d[i][1]]))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +225,34 @@ mod tests {
         let pts = s.points("a");
         assert!(pts.iter().all(|p| p[0] >= 3.5));
         assert!(!pts.is_empty());
+    }
+
+    #[test]
+    fn vec3_reconstructs_aligned_vector() {
+        let mut s = TraceStore::new(60.0);
+        s.push(0.0, "p[0]", 1.0);
+        s.push(0.0, "p[1]", 2.0);
+        s.push(0.0, "p[2]", 3.0);
+        s.push(0.1, "p[0]", 4.0);
+        s.push(0.1, "p[1]", 5.0);
+        s.push(0.1, "p[2]", 6.0);
+        let v = s.vec3("p[0]", "p[1]", "p[2]");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], (0.0, [1.0, 2.0, 3.0]));
+        assert_eq!(v[1], (0.1, [4.0, 5.0, 6.0]));
+        // Missing key → empty.
+        assert!(s.vec3("p[0]", "p[1]", "missing").is_empty());
+    }
+
+    #[test]
+    fn vec4_reconstructs_quaternion() {
+        let mut s = TraceStore::new(60.0);
+        for (i, comp) in ["q[0]", "q[1]", "q[2]", "q[3]"].iter().enumerate() {
+            s.push(0.0, comp, i as f64);
+        }
+        let q = s.vec4("q[0]", "q[1]", "q[2]", "q[3]");
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0], (0.0, [0.0, 1.0, 2.0, 3.0]));
     }
 
     #[test]

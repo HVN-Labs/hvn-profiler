@@ -1,14 +1,20 @@
-//! hvn-profiler v0.2.0 — JSON-driven multi-panel 2D layout.
+//! hvn-profiler v0.3.0 — JSON-driven 2D grid + 3D trajectory view.
 //!
 //! Backends (unchanged from v0.1.0):
 //! - `mock://`            → synthetic sine wave (v0.0.1 demo, preserved)
 //! - `zmq://host:port`    → subscribe to the HVN-SITL msgpack streamer
 //!
 //! Rendering:
-//! - With `--template <PATH>`: load the JSON template, lay its `cells` out on
-//!   a `grid.rows × grid.cols` grid, one static auto-scaling `egui_plot::Plot`
-//!   per visible panel. The `view_3d` block is parsed but NOT rendered (3D is
-//!   a later milestone). The 2D panels have no live controls by design.
+//! - With `--template <PATH>`: load the JSON template. A top toolbar offers a
+//!   view-mode switch — `2D grid` / `3D view` / `Split` — when the template
+//!   carries a `view_3d` block (default `Split`, else `2D grid`):
+//!   - `2D grid` lays the template's `cells` out on a `grid.rows × grid.cols`
+//!     grid, one static auto-scaling `egui_plot::Plot` per visible panel. The
+//!     2D panels have NO live controls by design (unchanged from v0.2.0).
+//!   - `3D view` projects the `view_3d` trails through an orbit-camera painter
+//!     and exposes the 3D-only live controls (view / trail-length / zoom /
+//!     decimation / realtime / per-trail visibility). See `profiler_render::view3d`.
+//!   - `Split` shows the 2D grid and 3D view side-by-side.
 //! - Without `--template`: fall back to v0.1.0 single-trace mode (prefers
 //!   `accel[0]`, else the busiest channel) so the binary works even when no
 //!   template file is present.
@@ -18,7 +24,7 @@ use std::time::Instant;
 use clap::Parser;
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
-use profiler_render::TraceStore;
+use profiler_render::{render_view3d, TraceStore, View3dState};
 use profiler_source::{from_uri, Source};
 use profiler_template::Template;
 
@@ -113,12 +119,33 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe::run_native failed: {e}"))
 }
 
+/// Which layout the toolbar is currently showing.
+///
+/// `Split` and `View3d` are only reachable when the template carries a
+/// `view_3d` block; otherwise the toolbar pins to `Grid` (or, with no template
+/// at all, the v0.1.0 single-trace fallback runs regardless of this field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    /// v0.2.0 multi-panel 2D grid (unchanged, control-free).
+    Grid,
+    /// 3D trajectory view + its live controls.
+    View3d,
+    /// 2D grid and 3D view side-by-side.
+    Split,
+}
+
 struct App {
     source: Box<dyn Source>,
     source_desc: String,
     store: TraceStore,
     /// Optional template — when present, render the multi-panel grid.
     template: Option<Template>,
+    /// Current toolbar view mode.
+    mode: ViewMode,
+    /// Persisted 3D camera + control state (only used when a `view_3d` exists).
+    view3d_state: View3dState,
+    /// `true` once the 3D state has been seeded from the template defaults.
+    view3d_inited: bool,
     started: Instant,
     drained_total: u64,
     /// Wall-clock of the last "samples-in-store" status log (1 Hz).
@@ -128,11 +155,20 @@ struct App {
 impl App {
     fn new(source: Box<dyn Source>, source_desc: String, template: Option<Template>) -> Self {
         let now = Instant::now();
+        // Default mode: Split when the template ships a 3D view, else Grid.
+        let has_3d = template
+            .as_ref()
+            .and_then(|t| t.view_3d.as_ref())
+            .is_some();
+        let mode = if has_3d { ViewMode::Split } else { ViewMode::Grid };
         Self {
             source,
             source_desc,
             store: TraceStore::default(),
             template,
+            mode,
+            view3d_state: View3dState::default(),
+            view3d_inited: false,
             started: now,
             drained_total: 0,
             last_status_log: now,
@@ -168,11 +204,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Keep the render loop hot.
         ui.ctx().request_repaint();
-
         self.drain();
 
         let elapsed = self.started.elapsed().as_secs_f64();
+        let has_3d = self
+            .template
+            .as_ref()
+            .and_then(|t| t.view_3d.as_ref())
+            .is_some();
 
+        // ── Top toolbar: status + view-mode switch ────────────────────────
         ui.horizontal(|ui| {
             ui.heading(format!("hvn-profiler v{}", env!("CARGO_PKG_VERSION")));
             ui.separator();
@@ -185,38 +226,77 @@ impl eframe::App for App {
             ui.label(&self.source_desc);
             ui.separator();
             ui.label(format!("samples={}", self.drained_total));
+
+            // The view-mode switch is only meaningful with a 3D block.
+            if has_3d {
+                ui.separator();
+                ui.label("view:");
+                ui.selectable_value(&mut self.mode, ViewMode::Grid, "2D grid");
+                ui.selectable_value(&mut self.mode, ViewMode::View3d, "3D view");
+                ui.selectable_value(&mut self.mode, ViewMode::Split, "Split");
+            }
         });
         ui.separator();
 
-        // Status-log bookkeeping is mode-specific; capture a line then emit it
-        // after the immutable borrow of `self.template` ends.
+        // Status-log bookkeeping is mode-specific.
         let mut grid_log: Option<(usize, usize, usize)> = None;
+        let mut v3d_log: Option<profiler_render::View3dStats> = None;
 
-        if let Some(tpl) = self.template.take() {
-            let stats = profiler_render::render_template_grid(ui, &tpl, &self.store);
-            grid_log = Some((stats.panels, stats.panels_with_data, stats.keys_with_data));
-            self.template = Some(tpl);
-        } else {
+        // No template → v0.1.0 single-trace fallback (mode is irrelevant).
+        if self.template.is_none() {
             self.render_single_trace(ui);
+        } else {
+            // No 3D block → always the plain grid.
+            let mode = if has_3d { self.mode } else { ViewMode::Grid };
+            match mode {
+                ViewMode::Grid => {
+                    grid_log = Some(self.render_grid(ui));
+                }
+                ViewMode::View3d => {
+                    v3d_log = self.render_3d(ui);
+                }
+                ViewMode::Split => {
+                    // Left/right split via equal columns: 2D grid | 3D view.
+                    ui.columns(2, |cols| {
+                        grid_log = Some(self.render_grid(&mut cols[0]));
+                        v3d_log = self.render_3d(&mut cols[1]);
+                    });
+                }
+            }
         }
 
-        // 1 Hz status log — proof-of-life when running headless (smoke test /
-        // CI greps for `panels=` in template mode, `store:` otherwise).
+        // 1 Hz status log — proof-of-life when running headless. The smoke
+        // test greps for `view3d:` (3D modes) and `grid:` (2D / split).
         let now = Instant::now();
         if now.duration_since(self.last_status_log).as_secs_f32() >= 1.0 {
-            match grid_log {
-                Some((panels, with_data, keys_with_data)) => log::info!(
+            if let Some((panels, with_data, keys_with_data)) = grid_log {
+                log::info!(
                     "grid: panels={panels} panels_with_data={with_data} \
                      keys_with_data={keys_with_data} drained_total={} latest_ts={:.2}",
                     self.drained_total,
                     self.store.latest_ts(),
-                ),
-                None => log::info!(
+                );
+            }
+            if let Some(stats) = &v3d_log {
+                log::info!(
+                    "view3d: trails_visible={} truth_pts={} gps_pts={} ekf_pts={} dr_pts={} \
+                     drained_total={} latest_ts={:.2}",
+                    stats.trails_visible,
+                    stats.pts("truth"),
+                    stats.pts("gps"),
+                    stats.pts("ekf"),
+                    stats.pts("dr"),
+                    self.drained_total,
+                    self.store.latest_ts(),
+                );
+            }
+            if grid_log.is_none() && v3d_log.is_none() {
+                log::info!(
                     "store: keys={} drained_total={} latest_ts={:.2}",
                     self.store.keys().len(),
                     self.drained_total,
                     self.store.latest_ts(),
-                ),
+                );
             }
             self.last_status_log = now;
         }
@@ -224,6 +304,37 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Render the 2D grid (unchanged from v0.2.0). Returns the grid stats
+    /// tuple `(panels, panels_with_data, keys_with_data)` for the status log.
+    fn render_grid(&mut self, ui: &mut egui::Ui) -> (usize, usize, usize) {
+        // `take` to avoid borrowing `self` immutably while `render_template_grid`
+        // also borrows `self.store` — same pattern as v0.2.0.
+        let tpl = self.template.take().expect("render_grid called with template");
+        let stats = profiler_render::render_template_grid(ui, &tpl, &self.store);
+        self.template = Some(tpl);
+        (stats.panels, stats.panels_with_data, stats.keys_with_data)
+    }
+
+    /// Render the 3D trajectory view + its controls. Returns the per-frame
+    /// stats, or `None` if the template has no `view_3d` block.
+    fn render_3d(&mut self, ui: &mut egui::Ui) -> Option<profiler_render::View3dStats> {
+        let tpl = self.template.take()?;
+        let result = tpl.view_3d.as_ref().map(|view| {
+            if !self.view3d_inited {
+                let (min_w, valinit) = tpl
+                    .view_slider
+                    .as_ref()
+                    .map(|s| (Some(s.min_window_s), Some(s.valinit)))
+                    .unwrap_or((None, None));
+                self.view3d_state.init_from(view, min_w, valinit);
+                self.view3d_inited = true;
+            }
+            render_view3d(ui, view, &self.store, &mut self.view3d_state)
+        });
+        self.template = Some(tpl);
+        result
+    }
+
     /// v0.1.0 single-trace fallback (no template given).
     fn render_single_trace(&mut self, ui: &mut egui::Ui) {
         let key = self.select_key();
