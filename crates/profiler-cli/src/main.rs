@@ -1,29 +1,41 @@
-//! hvn-profiler v0.0.1 — toolchain proof.
+//! hvn-profiler v0.1.0 — first live data.
 //!
-//! Opens an `eframe` window containing a live-animated sine wave drawn with
-//! `egui_plot`. This is intentionally minimal — its only job is to prove that
-//! `egui` + `wgpu` build and run on the developer's machine.
+//! This release wires the CLI to two backends:
+//! - `mock://`            → synthetic sine wave (v0.0.1 demo, preserved)
+//! - `zmq://host:port`    → subscribe to the HVN-SITL msgpack streamer
 //!
-//! Real telemetry sources land in v0.1.0.
+//! One trace is rendered (multi-panel layout is v0.2.0). The trace selection
+//! prefers `accel[0]` when present, else the busiest channel in the store.
 
 use std::time::Instant;
 
 use clap::Parser;
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
+use profiler_render::TraceStore;
+use profiler_source::{from_uri, Source};
 
-/// HVN profiler — GPU-accelerated telemetry viewer (v0.0.1 demo).
+/// Max samples drained from the source per render frame. Caps wall-clock
+/// time spent in `update` when the ZMQ backend is wildly ahead.
+const MAX_DRAIN_PER_FRAME: usize = 5_000;
+
+/// Preferred key to render when present in the store.
+const PREFERRED_KEY: &str = "accel[0]";
+
+/// HVN profiler — GPU-accelerated telemetry viewer.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Telemetry source URI. Schemes: `mock://`, `mavlink://host:port`,
-    /// `zmq://host:port`, `csv://path`. v0.0.1 ignores this and always
-    /// renders the mock sine wave.
+    /// Telemetry source URI.
+    ///
+    /// Supported in v0.1.0:
+    /// - `mock://`             — synthetic sine wave (default)
+    /// - `zmq://host:port`     — subscribe to the SITL msgpack streamer
     #[arg(long, default_value = "mock://")]
     source: String,
 
     /// Path to a JSON template describing panels / traces / units.
-    /// v0.0.1 ignores this — multi-panel layout lands in v0.2.0.
+    /// v0.1.0 ignores this — multi-panel layout lands in v0.2.0.
     #[arg(long)]
     template: Option<String>,
 }
@@ -38,73 +50,140 @@ fn main() -> anyhow::Result<()> {
         cli.source,
         cli.template,
     );
-    if cli.source != "mock://" {
-        log::warn!(
-            "Source '{}' is not implemented yet — falling back to mock sine wave (v0.0.1).",
-            cli.source
-        );
-    }
+
+    let source = from_uri(&cli.source)?;
+    let source_desc = source.describe();
+    let title = format!(
+        "hvn-profiler v{} — {}",
+        env!("CARGO_PKG_VERSION"),
+        cli.source
+    );
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 540.0])
-            .with_title("hvn-profiler v0.0.1 — sine wave demo"),
+            .with_title(&title),
         ..Default::default()
     };
 
     eframe::run_native(
         "hvn-profiler",
         native_options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |_cc| Ok(Box::new(App::new(source, source_desc)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe::run_native failed: {e}"))
 }
 
 struct App {
+    source: Box<dyn Source>,
+    source_desc: String,
+    store: TraceStore,
     started: Instant,
+    drained_total: u64,
+    /// Wall-clock of the last "samples-in-store" status log (1 Hz).
+    last_status_log: Instant,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(source: Box<dyn Source>, source_desc: String) -> Self {
+        let now = Instant::now();
         Self {
-            started: Instant::now(),
+            source,
+            source_desc,
+            store: TraceStore::default(),
+            started: now,
+            drained_total: 0,
+            last_status_log: now,
+        }
+    }
+
+    /// Drain the source, push into the store. Caps work per frame.
+    fn drain(&mut self) {
+        let mut n = 0;
+        while n < MAX_DRAIN_PER_FRAME {
+            match self.source.try_recv() {
+                Some(s) => {
+                    self.store.push(s.ts, &s.key, s.value);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        self.drained_total += n as u64;
+    }
+
+    /// Choose which trace to render this frame.
+    fn select_key(&self) -> Option<String> {
+        if self.store.len(PREFERRED_KEY) > 0 {
+            Some(PREFERRED_KEY.to_string())
+        } else {
+            self.store.busiest_key()
         }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Keep redrawing every frame so the wave animates.
+        // Keep the render loop hot.
         ui.ctx().request_repaint();
+
+        self.drain();
+
+        // 1 Hz status log — handy proof-of-life when running headless (smoke
+        // test in CI / verification scripts greps for this).
+        let now = Instant::now();
+        if now.duration_since(self.last_status_log).as_secs_f32() >= 1.0 {
+            log::info!(
+                "store: keys={} drained_total={} latest_ts={:.2}",
+                self.store.keys().len(),
+                self.drained_total,
+                self.store.latest_ts(),
+            );
+            self.last_status_log = now;
+        }
 
         let elapsed = self.started.elapsed().as_secs_f64();
 
         ui.horizontal(|ui| {
-            ui.heading("hvn-profiler v0.0.1");
+            ui.heading(format!("hvn-profiler v{}", env!("CARGO_PKG_VERSION")));
             ui.separator();
             ui.label(format!("t = {elapsed:7.2} s"));
             ui.separator();
-            ui.label("mock://sine — toolchain proof");
+            ui.label(&self.source_desc);
+            ui.separator();
+            ui.label(format!("samples={}", self.drained_total));
         });
         ui.separator();
 
-        // 1 kHz density across a 4-second window — exercises the renderer
-        // more than a token 100-sample line would.
-        const N: usize = 4_000;
-        let samples: PlotPoints = (0..N)
-            .map(|i| {
-                let t = elapsed + (i as f64) * 0.001;
-                let y = (t * std::f64::consts::TAU * 0.5).sin();
-                [t, y]
-            })
-            .collect();
+        let key = self.select_key();
+        let title = match key.as_deref() {
+            Some(k) => format!("trace: {k}"),
+            None => "waiting for data…".to_string(),
+        };
+        ui.label(&title);
 
-        Plot::new("sine")
+        let points: Vec<[f64; 2]> = key
+            .as_deref()
+            .map(|k| self.store.points(k))
+            .unwrap_or_default();
+        let count = points.len();
+
+        Plot::new("trace")
             .legend(Legend::default())
             .show_axes([true, true])
             .show_grid([true, true])
             .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("sin(2π·0.5·t)", samples));
+                if !points.is_empty() {
+                    let label = key.clone().unwrap_or_else(|| "trace".to_string());
+                    plot_ui.line(Line::new(label, PlotPoints::from(points)));
+                }
             });
+
+        ui.separator();
+        ui.label(format!(
+            "store: keys={} points-in-current-trace={}",
+            self.store.keys().len(),
+            count,
+        ));
     }
 }

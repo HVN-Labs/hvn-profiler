@@ -1,90 +1,309 @@
 //! profiler-source — `Source` trait + telemetry backends.
 //!
-//! v0.0.1 only ships the `Mock` backend (sine wave). Real backends land in
-//! subsequent releases:
-//! - v0.1.0: ZMQ msgpack (pure-Rust `zeromq` crate so Windows doesn't need libzmq)
-//! - v0.4.0: direct MAVLink over UDP (gated behind the `mavlink-source` feature)
+//! v0.1.0 ships two backends:
+//! - [`MockSource`] — synthetic sine wave (the v0.0.1 demo, now expressed
+//!   as a `Source` impl).
+//! - [`ZmqSource`] — subscribes to a ZMQ PUB endpoint, decodes msgpack
+//!   envelopes shipped by `hvn_sitl.streamer`, flattens them into [`Sample`]s.
+//!
+//! ZMQ is implemented on the pure-Rust [`zeromq`] crate (no libzmq C dep,
+//! works on Windows out of the box). Because that crate is async-only, we
+//! spawn a dedicated `tokio` runtime in a background thread and bridge the
+//! decoded samples back to the sync render loop via [`crossbeam_channel`].
+//!
+//! Later releases:
+//! - v0.4.0: direct MAVLink over UDP (gated behind `mavlink-source`)
 //! - later:  CSV / log-file replay
 
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
-/// A single telemetry sample. Channel naming follows the SITL streamer schema
-/// (e.g. `"ATT.Roll"`, `"BAT.Volt"`); semantics are decided by the template.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+pub mod zmq_source;
+pub use zmq_source::ZmqSource;
+
+// ─── Sample / trait ────────────────────────────────────────────────────────
+
+/// A single flattened telemetry sample. One envelope from the streamer
+/// fans out into many `Sample`s (one per scalar leaf of `values`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
-    /// Wall-clock or vehicle-time timestamp, seconds.
-    pub t: f64,
-    /// Channel name. Stable identifier the template binds plots against.
-    pub channel: String,
-    /// Sample value.
+    /// Monotonic seconds since stream start (forwarded from the envelope).
+    pub ts: f64,
+    /// Trace identifier — e.g. `"accel[0]"`, `"ap_vfr_alt"`.
+    pub key: String,
+    /// Scalar value.
     pub value: f64,
 }
 
-/// A pull-based telemetry source. Backends drain whatever they have buffered
-/// each frame; the renderer handles pacing.
+/// A pull-based telemetry source. The render loop calls `try_recv` in a
+/// tight loop each frame until it returns `None`.
 pub trait Source: Send {
-    /// Drain any samples that have arrived since the previous call.
-    fn poll(&mut self) -> Result<Vec<Sample>>;
+    /// Pop one sample, or `None` if nothing is buffered. Never blocks.
+    fn try_recv(&mut self) -> Option<Sample>;
 
-    /// Human-readable description for the status bar.
+    /// Human-readable description for the status bar / window title.
     fn describe(&self) -> String;
 }
 
-/// Construct a source from a URI like `mock://`, `zmq://host:port`,
-/// `mavlink://host:port`, or `csv://path`. v0.0.1 only handles `mock://`.
+/// Construct a source from a URI.
+///
+/// Supported schemes:
+/// - `mock://`           — synthetic sine wave
+/// - `zmq://host:port`   — subscribe to a ZMQ PUB streamer
 pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
     if uri == "mock://" || uri.starts_with("mock://") {
-        Ok(Box::new(Mock::default()))
+        Ok(Box::new(MockSource::default()))
+    } else if let Some(rest) = uri.strip_prefix("zmq://") {
+        // `host:port` → `tcp://host:port` for zeromq's connect string.
+        let endpoint = format!("tcp://{}", rest.trim_end_matches('/'));
+        let zmq = ZmqSource::connect(&endpoint)
+            .with_context(|| format!("opening ZMQ source at {endpoint}"))?;
+        Ok(Box::new(zmq))
     } else {
-        // v0.0.1 stub — fall back to the mock backend with a warning.
-        log::warn!("Source '{uri}' not yet implemented (v0.0.1) — using mock://");
-        Ok(Box::new(Mock::default()))
+        log::warn!("Source '{uri}' not recognised — using mock://");
+        Ok(Box::new(MockSource::default()))
     }
 }
 
-/// Mock backend — emits a synthetic sine wave. Used by the v0.0.1 demo and
-/// for headless tests.
-#[derive(Debug, Default)]
-pub struct Mock {
-    t: f64,
+// ─── MockSource ────────────────────────────────────────────────────────────
+
+/// Synthetic sine-wave source. Used for the v0.0.1 toolchain-proof demo and
+/// for tests that don't want a real network dependency.
+///
+/// Emits points at a steady ~60 Hz (one per `try_recv` call once `next_due`
+/// has elapsed), so the render loop's `try_recv → push` cycle exercises the
+/// same code path the ZMQ backend uses.
+pub struct MockSource {
+    started: Instant,
+    last_emit: Option<Instant>,
+    period: Duration,
 }
 
-impl Source for Mock {
-    fn poll(&mut self) -> Result<Vec<Sample>> {
-        // 50-sample burst per poll, 1 ms apart.
-        let mut out = Vec::with_capacity(50);
-        for _ in 0..50 {
-            self.t += 0.001;
-            out.push(Sample {
-                t: self.t,
-                channel: "MOCK.sine".to_string(),
-                value: (self.t * std::f64::consts::TAU * 0.5).sin(),
-            });
+impl Default for MockSource {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            last_emit: None,
+            period: Duration::from_micros(16_666), // ~60 Hz
         }
-        Ok(out)
+    }
+}
+
+impl Source for MockSource {
+    fn try_recv(&mut self) -> Option<Sample> {
+        let now = Instant::now();
+        if let Some(last) = self.last_emit {
+            if now.duration_since(last) < self.period {
+                return None;
+            }
+        }
+        self.last_emit = Some(now);
+        let t = now.duration_since(self.started).as_secs_f64();
+        Some(Sample {
+            ts: t,
+            key: "mock.sine".to_string(),
+            value: (t * std::f64::consts::TAU * 0.5).sin(),
+        })
     }
 
     fn describe(&self) -> String {
-        "mock:// (synthetic sine, 1 kHz)".to_string()
+        "mock:// (synthetic sine, ~60 Hz)".to_string()
+    }
+}
+
+// ─── Envelope + flatten ────────────────────────────────────────────────────
+
+/// Streamer wire envelope. `values` is intentionally dynamic so we can keep
+/// up with the SITL schema without recompiling: every scalar / array leaf is
+/// flattened by [`flatten_envelope`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct Envelope {
+    pub ts: f64,
+    #[serde(default)]
+    pub source: String,
+    /// Flat-ish map of channel name → scalar | array | null. Stored as a raw
+    /// `rmpv::Value` so we can flatten dynamically without a static schema.
+    pub values: rmpv::Value,
+}
+
+/// Decode a msgpack-encoded envelope (raw bytes off the ZMQ socket) into
+/// a stream of [`Sample`]s.
+///
+/// Flattening rules — match the streamer's wire schema:
+/// - Scalars (`f64`, `i64`, `u64`, `bool`) → one `Sample { key, value }`.
+///   `bool` becomes `0.0` / `1.0`.
+/// - Arrays of scalars → one `Sample` per element with key `"<base>[i]"`.
+/// - `null` / Nil values → dropped silently (the streamer emits `None`
+///   for sensors that haven't reported yet).
+/// - Nested maps / arrays-of-arrays → currently dropped (no SITL key uses them).
+pub fn flatten_msgpack(bytes: &[u8]) -> Result<Vec<Sample>> {
+    let env: Envelope = rmp_serde::from_slice(bytes).context("decoding msgpack envelope")?;
+    Ok(flatten_envelope(&env))
+}
+
+/// Flatten an already-decoded envelope. Split out from [`flatten_msgpack`]
+/// so unit tests can exercise the schema logic without round-tripping bytes.
+pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
+    let mut out = Vec::new();
+    let ts = env.ts;
+    let map = match env.values.as_map() {
+        Some(m) => m,
+        None => return out,
+    };
+    for (k, v) in map {
+        let key = match k.as_str() {
+            Some(s) => s,
+            None => continue, // streamer always uses string keys; skip otherwise.
+        };
+        match v {
+            rmpv::Value::Nil => continue,
+            rmpv::Value::Boolean(b) => out.push(Sample {
+                ts,
+                key: key.to_string(),
+                value: if *b { 1.0 } else { 0.0 },
+            }),
+            rmpv::Value::Integer(i) => {
+                if let Some(f) = i.as_f64() {
+                    out.push(Sample {
+                        ts,
+                        key: key.to_string(),
+                        value: f,
+                    });
+                }
+            }
+            rmpv::Value::F32(f) => out.push(Sample {
+                ts,
+                key: key.to_string(),
+                value: *f as f64,
+            }),
+            rmpv::Value::F64(f) => out.push(Sample {
+                ts,
+                key: key.to_string(),
+                value: *f,
+            }),
+            rmpv::Value::Array(arr) => {
+                for (i, elt) in arr.iter().enumerate() {
+                    if let Some(v) = scalar_to_f64(elt) {
+                        out.push(Sample {
+                            ts,
+                            key: format!("{key}[{i}]"),
+                            value: v,
+                        });
+                    }
+                    // non-scalar / null elements drop silently
+                }
+            }
+            // Strings, nested maps, binary blobs etc. aren't plottable.
+            _ => continue,
+        }
+    }
+    out
+}
+
+fn scalar_to_f64(v: &rmpv::Value) -> Option<f64> {
+    match v {
+        rmpv::Value::Nil => None,
+        rmpv::Value::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
+        rmpv::Value::Integer(i) => i.as_f64(),
+        rmpv::Value::F32(f) => Some(*f as f64),
+        rmpv::Value::F64(f) => Some(*f),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
+    use std::collections::BTreeMap;
 
     #[test]
     fn mock_emits_samples() {
-        let mut m = Mock::default();
-        let s = m.poll().unwrap();
-        assert_eq!(s.len(), 50);
-        assert_eq!(s[0].channel, "MOCK.sine");
+        let mut m = MockSource::default();
+        // First call always yields a sample.
+        let s = m.try_recv().expect("first call should yield");
+        assert_eq!(s.key, "mock.sine");
+        // Second call immediately after returns None (rate-limited).
+        assert!(m.try_recv().is_none());
     }
 
     #[test]
     fn from_uri_mock() {
         let mut s = from_uri("mock://").unwrap();
-        assert!(!s.poll().unwrap().is_empty());
+        assert!(s.try_recv().is_some());
+    }
+
+    /// Bench against the streamer schema: `accel` (3-vec) + `ap_vfr_alt`
+    /// (scalar) + `skip_me` (null). Expect three `accel[i]` samples plus
+    /// the scalar, with the null silently dropped.
+    #[test]
+    fn flatten_matches_streamer_schema() {
+        // Build a msgpack-encoded envelope by hand so the test exercises
+        // the same path the ZMQ backend will take.
+        #[derive(Serialize)]
+        struct Env {
+            ts: f64,
+            source: String,
+            values: BTreeMap<String, serde_json::Value>,
+        }
+        let mut values = BTreeMap::new();
+        values.insert(
+            "accel".into(),
+            serde_json::json!([1.0_f64, 2.0_f64, 3.0_f64]),
+        );
+        values.insert("ap_vfr_alt".into(), serde_json::json!(4.5_f64));
+        values.insert("skip_me".into(), serde_json::Value::Null);
+        let env = Env {
+            ts: 12.5,
+            source: "dt".into(),
+            values,
+        };
+        let bytes = rmp_serde::to_vec_named(&env).expect("encode");
+
+        let mut samples = flatten_msgpack(&bytes).expect("decode");
+        // Sort so the assertion doesn't depend on map iteration order.
+        samples.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let got: Vec<(String, f64)> = samples
+            .into_iter()
+            .map(|s| {
+                assert_eq!(s.ts, 12.5);
+                (s.key, s.value)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("accel[0]".into(), 1.0),
+                ("accel[1]".into(), 2.0),
+                ("accel[2]".into(), 3.0),
+                ("ap_vfr_alt".into(), 4.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_drops_null_array_elements() {
+        #[derive(Serialize)]
+        struct Env {
+            ts: f64,
+            values: BTreeMap<String, serde_json::Value>,
+        }
+        let mut values = BTreeMap::new();
+        // Mixed array: middle element is null and should silently drop.
+        values.insert(
+            "mixed".into(),
+            serde_json::json!([1.0_f64, serde_json::Value::Null, 3.0_f64]),
+        );
+        let env = Env { ts: 0.0, values };
+        let bytes = rmp_serde::to_vec_named(&env).unwrap();
+        let mut s = flatten_msgpack(&bytes).unwrap();
+        s.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(
+            s.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            vec!["mixed[0]", "mixed[2]"],
+        );
     }
 }

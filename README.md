@@ -40,17 +40,21 @@ cargo build --release
 # Mock sine-wave demo — proves egui + wgpu work on this machine.
 cargo run --release --bin hvn-profiler
 
-# CLI flags are scaffolded for v0.1.0+ — currently no-ops:
-cargo run --release --bin hvn-profiler -- --source mock://
-cargo run --release --bin hvn-profiler -- --source zmq://localhost:5556 --template templates/copter.json
+# Live ZMQ data from the HVN-SITL streamer (v0.7.18+):
+#   python -m hvn_sitl.streamer --source mavlink://127.0.0.1:14560 \
+#                               --pub tcp://127.0.0.1:9005
+cargo run --release --bin hvn-profiler -- --source zmq://127.0.0.1:9005
 ```
+
+The ZMQ backend uses the pure-Rust [`zeromq`](https://crates.io/crates/zeromq)
+crate — no libzmq C dependency needed on Windows.
 
 ## Roadmap
 
 | version | scope |
 | --- | --- |
-| v0.0.1 | Mock sine-wave demo (toolchain proof) <- **shipping now** |
-| v0.1.0 | ZMQ msgpack source; render one trace |
+| v0.0.1 | Mock sine-wave demo (toolchain proof) |
+| v0.1.0 | ZMQ msgpack source; render one live trace <- **shipping now** |
 | v0.2.0 | JSON template loading; multi-panel layout |
 | v0.3.0 | Live controls (view slider, trail, zoom, decimation) |
 | v0.4.0 | Direct MAVLink source (real-drone support) |
