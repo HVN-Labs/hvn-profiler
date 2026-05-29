@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/profiler-cli",
+    "crates/profiler-render",
+    "crates/profiler-source",
+    "crates/profiler-template",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["HVN Labs <engineering@hvn-labs.com>"]
+repository = "https://github.com/HVN-Labs/hvn-profiler"
+rust-version = "1.92"
+
+[workspace.dependencies]
+# GUI / rendering
+eframe = { version = "0.34", default-features = true }
+egui = "0.34"
+egui_plot = "0.35"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmp-serde = "1.3"
+
+# CLI / errors / logging
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+env_logger = "0.11"
+log = "0.4"
+
+# Telemetry sources
+mavlink = "0.18"
+# NOTE: `zmq` (libzmq bindings) is painful on Windows without vcpkg/cmake.
+# v0.0.1 stubs the ZMQ backend; v0.1.0 will use `zeromq` (pure-Rust) instead.
+# zeromq = "0.6"
+
+# Workspace-internal
+profiler-render   = { path = "crates/profiler-render" }
+profiler-source   = { path = "crates/profiler-source" }
+profiler-template = { path = "crates/profiler-template" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

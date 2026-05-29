@@ -1,0 +1,26 @@
+[package]
+name = "profiler-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "HVN profiler — CLI entry point that opens the egui window."
+
+[[bin]]
+name = "hvn-profiler"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_plot = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+
+profiler-render   = { workspace = true }
+profiler-source   = { workspace = true }
+profiler-template = { workspace = true }

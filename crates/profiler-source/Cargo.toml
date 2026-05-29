@@ -1,0 +1,24 @@
+[package]
+name = "profiler-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Telemetry source trait + Mock / MAVLink / ZMQ / CSV backends for hvn-profiler."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+# Heavy backends — kept optional so the CLI builds without libzmq on Windows.
+mavlink = { workspace = true, optional = true }
+
+[features]
+default = []
+mavlink-source = ["dep:mavlink"]
+# zmq-source will land in v0.1.0 via the pure-Rust `zeromq` crate.
