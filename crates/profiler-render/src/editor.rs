@@ -160,6 +160,100 @@ pub fn remove_cell_at(tpl: &mut Template, row: usize, col: usize) -> Result<(), 
     }
 }
 
+/// v0.10.2 — re-pack the template's `cells` into a tightly-packed grid.
+///
+/// Iterates the existing cells in display order (`(row, col)`-sorted),
+/// re-assigning each to the next free slot top-to-bottom, left-to-right
+/// across `tpl.grid.cols`. Visual ordering is preserved while gaps left by
+/// `remove_cell_at` (or any other deletion) are removed.
+///
+/// `tpl.grid.rows` is also shrunk to the minimum needed for the surviving
+/// cells (at least 1). `tpl.grid.cols` is left unchanged so the operator's
+/// chosen column count persists across reflow.
+///
+/// Idempotent: calling `compact_cells` twice on the same template is a no-op
+/// on the second call.
+pub fn compact_cells(tpl: &mut Template) {
+    let cols = tpl.grid.cols.max(1);
+    let mut cells = std::mem::take(&mut tpl.cells);
+    // Stable sort by (row, col) so cells in the same slot keep their relative
+    // order (rare, but legal under the v0.10.0 spec).
+    cells.sort_by_key(|c| (c.row, c.col));
+    for (i, cell) in cells.iter_mut().enumerate() {
+        cell.row = i / cols;
+        cell.col = i % cols;
+    }
+    tpl.cells = cells;
+    tpl.grid.rows = tpl
+        .cells
+        .iter()
+        .map(|c| c.row + 1)
+        .max()
+        .unwrap_or(1);
+}
+
+/// v0.10.2 — categorize a source key into a section heading for the grouped
+/// dropdown. The dropdown sorts groups in this fixed order:
+///
+/// 1. `"DT physics"` — truth / raw sensor models from the digital twin.
+/// 2. `"AP MAVLink"` — autopilot mirrors over MAVLink.
+/// 3. `"Position (NED)"` — any `pos_*` channel.
+/// 4. `"Timing"` — `t`, `ts`.
+/// 5. `"Other"` — everything else.
+///
+/// Classification is by BASE key (strip array indexing / dotted suffixes), so
+/// `accel[0]`, `accel[1]`, and `accel` all land in the same group.
+pub fn categorize_key(key: &str) -> &'static str {
+    let base = key.split(['[', '.']).next().unwrap_or(key);
+    match base {
+        // DT physics (truth / raw sensor models)
+        "accel" | "gyro" | "mag_xyz" | "mag_clean_xyz" | "wind_ned"
+        | "baro_pressure" | "baro_temp" | "baro_alt" | "state_alt"
+        | "quat_wxyz" | "euler" | "gps_alt" | "gps_vn"
+            => "DT physics",
+        // AP MAVLink mirrors (what the autopilot sees)
+        "ap_attitude" | "ap_raw_imu" | "ap_vfr_alt" | "ap_vel_ned"
+            => "AP MAVLink",
+        // Position channels (NED frames)
+        k if k.starts_with("pos_") => "Position (NED)",
+        // Timing / miscellaneous
+        "t" | "ts"
+            => "Timing",
+        _ => "Other",
+    }
+}
+
+/// v0.10.2 — fixed group ordering used by the dropdown UI. Returned as a
+/// slice so the rendering side can iterate over groups in this exact order
+/// regardless of whether a given run observed any keys in some group.
+pub const KEY_GROUPS: &[&str] = &[
+    "DT physics",
+    "AP MAVLink",
+    "Position (NED)",
+    "Timing",
+    "Other",
+];
+
+/// v0.10.2 — group a flat list of source keys by category, preserving the
+/// fixed `KEY_GROUPS` order. Within each group keys retain their input order
+/// (the caller is expected to pass an alphabetically-sorted list, which is
+/// what `collect_source_keys` already returns).
+///
+/// Empty groups are omitted from the returned vector so the UI doesn't draw
+/// dead section headers.
+pub fn group_source_keys(keys: &[String]) -> Vec<(&'static str, Vec<String>)> {
+    let mut buckets: std::collections::BTreeMap<&'static str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for k in keys {
+        let cat = categorize_key(k);
+        buckets.entry(cat).or_default().push(k.clone());
+    }
+    KEY_GROUPS
+        .iter()
+        .filter_map(|g| buckets.remove(g).map(|v| (*g, v)))
+        .collect()
+}
+
 /// Replace the cell originally at `(row, col)` with the draft contents — used
 /// by the per-cell "Edit panel..." flow.
 ///

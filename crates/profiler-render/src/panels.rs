@@ -119,7 +119,6 @@ pub fn render_template_grid(ui: &mut egui::Ui, tpl: &Template, store: &TraceStor
 /// `Default` matches the v0.9.0 behaviour bit-for-bit: no per-cell mutable
 /// state, no context menu, no interactivity. The CLI opts in by passing its
 /// owned `PanelState` map + a sink for emitted menu actions.
-#[derive(Default)]
 pub struct GridRenderOptions<'a> {
     /// When `Some`, enables egui_plot interactivity (drag / zoom / box-zoom /
     /// double-click reset) and uses the per-cell `PanelState` to remember
@@ -134,6 +133,25 @@ pub struct GridRenderOptions<'a> {
     /// flow; the underlying `tpl.cells[].visible` stays at the template's
     /// default, while this map carries the runtime override.
     pub visibility_override: Option<&'a HashMap<(usize, usize), bool>>,
+    /// v0.10.2 — when `true`, hidden cells (either `cell.visible == false` or
+    /// flipped off via `visibility_override`) are compacted OUT of the visible
+    /// grid: remaining visible cells reflow top-to-bottom, left-to-right to
+    /// fill the gap. The template itself is NOT mutated — the hidden cells
+    /// keep their original `(row, col)` in `tpl.cells` so "Restore" can put
+    /// them back. Defaults to `true` (the v0.10.2 behaviour); set to `false`
+    /// to get the v0.10.1 behaviour where hidden cells leave blank slots.
+    pub compact_hidden: bool,
+}
+
+impl<'a> Default for GridRenderOptions<'a> {
+    fn default() -> Self {
+        Self {
+            panel_states: None,
+            menu_sink: None,
+            visibility_override: None,
+            compact_hidden: true,
+        }
+    }
 }
 
 /// Same as [`render_template_grid`], with an explicit [`LabelOverride`] applied
@@ -168,16 +186,54 @@ pub fn render_template_grid_full(
     label_override: LabelOverride,
     mut opts: GridRenderOptions<'_>,
 ) -> GridStats {
-    let rows = tpl.grid.rows.max(1);
     let cols = tpl.grid.cols.max(1);
 
-    // Index cells by (row, col) for O(1) lookup during layout.
-    let mut at: Vec<Option<&Cell>> = vec![None; rows * cols];
-    for c in &tpl.cells {
-        if c.row < rows && c.col < cols {
-            at[c.row * cols + c.col] = Some(c);
+    // v0.10.2 — when `compact_hidden` is set, hidden cells (either
+    // `cell.visible == false` or flipped off in `visibility_override`) skip
+    // the layout entirely; visible cells reflow into a tightly-packed grid
+    // top-to-bottom, left-to-right. The template itself is NOT mutated —
+    // hidden cells keep their original coords in `tpl.cells` so a future
+    // "Restore" restores them in place.
+    //
+    // When `compact_hidden` is false (v0.10.1 behaviour), each cell stays at
+    // its declared `(row, col)` and hidden slots render as gaps.
+    let (rows, at) = if opts.compact_hidden {
+        let mut visible_cells: Vec<&Cell> = tpl
+            .cells
+            .iter()
+            .filter(|c| {
+                if !c.visible {
+                    return false;
+                }
+                opts.visibility_override
+                    .as_ref()
+                    .and_then(|m| m.get(&(c.row, c.col)).copied())
+                    .unwrap_or(true)
+            })
+            .collect();
+        // Preserve top-to-bottom, left-to-right visual order — matches
+        // `compact_cells` so the on-disk save and the in-memory layout agree
+        // after a "Save".
+        visible_cells.sort_by_key(|c| (c.row, c.col));
+        let rows = visible_cells
+            .len()
+            .div_ceil(cols)
+            .max(1);
+        let mut at: Vec<Option<&Cell>> = vec![None; rows * cols];
+        for (i, c) in visible_cells.iter().enumerate() {
+            at[i] = Some(*c);
         }
-    }
+        (rows, at)
+    } else {
+        let rows = tpl.grid.rows.max(1);
+        let mut at: Vec<Option<&Cell>> = vec![None; rows * cols];
+        for c in &tpl.cells {
+            if c.row < rows && c.col < cols {
+                at[c.row * cols + c.col] = Some(c);
+            }
+        }
+        (rows, at)
+    };
 
     // Compute the absolute rect we get to draw inside. `available_rect_before_wrap`
     // returns true pixel coords on the parent ui, so child cells can be placed
@@ -198,14 +254,18 @@ pub fn render_template_grid_full(
         for c in 0..cols {
             let id = r * cols + c;
             let rect = layout.cell_rect(r, c);
-            // Runtime visibility override (v0.10.0 "Hide panel" path). When the
-            // override is `Some(false)` we still draw nothing but the rect is
-            // reserved — same behaviour as the template's `visible: false`.
-            let runtime_visible = opts
-                .visibility_override
-                .as_ref()
-                .and_then(|m| m.get(&(r, c)).copied())
-                .unwrap_or(true);
+            // When `compact_hidden` is true the at-grid only contains visible
+            // cells (we filtered above), so the runtime override check is
+            // redundant. When false, honour the per-slot override at the
+            // SLOT coordinates so the v0.10.1 behaviour is preserved.
+            let runtime_visible = if opts.compact_hidden {
+                true
+            } else {
+                opts.visibility_override
+                    .as_ref()
+                    .and_then(|m| m.get(&(r, c)).copied())
+                    .unwrap_or(true)
+            };
             // Always claim the rect so the next row's `available_rect`
             // computation downstream of the grid is correct, even when a
             // slot is empty.
@@ -214,13 +274,17 @@ pub fn render_template_grid_full(
                 match at[id] {
                     Some(cell) if cell.visible && runtime_visible && !cell.sources.is_empty() => {
                         stats.panels += 1;
-                        // Pull the lock state for this cell (None when the
-                        // CLI didn't pass a panel_states map — non-interactive
-                        // mode, identical to v0.9.0).
+                        // Pull the lock state for this cell. Under
+                        // `compact_hidden` mode the (r, c) we draw at is a
+                        // layout slot, not the cell's persisted coordinates;
+                        // we key panel state by the CELL's own (row, col) so
+                        // zoom/lock state survives reflow when other cells
+                        // are hidden/shown.
+                        let state_key = (cell.row, cell.col);
                         let mut local_locked = false;
                         let panel_locked = match &mut opts.panel_states {
                             Some(map) => {
-                                let st = map.entry((r, c)).or_default();
+                                let st = map.entry(state_key).or_default();
                                 &mut st.locked
                             }
                             None => &mut local_locked,

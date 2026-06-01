@@ -17,8 +17,8 @@ pub mod generators;
 pub mod panels;
 pub mod view3d;
 pub use editor::{
-    apply_panel_draft, apply_trail_draft, collect_source_keys, remove_cell_at, replace_cell_at,
-    PanelDraft, TrailDraft,
+    apply_panel_draft, apply_trail_draft, categorize_key, collect_source_keys, compact_cells,
+    group_source_keys, remove_cell_at, replace_cell_at, PanelDraft, TrailDraft, KEY_GROUPS,
 };
 pub use faults::{
     default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,

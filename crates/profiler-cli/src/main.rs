@@ -29,11 +29,11 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 
 use profiler_render::{
-    apply_panel_draft, apply_trail_draft, collect_source_keys, remove_cell_at, replace_cell_at,
-    render_faults_panel, render_gen_panel, render_template_grid_full,
-    render_view3d_with_override, CellMenuAction, FaultsPanelState, GeneratorPanelState,
-    GridRenderOptions, LabelOverride, PanelDraft, PanelState, PendingCommand, SeenDrones,
-    TraceStore, TrailDraft, View3dState,
+    apply_panel_draft, apply_trail_draft, collect_source_keys, compact_cells, group_source_keys,
+    remove_cell_at, replace_cell_at, render_faults_panel, render_gen_panel,
+    render_template_grid_full, render_view3d_with_override, CellMenuAction, FaultsPanelState,
+    GeneratorPanelState, GridRenderOptions, LabelOverride, PanelDraft, PanelState, PendingCommand,
+    SeenDrones, TraceStore, TrailDraft, View3dState,
 };
 use profiler_source::{
     multi_from_uris_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
@@ -967,6 +967,10 @@ impl App {
             panel_states: Some(&mut self.panel_states),
             menu_sink: Some(&mut self.pending_cell_actions),
             visibility_override: Some(&self.cell_visibility_override),
+            // v0.10.2 — hidden cells are compacted out of the visible grid by
+            // default. The override map still drives WHAT is hidden, but the
+            // renderer no longer reserves a blank slot for it.
+            compact_hidden: true,
         };
         let stats = render_template_grid_full(
             ui,
@@ -1482,7 +1486,12 @@ impl App {
             }
             CellMenuAction::Delete { row, col } => {
                 if let Some(tpl) = self.template.as_mut() {
-                    let _ = remove_cell_at(tpl, row, col);
+                    if remove_cell_at(tpl, row, col).is_ok() {
+                        // v0.10.2 — reflow the remaining cells so the grid
+                        // stays tightly packed. Visual ordering (top-to-bottom,
+                        // left-to-right) is preserved by `compact_cells`.
+                        compact_cells(tpl);
+                    }
                     self.template_dirty = true;
                 }
             }
@@ -1828,6 +1837,11 @@ fn trail_form(ui: &mut egui::Ui, draft: &mut TrailDraft, source_keys: &[String])
 }
 
 /// Free-form text input + dropdown to pick from observed source keys.
+///
+/// v0.10.2 — the dropdown is grouped by category (DT physics, AP MAVLink,
+/// Position (NED), Timing, Other). Each group is a `CollapsingHeader` so the
+/// operator can collapse the categories they don't care about. Within a
+/// group, keys keep the alphabetical order returned by `collect_source_keys`.
 fn source_key_combo(ui: &mut egui::Ui, salt: &str, value: &mut String, source_keys: &[String]) {
     ui.horizontal(|ui| {
         ui.text_edit_singleline(value);
@@ -1836,10 +1850,20 @@ fn source_key_combo(ui: &mut egui::Ui, salt: &str, value: &mut String, source_ke
             .width(20.0)
             .show_ui(ui, |ui| {
                 // Cap at 256 entries so a noisy run doesn't lock up the UI.
-                for k in source_keys.iter().take(256) {
-                    if ui.selectable_label(value == k, k).clicked() {
-                        *value = k.clone();
-                    }
+                // We slice BEFORE grouping so the cap applies uniformly.
+                let limited: Vec<String> = source_keys.iter().take(256).cloned().collect();
+                let grouped = group_source_keys(&limited);
+                for (group, keys) in grouped {
+                    egui::CollapsingHeader::new(group)
+                        .id_salt(format!("{salt}_{group}"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for k in &keys {
+                                if ui.selectable_label(value == k, k).clicked() {
+                                    *value = k.clone();
+                                }
+                            }
+                        });
                 }
             });
     });
