@@ -79,11 +79,15 @@ pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
 }
 
 /// Profiler-side options that affect which sources are constructed.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MavlinkConfig {
     /// When `true`, opens MAVLink sources in passive listen-only mode (no
     /// HEARTBEAT sender, no `REQUEST_DATA_STREAM`). v0.4.0 behaviour.
     pub passive: bool,
+    /// v0.10.0 — pin every MAVLink-source sample's `drone_name` to this string,
+    /// overriding the default `sysid_<id>` demux. Useful when the operator
+    /// knows there's only one vehicle on the link.
+    pub drone_name_override: Option<String>,
 }
 
 /// Like [`from_uri`] but lets the caller pass [`MavlinkConfig`] (controls
@@ -114,6 +118,7 @@ fn mavlink_from_addr(scheme: &str, rest: &str, cfg: MavlinkConfig) -> Result<Box
     let conn_str = format!("{scheme}:{}", rest.trim_end_matches('/'));
     let opts = MavlinkOptions {
         passive: cfg.passive,
+        drone_name_override: cfg.drone_name_override.clone(),
     };
     let src = MavlinkSource::connect_with(&conn_str, opts)
         .with_context(|| format!("opening MAVLink source at {conn_str}"))?;
@@ -181,14 +186,14 @@ pub fn multi_from_uris_with_discovery_opts(
     // returned `SeenDrones` is whatever the single source surfaces (Arc-shared
     // with the worker thread, no copy / merging).
     if uris.len() == 1 {
-        return from_uri_with_discovery_opts(&uris[0], cfg);
+        return from_uri_with_discovery_opts(&uris[0], cfg.clone());
     }
 
     let merged: SeenDrones = Arc::new(RwLock::new(HashSet::new()));
     let mut subs: Vec<MultiSubSource> = Vec::with_capacity(uris.len());
 
     for (i, uri) in uris.iter().enumerate() {
-        let (src, seen_opt) = from_uri_with_discovery_opts(uri, cfg)?;
+        let (src, seen_opt) = from_uri_with_discovery_opts(uri, cfg.clone())?;
         // Fallback drone name when the source has no native discovery (mock /
         // mavlink): derive from URI host:port (strip the scheme).
         let fallback_name = fallback_drone_name_from_uri(uri, i);

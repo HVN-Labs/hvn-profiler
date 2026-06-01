@@ -10,11 +10,16 @@
 
 use std::collections::{HashMap, VecDeque};
 
+pub mod editor;
 pub mod faults;
 pub mod gen_panel;
 pub mod generators;
 pub mod panels;
 pub mod view3d;
+pub use editor::{
+    apply_panel_draft, apply_trail_draft, collect_source_keys, remove_cell_at, replace_cell_at,
+    PanelDraft, TrailDraft,
+};
 pub use faults::{
     default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,
 };
@@ -22,7 +27,8 @@ pub use gen_panel::{render_gen_panel, GeneratorPanelState, SLIDER_TARGETS};
 pub use generators::{Generator, Waveform};
 pub use panels::{
     build_label_text, format_value_pub, layout_cell_rects, overlay_box_size,
-    render_template_grid, render_template_grid_with_override, GridStats, LabelOverride,
+    render_template_grid, render_template_grid_full, render_template_grid_with_override,
+    CellMenuAction, GridRenderOptions, GridStats, LabelOverride, PanelState,
 };
 pub use view3d::{render_view3d, render_view3d_with_override, OrbitCamera, View3dState, View3dStats};
 

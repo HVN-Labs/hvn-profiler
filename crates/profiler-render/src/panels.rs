@@ -25,10 +25,45 @@
 //! The primitive renderers map [`profiler_template::Primitive`] variants onto
 //! egui_plot lines; see [`render_cell`].
 
+use std::collections::HashMap;
+
 use egui::{Align2, Color32, Rect, RichText, TextStyle, UiBuilder, Vec2};
 use egui_plot::{HLine, Legend, Line, Plot, PlotPoints};
 
 use profiler_template::{Cell, CellSource, LabelMode, Primitive, Section, Template};
+
+/// v0.10.0 — per-panel runtime state for 2D zoom/pan + auto-scale lock.
+///
+/// Keyed by `(row, col)` inside the renderer's session-state map. `locked`
+/// starts `false` (auto-scale Y on); on the first user interaction
+/// (drag / box-zoom / wheel) the renderer sets it `true` and stops
+/// recomputing bounds each frame. The right-click "Reset zoom" menu flips
+/// it back to `false`.
+#[derive(Debug, Clone, Default)]
+pub struct PanelState {
+    /// `true` once the user has interacted with the plot (drag / wheel /
+    /// box-zoom). While locked, the renderer keeps whatever bounds
+    /// `egui_plot` is showing and never reapplies its rolling X-window or
+    /// auto-bounds-Y reset.
+    pub locked: bool,
+}
+
+/// v0.10.0 — per-cell context-menu action emitted by the renderer for the CLI
+/// to apply between frames. Captured by the parent (`profiler-cli`) so it can
+/// open the Edit modal, mutate `UiState`, prompt for delete, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CellMenuAction {
+    /// "Edit panel..." — open the editor modal pre-filled from this cell.
+    Edit { row: usize, col: usize },
+    /// "Hide panel" toggle — flip the visibility bit in `UiState`.
+    HideToggle { row: usize, col: usize },
+    /// "Reset zoom" — clear the auto-scale lock for this cell.
+    ResetZoom { row: usize, col: usize },
+    /// "Label: off/data/metadata" — override the label mode for this cell.
+    SetLabelMode { row: usize, col: usize, mode: LabelMode },
+    /// "Delete panel" — drop the cell from the template (with confirm).
+    Delete { row: usize, col: usize },
+}
 
 /// Global label-mode override applied to every cell at render time.
 ///
@@ -78,6 +113,29 @@ pub fn render_template_grid(ui: &mut egui::Ui, tpl: &Template, store: &TraceStor
     render_template_grid_with_override(ui, tpl, store, LabelOverride::default())
 }
 
+/// v0.10.0 — knobs that change how the 2D grid renders without changing the
+/// data it draws.
+///
+/// `Default` matches the v0.9.0 behaviour bit-for-bit: no per-cell mutable
+/// state, no context menu, no interactivity. The CLI opts in by passing its
+/// owned `PanelState` map + a sink for emitted menu actions.
+#[derive(Default)]
+pub struct GridRenderOptions<'a> {
+    /// When `Some`, enables egui_plot interactivity (drag / zoom / box-zoom /
+    /// double-click reset) and uses the per-cell `PanelState` to remember
+    /// the auto-scale lock across frames. Each cell's state lives in this
+    /// map keyed by `(row, col)`; the entry is created lazily on first paint.
+    pub panel_states: Option<&'a mut HashMap<(usize, usize), PanelState>>,
+    /// When `Some`, the renderer will surface a right-click context menu on
+    /// each visible 2D panel; user clicks push a [`CellMenuAction`] into
+    /// this sink for the CLI to handle next frame.
+    pub menu_sink: Option<&'a mut Vec<CellMenuAction>>,
+    /// Override visibility per `(row, col)`. Used by the v0.10.0 "Hide panel"
+    /// flow; the underlying `tpl.cells[].visible` stays at the template's
+    /// default, while this map carries the runtime override.
+    pub visibility_override: Option<&'a HashMap<(usize, usize), bool>>,
+}
+
 /// Same as [`render_template_grid`], with an explicit [`LabelOverride`] applied
 /// uniformly to every cell. The default-arg helper above forwards `Respect`.
 ///
@@ -96,6 +154,19 @@ pub fn render_template_grid_with_override(
     tpl: &Template,
     store: &TraceStore,
     label_override: LabelOverride,
+) -> GridStats {
+    render_template_grid_full(ui, tpl, store, label_override, GridRenderOptions::default())
+}
+
+/// v0.10.0 — render the grid with full options: interactivity, context menus,
+/// runtime visibility overrides. Default-equivalent for callers that only pass
+/// a [`LabelOverride`] is [`render_template_grid_with_override`].
+pub fn render_template_grid_full(
+    ui: &mut egui::Ui,
+    tpl: &Template,
+    store: &TraceStore,
+    label_override: LabelOverride,
+    mut opts: GridRenderOptions<'_>,
 ) -> GridStats {
     let rows = tpl.grid.rows.max(1);
     let cols = tpl.grid.cols.max(1);
@@ -122,22 +193,55 @@ pub fn render_template_grid_with_override(
     }
 
     // ── Cells ───────────────────────────────────────────────────────────────
+    let interactive = opts.panel_states.is_some();
     for r in 0..rows {
         for c in 0..cols {
             let id = r * cols + c;
             let rect = layout.cell_rect(r, c);
+            // Runtime visibility override (v0.10.0 "Hide panel" path). When the
+            // override is `Some(false)` we still draw nothing but the rect is
+            // reserved — same behaviour as the template's `visible: false`.
+            let runtime_visible = opts
+                .visibility_override
+                .as_ref()
+                .and_then(|m| m.get(&(r, c)).copied())
+                .unwrap_or(true);
             // Always claim the rect so the next row's `available_rect`
             // computation downstream of the grid is correct, even when a
             // slot is empty.
             ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
                 ui.set_clip_rect(rect);
                 match at[id] {
-                    Some(cell) if cell.visible && !cell.sources.is_empty() => {
+                    Some(cell) if cell.visible && runtime_visible && !cell.sources.is_empty() => {
                         stats.panels += 1;
-                        let had_data =
-                            render_cell(ui, cell, store, store.window_s, label_override, rect);
+                        // Pull the lock state for this cell (None when the
+                        // CLI didn't pass a panel_states map — non-interactive
+                        // mode, identical to v0.9.0).
+                        let mut local_locked = false;
+                        let panel_locked = match &mut opts.panel_states {
+                            Some(map) => {
+                                let st = map.entry((r, c)).or_default();
+                                &mut st.locked
+                            }
+                            None => &mut local_locked,
+                        };
+                        let (had_data, plot_resp) = render_cell(
+                            ui,
+                            cell,
+                            store,
+                            store.window_s,
+                            label_override,
+                            rect,
+                            interactive,
+                            panel_locked,
+                        );
                         if had_data {
                             stats.panels_with_data += 1;
+                        }
+                        // Right-click context menu (v0.10.0). Only attached
+                        // when the CLI supplied a menu sink.
+                        if let Some(sink) = opts.menu_sink.as_deref_mut() {
+                            attach_context_menu(&plot_resp, cell, sink);
                         }
                     }
                     _ => {} // empty slot — rect is reserved, nothing drawn.
@@ -316,11 +420,17 @@ fn count_keys_with_data(tpl: &Template, store: &TraceStore) -> usize {
     keys.into_iter().filter(|k| store.len(k) > 0).count()
 }
 
-/// Render a single panel. Returns `true` if any line had at least one point.
+/// Render a single panel. Returns `(any_data, plot_response)`.
 ///
 /// `cell_rect` is the absolute pixel rect the cell owns; the plot height is
 /// forced via `.height(remaining)` so the Plot can never grow past the cell
 /// box and bleed into the next row.
+///
+/// v0.10.0 — `interactive=true` enables zoom/pan/box-zoom/double-click-reset.
+/// `locked` is mutated to `true` on the first interaction this frame (so the
+/// next frame skips the rolling-window X reset and the auto-bounds-Y reset).
+/// Double-click on the plot resets `locked` back to `false`.
+#[allow(clippy::too_many_arguments)]
 fn render_cell(
     ui: &mut egui::Ui,
     cell: &Cell,
@@ -328,7 +438,9 @@ fn render_cell(
     window_s: f64,
     label_override: LabelOverride,
     cell_rect: Rect,
-) -> bool {
+    interactive: bool,
+    locked: &mut bool,
+) -> (bool, egui::Response) {
     let plot_id = format!("cell_{}_{}", cell.row, cell.col);
 
     // Title above the plot — measured so the plot below knows how much height
@@ -357,6 +469,10 @@ fn render_cell(
     let plot_h = (cell_rect.height() - title_h).max(40.0);
     let plot_w = cell_rect.width();
 
+    // v0.10.0 — when interactive, enable the egui_plot zoom/pan/box-zoom
+    // suite + double-click reset. The auto-scale-Y default holds UNTIL the
+    // user interacts; after that, the per-cell `locked` flag stays `true`
+    // until the right-click "Reset zoom" or a double-click flips it off.
     let resp = Plot::new(plot_id)
         .legend(Legend::default())
         .show_axes([true, true])
@@ -366,17 +482,22 @@ fn render_cell(
         // next row on tight layouts (the v0.8.0 bug).
         .height(plot_h)
         .width(plot_w)
-        // Static panels: no live interaction (3D-only per design).
-        .allow_drag(false)
-        .allow_zoom(false)
-        .allow_scroll(false)
-        .allow_boxed_zoom(false)
+        .allow_drag(interactive)
+        .allow_zoom(interactive)
+        .allow_scroll(interactive)
+        .allow_boxed_zoom(interactive)
+        .allow_double_click_reset(interactive)
         .show(ui, |plot_ui| {
-            // X = rolling window. Y auto-scales to the visible data.
-            if latest_ts.is_finite() {
-                plot_ui.set_plot_bounds_x(x_lo..=x_hi);
+            // While the plot is unlocked, drive the rolling X window and the
+            // auto-scale-Y reset every frame (v0.9.0 behaviour). Once locked,
+            // leave the plot's bounds untouched so the user's pan / zoom
+            // persists across frames.
+            if !*locked {
+                if latest_ts.is_finite() {
+                    plot_ui.set_plot_bounds_x(x_lo..=x_hi);
+                }
+                plot_ui.set_auto_bounds([false, true]);
             }
-            plot_ui.set_auto_bounds([false, true]);
 
             any_data = draw_primitive(plot_ui, cell, store);
 
@@ -389,6 +510,20 @@ fn render_cell(
             }
         });
 
+    // v0.10.0 — flip the auto-scale lock on the FIRST interaction (drag /
+    // wheel / box-zoom). A double-click clears it so auto-scale resumes.
+    if interactive {
+        let r = &resp.response;
+        if r.double_clicked() {
+            *locked = false;
+        } else if r.dragged()
+            || r.clicked()
+            || (r.hovered() && r.ctx.input(|i| i.smooth_scroll_delta.y).abs() > 0.0)
+        {
+            *locked = true;
+        }
+    }
+
     // ── Non-reflowing label overlay (v0.9.0) ────────────────────────────
     // Paint AFTER the plot so the layout was already finalised: the overlay
     // can't push the plot down by toggling on/off. The overlay uses the
@@ -397,7 +532,47 @@ fn render_cell(
     // pixels regardless of what the data is doing.
     draw_label_overlay(ui, resp.response.rect, cell, store, label_override);
 
-    any_data
+    (any_data, resp.response)
+}
+
+/// v0.10.0 — attach the per-cell right-click context menu to a plot response.
+/// Drains user clicks into `sink` for the CLI to apply next frame.
+fn attach_context_menu(resp: &egui::Response, cell: &Cell, sink: &mut Vec<CellMenuAction>) {
+    let row = cell.row;
+    let col = cell.col;
+    resp.clone().context_menu(|ui| {
+        if ui.button("Edit panel...").clicked() {
+            sink.push(CellMenuAction::Edit { row, col });
+            ui.close();
+        }
+        if ui.button("Hide panel").clicked() {
+            sink.push(CellMenuAction::HideToggle { row, col });
+            ui.close();
+        }
+        if ui.button("Reset zoom").clicked() {
+            sink.push(CellMenuAction::ResetZoom { row, col });
+            ui.close();
+        }
+        ui.separator();
+        ui.label("Label:");
+        if ui.button("off").clicked() {
+            sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Off });
+            ui.close();
+        }
+        if ui.button("data").clicked() {
+            sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Data });
+            ui.close();
+        }
+        if ui.button("metadata").clicked() {
+            sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Metadata });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Delete panel").clicked() {
+            sink.push(CellMenuAction::Delete { row, col });
+            ui.close();
+        }
+    });
 }
 
 /// Dispatch on the cell's primitive and draw the appropriate lines.

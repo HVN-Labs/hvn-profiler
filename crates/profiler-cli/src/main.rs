@@ -26,10 +26,14 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
+use std::collections::HashMap;
+
 use profiler_render::{
-    render_faults_panel, render_gen_panel, render_template_grid_with_override,
-    render_view3d_with_override, FaultsPanelState, GeneratorPanelState, LabelOverride,
-    PendingCommand, SeenDrones, TraceStore, View3dState,
+    apply_panel_draft, apply_trail_draft, collect_source_keys, remove_cell_at, replace_cell_at,
+    render_faults_panel, render_gen_panel, render_template_grid_full,
+    render_view3d_with_override, CellMenuAction, FaultsPanelState, GeneratorPanelState,
+    GridRenderOptions, LabelOverride, PanelDraft, PanelState, PendingCommand, SeenDrones,
+    TraceStore, TrailDraft, View3dState,
 };
 use profiler_source::{
     multi_from_uris_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
@@ -214,6 +218,12 @@ fn main() -> anyhow::Result<()> {
 
     let mav_cfg = MavlinkConfig {
         passive: matches!(cli.mavlink_passive, MavlinkPassiveArg::On),
+        // v0.10.0 — when the operator passes `--drone NAME`, pin every MAVLink
+        // sample's `drone_name` to that string instead of the default
+        // `sysid_<id>` demux. Useful for single-vehicle links where the
+        // operator already knows the friendly name. ZMQ sources still use the
+        // envelope's own `drone_name`; this only applies to MAVLink legs.
+        drone_name_override: cli.drone.clone(),
     };
     // v0.9.0 — multi-source fan-in. Single-URI is the fast path
     // (preserves v0.8.0 behaviour bit-for-bit); >1 URI wraps every leg into
@@ -418,6 +428,38 @@ struct App {
     /// v0.8.0: most recent status text from a Save / Save-as / Open action,
     /// shown briefly in the toolbar.
     last_template_action: Option<String>,
+    // ── v0.10.0 state ────────────────────────────────────────────────────
+    /// Per-cell zoom/pan state. Persists across frames; the entry for
+    /// `(row, col)` is created lazily by the renderer on first paint.
+    panel_states: HashMap<(usize, usize), PanelState>,
+    /// Runtime visibility override (right-click "Hide panel"). Keyed by
+    /// `(row, col)`. Absent → use the template's `visible` flag.
+    cell_visibility_override: HashMap<(usize, usize), bool>,
+    /// Runtime per-cell `label_mode` override (right-click "Label: …").
+    cell_label_override: HashMap<(usize, usize), profiler_template::LabelMode>,
+    /// Sink for context-menu actions emitted by the renderer this frame.
+    /// Drained at the end of `update` so the actions take effect next frame.
+    pending_cell_actions: Vec<CellMenuAction>,
+    /// Open editor mode: `None` means no modal; otherwise the operator is
+    /// editing a panel / trail (Add or Edit). Cleared on Cancel/Add.
+    editor: Option<EditorMode>,
+    /// Source-key dropdown contents, refreshed on each opens of the editor
+    /// from the union of live store keys across every drone.
+    editor_source_keys_cache: Vec<String>,
+    /// `true` when the loaded template has been mutated since the last save.
+    /// Toolbar paints a `●` next to the template name. Ctrl+S clears it.
+    template_dirty: bool,
+}
+
+/// v0.10.0 — what the modal editor is currently doing.
+enum EditorMode {
+    /// "+ Add Panel" toolbar click — empty draft.
+    AddPanel(PanelDraft),
+    /// Per-cell "Edit panel..." right-click — pre-filled draft + original
+    /// `(row, col)` so the apply step calls `replace_cell_at`.
+    EditPanel { row: usize, col: usize, draft: PanelDraft },
+    /// "+ Add Trail" 3D-view click — empty draft.
+    AddTrail(TrailDraft),
 }
 
 impl App {
@@ -475,6 +517,13 @@ impl App {
             templates,
             current_template,
             last_template_action: None,
+            panel_states: HashMap::new(),
+            cell_visibility_override: HashMap::new(),
+            cell_label_override: HashMap::new(),
+            pending_cell_actions: Vec::new(),
+            editor: None,
+            editor_source_keys_cache: Vec::new(),
+            template_dirty: false,
         }
     }
 
@@ -599,6 +648,39 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.label_arg, LabelArg::Off, "off");
                 ui.selectable_value(&mut self.label_arg, LabelArg::Data, "data");
                 ui.selectable_value(&mut self.label_arg, LabelArg::Metadata, "metadata");
+            }
+
+            // v0.10.0 — in-app editor entry points + dirty flag.
+            if self.template.is_some() {
+                ui.separator();
+                if ui.button("+ Add Panel").clicked() {
+                    self.refresh_editor_source_keys();
+                    self.editor = Some(EditorMode::AddPanel(PanelDraft::default()));
+                }
+                if has_3d && ui.button("+ Add Trail").clicked() {
+                    self.refresh_editor_source_keys();
+                    self.editor = Some(EditorMode::AddTrail(TrailDraft::default()));
+                }
+                // Hidden-panels button: only visible when at least one cell
+                // is currently hidden via the runtime override map.
+                let hidden_n = self
+                    .cell_visibility_override
+                    .values()
+                    .filter(|v| !**v)
+                    .count();
+                if hidden_n > 0
+                    && ui
+                        .button(format!("Hidden panels ({hidden_n})"))
+                        .on_hover_text("Click to restore all hidden panels")
+                        .clicked()
+                {
+                    self.cell_visibility_override.clear();
+                    self.template_dirty = true;
+                }
+                if self.template_dirty {
+                    ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(0xff, 0x99, 0x33)))
+                        .on_hover_text("Template has unsaved changes (Ctrl+S to save)");
+                }
             }
 
             // Faults panel toggle (v0.6.0). Only available when --fault-panel on
@@ -794,6 +876,26 @@ impl eframe::App for App {
             }
         }
 
+        // ── v0.10.0 — drain per-cell context-menu actions queued by the grid
+        // renderer this frame. The renderer pushed entries into
+        // `self.pending_cell_actions` while drawing; we apply them here so
+        // the next frame sees the mutated template / state.
+        if !self.pending_cell_actions.is_empty() {
+            let actions: Vec<CellMenuAction> = self.pending_cell_actions.drain(..).collect();
+            for action in actions {
+                self.apply_cell_menu_action(action);
+            }
+        }
+
+        // ── v0.10.0 — in-app editor modal (Add Panel / Add Trail / Edit Panel).
+        // Driven by the toolbar buttons and the per-cell "Edit panel..." menu;
+        // the modal mutates the loaded template in-memory and flips the dirty
+        // bit so the toolbar's `●` indicator and Ctrl+S save flow notice.
+        if self.editor.is_some() {
+            let ctx = ui.ctx().clone();
+            self.render_editor_modal(&ctx);
+        }
+
         // 1 Hz status log — proof-of-life when running headless. The smoke
         // test greps for `view3d:` (3D modes) and `grid:` (2D / split).
         let now = Instant::now();
@@ -845,12 +947,30 @@ impl App {
     /// for the status log.
     fn render_grid(&mut self, ui: &mut egui::Ui) -> (usize, usize, usize) {
         let tpl = self.template.take().expect("render_grid called with template");
-        let store = self.view_store();
-        let stats = render_template_grid_with_override(
+        // Take store / state-maps via raw references to satisfy the
+        // split-borrow rules: `render_template_grid_full` takes
+        // `GridRenderOptions { panel_states: &mut HashMap, … }` and the
+        // store is `&TraceStore`, so we resolve the store via the same
+        // OnceLock empty trick `render_3d` uses.
+        let store = match self.view_drone.as_deref().and_then(|d| self.stores.get(d)) {
+            Some(s) => s,
+            None => {
+                use std::sync::OnceLock;
+                static EMPTY: OnceLock<TraceStore> = OnceLock::new();
+                EMPTY.get_or_init(TraceStore::default)
+            }
+        };
+        let opts = GridRenderOptions {
+            panel_states: Some(&mut self.panel_states),
+            menu_sink: Some(&mut self.pending_cell_actions),
+            visibility_override: Some(&self.cell_visibility_override),
+        };
+        let stats = render_template_grid_full(
             ui,
             &tpl,
             store,
             self.label_arg.to_override(),
+            opts,
         );
         self.template = Some(tpl);
         (stats.panels, stats.panels_with_data, stats.keys_with_data)
@@ -1036,11 +1156,18 @@ impl App {
     }
 
     /// Switch the active template to `templates[i]`, preserving the store
-    /// (so live data keeps flowing) and toolbar state (labels, fault panel,
-    /// generators). Resets only the bits that depend on the template
-    /// itself: the view3d init flag (so the 3D camera re-fits to the new
-    /// trail set) and the picked index.
+    /// (so live data keeps flowing), the discovered-drone roster, and the
+    /// operator's `view_drone` selection (when that drone is still known),
+    /// plus toolbar state (labels, fault panel, generators). Resets only
+    /// the bits that depend on the template itself: the view3d init flag
+    /// (so the 3D camera re-fits to the new trail set) and the picked index.
+    ///
+    /// v0.10.0 — explicit `view_drone` capture-and-restore: prior to this we
+    /// relied on the implicit invariant that nothing here touches the field;
+    /// the explicit step pins the contract and is what the
+    /// `view_drone_persist_test` integration test asserts.
     fn load_template_at(&mut self, i: usize) {
+        let captured_view_drone = self.view_drone.clone();
         let entry = match self.templates.get(i).cloned() {
             Some(e) => e,
             None => return,
@@ -1080,6 +1207,14 @@ impl App {
         self.template = Some(tpl);
         self.view3d_inited = false;
         self.current_template = Some(i);
+        // v0.10.0 — restore the captured view-drone selection if that drone
+        // is still known. If it's gone (the operator unplugged it between
+        // reloads), fall back to the first-seen drone so the renderer
+        // always has a valid target.
+        self.view_drone = match captured_view_drone {
+            Some(d) if self.stores.contains_key(&d) => Some(d),
+            _ => self.discovered_drones.first().cloned(),
+        };
     }
 
     fn open_template_dialog(&mut self) {
@@ -1210,6 +1345,434 @@ impl App {
         }
         ui
     }
+}
+
+// ─── v0.10.0 — in-app editor + per-cell context menu plumbing ────────────────
+
+impl App {
+    /// v0.10.0 — repopulate the source-key dropdown shown by the "+ Add Panel"
+    /// modal. Walks every per-drone [`TraceStore`] in `self.stores`, collects
+    /// the union of observed keys (with vector-base shorthand inserted so the
+    /// operator can pick `ap_attitude` for an `AttitudeRpy` panel without
+    /// remembering it expands to `ap_attitude[0..2]`), sorts + dedupes, and
+    /// stores the result in `editor_source_keys_cache`.
+    ///
+    /// Called whenever the operator opens the editor (toolbar "+ Add Panel"
+    /// / "+ Add Trail" or per-cell "Edit panel...") so the dropdown reflects
+    /// the keys observed *up to that moment* — a drone that started streaming
+    /// after a previous open will still have its keys in the list.
+    fn refresh_editor_source_keys(&mut self) {
+        self.editor_source_keys_cache = collect_source_keys(self.stores.values());
+    }
+
+    /// v0.10.0 — apply one [`CellMenuAction`] emitted by the per-cell
+    /// right-click menu. Called once per action drained at the end of each
+    /// frame so the next frame sees the mutated state.
+    ///
+    /// - `Edit` → open the editor pre-filled from the cell.
+    /// - `HideToggle` → flip `cell_visibility_override[(r,c)]`.
+    /// - `ResetZoom` → clear `panel_states[(r,c)].locked` so auto-scale-Y resumes.
+    /// - `SetLabelMode` → mutate the cell's own `label_mode` (template dirties).
+    /// - `Delete` → drop the cell from the template (template dirties).
+    fn apply_cell_menu_action(&mut self, action: CellMenuAction) {
+        match action {
+            CellMenuAction::Edit { row, col } => {
+                // Pre-fill the editor draft from the existing cell at (row,col).
+                let cell_opt = self
+                    .template
+                    .as_ref()
+                    .and_then(|t| t.cells.iter().find(|c| c.row == row && c.col == col).cloned());
+                let draft = match cell_opt {
+                    Some(cell) => panel_draft_from_cell(&cell),
+                    None => PanelDraft { row, col, ..Default::default() },
+                };
+                self.refresh_editor_source_keys();
+                self.editor = Some(EditorMode::EditPanel { row, col, draft });
+            }
+            CellMenuAction::HideToggle { row, col } => {
+                let cur = self
+                    .cell_visibility_override
+                    .get(&(row, col))
+                    .copied()
+                    .unwrap_or(true);
+                self.cell_visibility_override.insert((row, col), !cur);
+                self.template_dirty = true;
+            }
+            CellMenuAction::ResetZoom { row, col } => {
+                if let Some(st) = self.panel_states.get_mut(&(row, col)) {
+                    st.locked = false;
+                }
+            }
+            CellMenuAction::SetLabelMode { row, col, mode } => {
+                self.cell_label_override.insert((row, col), mode);
+                // Also mutate the template's own cell so the renderer
+                // (which honours `cell.label_mode` when LabelOverride::Respect
+                // is in effect) picks it up immediately.
+                if let Some(tpl) = self.template.as_mut() {
+                    for cell in tpl.cells.iter_mut() {
+                        if cell.row == row && cell.col == col {
+                            cell.label_mode = mode;
+                        }
+                    }
+                }
+                self.template_dirty = true;
+            }
+            CellMenuAction::Delete { row, col } => {
+                if let Some(tpl) = self.template.as_mut() {
+                    let _ = remove_cell_at(tpl, row, col);
+                    self.template_dirty = true;
+                }
+            }
+        }
+    }
+
+    /// v0.10.0 — render the open editor modal (Add Panel / Edit Panel /
+    /// Add Trail). The modal lives in its own `egui::Window` so it overlays
+    /// the grid without disturbing the central layout. On Apply / Add, the
+    /// modal mutates the in-memory template and sets `template_dirty = true`;
+    /// on Cancel / close, the editor is dropped without mutation.
+    fn render_editor_modal(&mut self, ctx: &egui::Context) {
+        // Take ownership so we can mutate without borrowing `self.editor`
+        // across the closure body.
+        let Some(mode) = self.editor.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut next: Option<EditorMode> = None;
+
+        match mode {
+            EditorMode::AddPanel(mut draft) => {
+                let mut commit = false;
+                let mut cancel = false;
+                egui::Window::new("+ Add Panel")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(360.0)
+                    .show(ctx, |ui| {
+                        panel_form(ui, &mut draft, &self.editor_source_keys_cache);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Add").clicked() {
+                                commit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if commit {
+                    if let Some(tpl) = self.template.as_mut() {
+                        match apply_panel_draft(tpl, &draft) {
+                            Ok(()) => {
+                                self.template_dirty = true;
+                                self.last_template_action = Some(format!(
+                                    "Added cell at ({}, {})", draft.row, draft.col,
+                                ));
+                            }
+                            Err(e) => {
+                                self.last_template_action = Some(format!("Add failed: {e}"));
+                                // Keep the modal open so operator can fix.
+                                next = Some(EditorMode::AddPanel(draft));
+                                keep_open = false;
+                            }
+                        }
+                    }
+                } else if cancel {
+                    // closed
+                } else {
+                    next = Some(EditorMode::AddPanel(draft));
+                }
+            }
+            EditorMode::EditPanel { row, col, mut draft } => {
+                let mut commit = false;
+                let mut cancel = false;
+                egui::Window::new(format!("Edit panel ({row}, {col})"))
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(360.0)
+                    .show(ctx, |ui| {
+                        panel_form(ui, &mut draft, &self.editor_source_keys_cache);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Apply").clicked() {
+                                commit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if commit {
+                    if let Some(tpl) = self.template.as_mut() {
+                        match replace_cell_at(tpl, row, col, &draft) {
+                            Ok(()) => {
+                                self.template_dirty = true;
+                                self.last_template_action = Some(format!(
+                                    "Updated cell at ({row}, {col})",
+                                ));
+                            }
+                            Err(e) => {
+                                self.last_template_action = Some(format!("Apply failed: {e}"));
+                                next = Some(EditorMode::EditPanel { row, col, draft });
+                                keep_open = false;
+                            }
+                        }
+                    }
+                } else if cancel {
+                    // closed
+                } else {
+                    next = Some(EditorMode::EditPanel { row, col, draft });
+                }
+            }
+            EditorMode::AddTrail(mut draft) => {
+                let mut commit = false;
+                let mut cancel = false;
+                egui::Window::new("+ Add Trail (3D)")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(360.0)
+                    .show(ctx, |ui| {
+                        trail_form(ui, &mut draft, &self.editor_source_keys_cache);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Add").clicked() {
+                                commit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if commit {
+                    if let Some(tpl) = self.template.as_mut() {
+                        match apply_trail_draft(tpl, &draft) {
+                            Ok(()) => {
+                                self.template_dirty = true;
+                                self.last_template_action = Some(format!(
+                                    "Added trail '{}'", draft.name,
+                                ));
+                                self.view3d_inited = false;
+                            }
+                            Err(e) => {
+                                self.last_template_action = Some(format!("Add failed: {e}"));
+                                next = Some(EditorMode::AddTrail(draft));
+                                keep_open = false;
+                            }
+                        }
+                    }
+                } else if cancel {
+                    // closed
+                } else {
+                    next = Some(EditorMode::AddTrail(draft));
+                }
+            }
+        }
+
+        // Reinstate the editor if the operator didn't commit/cancel this
+        // frame. `keep_open == false` is used by error paths to leave a
+        // sticky modal-open state with the failure message in
+        // `last_template_action`.
+        let _ = keep_open;
+        self.editor = next;
+    }
+}
+
+/// Build a [`PanelDraft`] from an existing cell — used by the "Edit panel..."
+/// flow so the modal opens pre-filled with the current values.
+fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
+    let (source_key, fallback, minus, color, overlay_extra) = match cell.sources.first() {
+        Some(src) => (
+            src.key.clone(),
+            src.fallback.clone().unwrap_or_default(),
+            src.minus.clone().unwrap_or_default(),
+            if !src.color.is_empty() {
+                src.color.clone()
+            } else {
+                cell.color.clone().unwrap_or_else(|| "#1f77b4".into())
+            },
+            cell.sources.iter().skip(1).map(|s| s.key.clone()).collect(),
+        ),
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            cell.color.clone().unwrap_or_else(|| "#1f77b4".into()),
+            Vec::new(),
+        ),
+    };
+    PanelDraft {
+        row: cell.row,
+        col: cell.col,
+        primitive: cell.primitive,
+        title: cell.title.clone(),
+        source_key,
+        fallback,
+        minus,
+        color,
+        label_mode: cell.label_mode,
+        overlay_extra_keys: overlay_extra,
+    }
+}
+
+/// Shared form widget for both Add Panel and Edit Panel modals — mutates a
+/// [`PanelDraft`] in place. Renders one labelled row per field.
+fn panel_form(ui: &mut egui::Ui, draft: &mut PanelDraft, source_keys: &[String]) {
+    use profiler_template::{LabelMode, Primitive};
+
+    egui::Grid::new("panel_form_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Row:");
+            ui.add(egui::DragValue::new(&mut draft.row).speed(1.0).range(0..=64));
+            ui.end_row();
+            ui.label("Col:");
+            ui.add(egui::DragValue::new(&mut draft.col).speed(1.0).range(0..=64));
+            ui.end_row();
+
+            ui.label("Title:");
+            ui.text_edit_singleline(&mut draft.title);
+            ui.end_row();
+
+            ui.label("Primitive:");
+            egui::ComboBox::from_id_salt("panel_form_primitive")
+                .selected_text(format!("{:?}", draft.primitive))
+                .show_ui(ui, |ui| {
+                    for p in [
+                        Primitive::Scalar,
+                        Primitive::Vector,
+                        Primitive::Overlay,
+                        Primitive::Magnitude,
+                        Primitive::Diff,
+                        Primitive::MagInterference,
+                        Primitive::AttitudeRpy,
+                    ] {
+                        ui.selectable_value(&mut draft.primitive, p, format!("{p:?}"));
+                    }
+                });
+            ui.end_row();
+
+            ui.label("Source key:");
+            source_key_combo(ui, "panel_form_src", &mut draft.source_key, source_keys);
+            ui.end_row();
+
+            ui.label("Fallback:");
+            ui.text_edit_singleline(&mut draft.fallback);
+            ui.end_row();
+
+            if draft.primitive == Primitive::Diff {
+                ui.label("Minus key:");
+                ui.text_edit_singleline(&mut draft.minus);
+                ui.end_row();
+            }
+
+            ui.label("Color:");
+            ui.text_edit_singleline(&mut draft.color);
+            ui.end_row();
+
+            ui.label("Label mode:");
+            egui::ComboBox::from_id_salt("panel_form_label_mode")
+                .selected_text(format!("{:?}", draft.label_mode))
+                .show_ui(ui, |ui| {
+                    for m in [LabelMode::Off, LabelMode::Data, LabelMode::Metadata] {
+                        ui.selectable_value(&mut draft.label_mode, m, format!("{m:?}"));
+                    }
+                });
+            ui.end_row();
+        });
+
+    // Overlay-only: editable list of extra source keys (one per line).
+    if draft.primitive == profiler_template::Primitive::Overlay {
+        ui.separator();
+        ui.label("Overlay extra keys (one per line):");
+        let mut joined = draft.overlay_extra_keys.join("\n");
+        if ui
+            .add(egui::TextEdit::multiline(&mut joined).desired_rows(3))
+            .changed()
+        {
+            draft.overlay_extra_keys = joined
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+}
+
+/// Form widget for the Add Trail modal.
+fn trail_form(ui: &mut egui::Ui, draft: &mut TrailDraft, source_keys: &[String]) {
+    egui::Grid::new("trail_form_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut draft.name);
+            ui.end_row();
+
+            ui.label("Label:");
+            ui.text_edit_singleline(&mut draft.label);
+            ui.end_row();
+
+            ui.label("Color:");
+            ui.text_edit_singleline(&mut draft.color);
+            ui.end_row();
+
+            ui.label("Dead-reckon?");
+            ui.checkbox(&mut draft.use_deadreckon, "synthesise from accel + quat");
+            ui.end_row();
+        });
+
+    ui.separator();
+    if draft.use_deadreckon {
+        egui::Grid::new("trail_form_dr_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Accel base:");
+                source_key_combo(ui, "trail_form_accel", &mut draft.accel_key, source_keys);
+                ui.end_row();
+                ui.label("Quat base:");
+                source_key_combo(ui, "trail_form_quat", &mut draft.quat_key, source_keys);
+                ui.end_row();
+                ui.label("Seed-from base:");
+                source_key_combo(ui, "trail_form_seed", &mut draft.seed_key, source_keys);
+                ui.end_row();
+            });
+    } else {
+        egui::Grid::new("trail_form_direct_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("X (East) key:");
+                source_key_combo(ui, "trail_form_x", &mut draft.x_key, source_keys);
+                ui.end_row();
+                ui.label("Y (North) key:");
+                source_key_combo(ui, "trail_form_y", &mut draft.y_key, source_keys);
+                ui.end_row();
+                ui.label("Z (NED-down) key:");
+                source_key_combo(ui, "trail_form_z", &mut draft.z_neg_key, source_keys);
+                ui.end_row();
+            });
+    }
+}
+
+/// Free-form text input + dropdown to pick from observed source keys.
+fn source_key_combo(ui: &mut egui::Ui, salt: &str, value: &mut String, source_keys: &[String]) {
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(value);
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text("▼")
+            .width(20.0)
+            .show_ui(ui, |ui| {
+                // Cap at 256 entries so a noisy run doesn't lock up the UI.
+                for k in source_keys.iter().take(256) {
+                    if ui.selectable_label(value == k, k).clicked() {
+                        *value = k.clone();
+                    }
+                }
+            });
+    });
 }
 
 /// Insert (or find-and-reuse) a `TemplateEntry` for `path` in `templates`,

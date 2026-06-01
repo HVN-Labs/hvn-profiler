@@ -91,11 +91,20 @@ const REQUEST_STREAM_RATE_HZ: u16 = 10;
 /// `Default` is `passive=false`: the v0.8.0 active-GCS behaviour. Toggle to
 /// `passive=true` via `--mavlink-passive on` on the CLI when sharing a
 /// socket with another GCS that already drives stream requests.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// v0.10.0 — `drone_name_override` pins the per-sample `drone_name` to a fixed
+/// string (the operator's `--drone NAME`), suppressing the default
+/// `system_id`-derived `sysid_<id>` naming. Useful when the operator knows
+/// there's only one vehicle on the link and wants a friendly label.
+#[derive(Debug, Clone, Default)]
 pub struct MavlinkOptions {
     /// When `true`, skip the 1 Hz HEARTBEAT and the `REQUEST_DATA_STREAM` —
     /// behave exactly like v0.4.0.
     pub passive: bool,
+    /// v0.10.0 — when `Some(name)`, every emitted `Sample.drone_name` is set
+    /// to `name` regardless of the inbound MAVLink frame's `system_id`. When
+    /// `None`, samples carry `sysid_<id>` derived from the frame header.
+    pub drone_name_override: Option<String>,
 }
 
 /// A direct MAVLink-over-UDP source. Spawns a worker thread that owns the
@@ -131,6 +140,10 @@ impl MavlinkSource {
     /// bad address or an already-bound port surfaces as an error from
     /// `from_uri` rather than silently dying inside the worker.
     pub fn connect_with(conn_str: &str, opts: MavlinkOptions) -> Result<Self> {
+        // Capture the small bool up front: the rest of `opts` (which now holds
+        // an owned `String` for the v0.10.0 drone-name override) is moved into
+        // the recv worker below.
+        let passive = opts.passive;
         let mut conn = mavlink::connect::<MavMessage>(conn_str)
             .with_context(|| format!("opening MAVLink connection at {conn_str}"))?;
 
@@ -166,7 +179,7 @@ impl MavlinkSource {
             .spawn(move || recv_worker_main(conn_recv, tx, opts, stop_recv, peer_recv))
             .context("spawning MAVLink recv worker thread")?;
 
-        let hb_worker = if opts.passive {
+        let hb_worker = if passive {
             None
         } else {
             let conn_hb = Arc::clone(&conn);
@@ -179,8 +192,7 @@ impl MavlinkSource {
         };
 
         log::info!(
-            "MavlinkSource: spawned worker on {conn_str} (passive={})",
-            opts.passive
+            "MavlinkSource: spawned worker on {conn_str} (passive={passive})",
         );
         Ok(Self {
             rx,
@@ -275,8 +287,17 @@ fn recv_worker_main(
             stream_requested = true;
         }
 
+        // v0.10.0 — demux by `system_id` so a single MAVLink leg carrying
+        // multiple vehicles fans out into distinct per-drone samples. The
+        // operator-supplied `--drone NAME` override (carried via
+        // `MavlinkOptions::drone_name_override`) wins when set.
+        let drone_name: String = match opts.drone_name_override.as_deref() {
+            Some(name) => name.to_string(),
+            None => format!("sysid_{}", header.system_id),
+        };
+
         let ts = started.elapsed().as_secs_f64();
-        for s in decode_to_samples(&msg, ts) {
+        for s in decode_to_samples_with_drone(&msg, ts, Some(drone_name.clone())) {
             match tx.try_send(s) {
                 Ok(()) => decoded += 1,
                 Err(TrySendError::Full(_)) => {
@@ -407,14 +428,25 @@ fn is_fatal(e: &mavlink::error::MessageReadError) -> bool {
 ///   altitude source on stock-stream vehicles.
 /// - Everything else (SCALED_IMU2/3, HEARTBEAT, …) is ignored for now.
 pub fn decode_to_samples(msg: &MavMessage, ts: f64) -> Vec<Sample> {
+    decode_to_samples_with_drone(msg, ts, None)
+}
+
+/// v0.10.0 — like [`decode_to_samples`] but stamps each emitted [`Sample`]
+/// with the supplied `drone_name`. The recv worker derives the name from each
+/// MAVLink frame's `system_id` (or from `MavlinkOptions::drone_name_override`)
+/// so a single leg carrying multiple vehicles fans out into distinct per-drone
+/// streams downstream.
+pub fn decode_to_samples_with_drone(
+    msg: &MavMessage,
+    ts: f64,
+    drone_name: Option<String>,
+) -> Vec<Sample> {
+    let dn = drone_name.clone();
     let s = |key: &str, value: f64| Sample {
         ts,
         key: key.to_string(),
         value,
-        // Direct MAVLink UDP carries no drone identity in its frames; the
-        // operator-supplied --drone CLI flag is what surfaces in the Faults
-        // panel for this transport.
-        drone_name: None,
+        drone_name: dn.clone(),
     };
     match msg {
         MavMessage::ATTITUDE(d) => vec![

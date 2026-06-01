@@ -63,7 +63,7 @@ fn active_source_emits_heartbeat_to_peer() {
     // Profiler-side source: udpout → connect/send to us.
     let _src = MavlinkSource::connect_with(
         &format!("udpout:127.0.0.1:{port}"),
-        MavlinkOptions { passive: false },
+        MavlinkOptions { passive: false, ..Default::default() },
     )
     .expect("source connect");
 
@@ -93,7 +93,7 @@ fn active_source_sends_request_data_stream_after_first_inbound_heartbeat() {
 
     let _src = MavlinkSource::connect_with(
         &format!("udpout:127.0.0.1:{port}"),
-        MavlinkOptions { passive: false },
+        MavlinkOptions { passive: false, ..Default::default() },
     )
     .expect("source connect");
 
@@ -150,7 +150,7 @@ fn passive_source_emits_no_heartbeat() {
 
     let _src = MavlinkSource::connect_with(
         &format!("udpout:127.0.0.1:{port}"),
-        MavlinkOptions { passive: true },
+        MavlinkOptions { passive: true, ..Default::default() },
     )
     .expect("source connect");
 
