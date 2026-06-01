@@ -15,6 +15,7 @@
 //! - v0.4.0: direct MAVLink over UDP (gated behind `mavlink-source`)
 //! - later:  CSV / log-file replay
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -49,7 +50,13 @@ pub struct Sample {
     /// streamer didn't supply one (older streamer, MAVLink CLI without
     /// `--drone-name`, etc.). The profiler treats missing names as
     /// "unknown" rather than crashing.
-    pub drone_name: Option<String>,
+    ///
+    /// v0.10.1 — backed by `Arc<str>` so a single allocation is shared
+    /// across every `Sample` in a flattened envelope / decoded MAVLink
+    /// frame. On a 10 Hz × 5-drone × 6-samples/message fleet this
+    /// eliminates ~300 short-lived String allocations per second on the
+    /// MAVLink decode hot path.
+    pub drone_name: Option<Arc<str>>,
 }
 
 /// A pull-based telemetry source. The render loop calls `try_recv` in a
@@ -196,13 +203,14 @@ pub fn multi_from_uris_with_discovery_opts(
         let (src, seen_opt) = from_uri_with_discovery_opts(uri, cfg.clone())?;
         // Fallback drone name when the source has no native discovery (mock /
         // mavlink): derive from URI host:port (strip the scheme).
-        let fallback_name = fallback_drone_name_from_uri(uri, i);
+        let fallback_name: Arc<str> = Arc::from(fallback_drone_name_from_uri(uri, i));
         // Merge: spawn a tiny watcher to copy this sub's seen set into merged.
         // Cheap — only fires when new names appear (read-poll once per push).
         subs.push(MultiSubSource {
             inner: src,
             fallback_name,
             inner_seen: seen_opt,
+            last_seen_len: 0,
             merged: Arc::clone(&merged),
         });
     }
@@ -235,12 +243,19 @@ fn fallback_drone_name_from_uri(uri: &str, idx: usize) -> String {
 struct MultiSubSource {
     inner: Box<dyn Source>,
     /// Stamped into samples whose `drone_name` is `None` (mock, mavlink).
-    /// For ZMQ legs the envelope's own name wins.
-    fallback_name: String,
+    /// For ZMQ legs the envelope's own name wins. Held as `Arc<str>` so a
+    /// single allocation services every fallback-stamped sample for the
+    /// life of the leg.
+    fallback_name: Arc<str>,
     /// The leg's own discovery set (`ZmqSource::seen_drones()` clone) when
     /// available. Polled on each push and the new entries unioned into
     /// `merged`.
     inner_seen: Option<SeenDrones>,
+    /// v0.10.1 — last observed `inner_seen.len()`. The MultiSource only takes
+    /// a write-lock on `merged` and copies entries when the leg's set has
+    /// actually grown. Without this we re-cloned + write-locked on every
+    /// sample (300+ write-locks/sec on a 10 Hz × 5-drone fleet).
+    last_seen_len: usize,
     /// Shared merged set across all legs of the parent [`MultiSource`].
     merged: SeenDrones,
 }
@@ -276,35 +291,42 @@ impl Source for MultiSource {
             if let Some(mut s) = leg.inner.try_recv() {
                 // Stamp the fallback name when the leg didn't supply one.
                 if s.drone_name.is_none() {
-                    s.drone_name = Some(leg.fallback_name.clone());
+                    s.drone_name = Some(Arc::clone(&leg.fallback_name));
                 }
                 // Union into merged. Fast path: read-lock first.
                 if let Some(name) = &s.drone_name {
                     let known = leg
                         .merged
                         .read()
-                        .map(|g| g.contains(name))
+                        .map(|g| g.contains(name.as_ref()))
                         .unwrap_or(true);
                     if !known {
                         if let Ok(mut g) = leg.merged.write() {
-                            g.insert(name.clone());
+                            g.insert(name.to_string());
                         }
                     }
                 }
                 // Also drain the leg's own native discovery set into merged
                 // (covers names that arrived via samples we never saw because
-                // a different leg yielded first).
+                // a different leg yielded first). v0.10.1 — only re-walk the
+                // set when it has actually grown since our last visit; this
+                // keeps the hot path lock-free for the steady state where the
+                // drone roster is stable.
                 if let Some(inner) = &leg.inner_seen {
-                    let to_add: Vec<String> = inner
-                        .read()
-                        .map(|g| g.iter().cloned().collect())
-                        .unwrap_or_default();
-                    if !to_add.is_empty() {
-                        if let Ok(mut m) = leg.merged.write() {
-                            for n in to_add {
-                                m.insert(n);
+                    let cur_len = inner.read().map(|g| g.len()).unwrap_or(0);
+                    if cur_len > leg.last_seen_len {
+                        let to_add: Vec<String> = inner
+                            .read()
+                            .map(|g| g.iter().cloned().collect())
+                            .unwrap_or_default();
+                        if !to_add.is_empty() {
+                            if let Ok(mut m) = leg.merged.write() {
+                                for n in to_add {
+                                    m.insert(n);
+                                }
                             }
                         }
+                        leg.last_seen_len = cur_len;
                     }
                 }
                 self.rr_cursor = (i + 1) % n;
@@ -415,7 +437,8 @@ pub fn flatten_msgpack(bytes: &[u8]) -> Result<Vec<Sample>> {
 pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
     let mut out = Vec::new();
     let ts = env.ts;
-    let drone_name = env.drone_name.clone();
+    // v0.10.1 — one Arc<str> allocation, cloned (refcount bump) per sample.
+    let drone_name: Option<Arc<str>> = env.drone_name.as_deref().map(Arc::from);
     let map = match env.values.as_map() {
         Some(m) => m,
         None => return out,

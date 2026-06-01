@@ -52,6 +52,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -291,13 +292,16 @@ fn recv_worker_main(
         // multiple vehicles fans out into distinct per-drone samples. The
         // operator-supplied `--drone NAME` override (carried via
         // `MavlinkOptions::drone_name_override`) wins when set.
-        let drone_name: String = match opts.drone_name_override.as_deref() {
-            Some(name) => name.to_string(),
-            None => format!("sysid_{}", header.system_id),
+        //
+        // v0.10.1 — held as `Arc<str>` so every emitted `Sample` clones a
+        // refcount instead of allocating a fresh `String`.
+        let drone_name: Arc<str> = match opts.drone_name_override.as_deref() {
+            Some(name) => Arc::from(name),
+            None => Arc::from(format!("sysid_{}", header.system_id).as_str()),
         };
 
         let ts = started.elapsed().as_secs_f64();
-        for s in decode_to_samples_with_drone(&msg, ts, Some(drone_name.clone())) {
+        for s in decode_to_samples_with_drone(&msg, ts, Some(Arc::clone(&drone_name))) {
             match tx.try_send(s) {
                 Ok(()) => decoded += 1,
                 Err(TrySendError::Full(_)) => {
@@ -439,14 +443,15 @@ pub fn decode_to_samples(msg: &MavMessage, ts: f64) -> Vec<Sample> {
 pub fn decode_to_samples_with_drone(
     msg: &MavMessage,
     ts: f64,
-    drone_name: Option<String>,
+    drone_name: Option<Arc<str>>,
 ) -> Vec<Sample> {
-    let dn = drone_name.clone();
+    // v0.10.1 — one shared `Arc<str>` across every emitted sample; the
+    // closure just bumps the refcount instead of allocating a `String`.
     let s = |key: &str, value: f64| Sample {
         ts,
         key: key.to_string(),
         value,
-        drone_name: dn.clone(),
+        drone_name: drone_name.as_ref().map(Arc::clone),
     };
     match msg {
         MavMessage::ATTITUDE(d) => vec![

@@ -72,8 +72,8 @@ fn discovery_set_grows_from_multiple_envelopes() {
         let bytes = envelope_with(ts, Some(name));
         let samples = flatten_msgpack(&bytes).expect("decode");
         for s in samples {
-            if let Some(n) = s.drone_name {
-                seen.insert(n);
+            if let Some(n) = &s.drone_name {
+                seen.insert(n.to_string());
             }
         }
     }
@@ -98,8 +98,8 @@ fn discovery_set_ignores_envelopes_with_no_drone_name() {
         let bytes = envelope_with(ts, name);
         let samples = flatten_msgpack(&bytes).expect("decode");
         for s in samples {
-            if let Some(n) = s.drone_name {
-                seen.insert(n);
+            if let Some(n) = &s.drone_name {
+                seen.insert(n.to_string());
             }
         }
     }

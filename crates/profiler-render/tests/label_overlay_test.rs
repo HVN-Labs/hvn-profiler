@@ -16,10 +16,10 @@
 //! Visual / snapshot tests aren't practical for egui in headless CI; these
 //! structural checks are the load-bearing v0.9.0 invariant.
 
-use egui::{RawInput, Rect, Vec2};
+use egui::{Pos2, RawInput, Rect, Vec2};
 use profiler_render::{
-    build_label_text, overlay_box_size, render_template_grid_with_override, LabelOverride,
-    TraceStore,
+    build_label_text, compute_overlay_pos, overlay_box_size,
+    render_template_grid_with_override, LabelOverride, TraceStore,
 };
 use profiler_template::{LabelMode, Template};
 
@@ -88,6 +88,47 @@ fn overlay_box_size_depends_on_text_only() {
             long.y,
         );
     });
+}
+
+/// v0.10.1 — pin the label overlay anchor to the top-LEFT of the plot rect.
+/// Before v0.10.1 the overlay was top-right, which continuously occluded the
+/// live trace tip on a rolling X window. The pure `compute_overlay_pos`
+/// helper is the load-bearing primitive — this test guards against regression
+/// to a right-anchored position.
+#[test]
+fn label_overlay_anchors_top_left() {
+    let plot_rect = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(400.0, 250.0));
+    let text_size = Vec2::new(80.0, 14.0);
+    let pos = compute_overlay_pos(plot_rect, text_size);
+
+    // Top-left: anchor sits in the upper-LEFT quadrant of the plot rect.
+    assert!(
+        pos.x < plot_rect.center().x,
+        "overlay x={} must be left of plot center {}",
+        pos.x,
+        plot_rect.center().x,
+    );
+    assert!(
+        pos.y < plot_rect.center().y,
+        "overlay y={} must be above plot center {}",
+        pos.y,
+        plot_rect.center().y,
+    );
+
+    // And specifically: NOT the old top-right anchor (right - text.x - PAD, ...).
+    let old_right_anchor_x = plot_rect.right() - text_size.x - 6.0;
+    assert!(
+        pos.x < old_right_anchor_x,
+        "overlay x={} must NOT be the old right-anchored value {}",
+        pos.x,
+        old_right_anchor_x,
+    );
+
+    // Sanity: a small inset (OVERLAY_PAD = 6.0) keeps it inside the rect.
+    assert!(pos.x >= plot_rect.left());
+    assert!(pos.y >= plot_rect.top());
+    assert!((pos.x - plot_rect.left()).abs() < 16.0);
+    assert!((pos.y - plot_rect.top()).abs() < 16.0);
 }
 
 /// End-to-end: rendering the grid with labels-off and labels-forced-on must

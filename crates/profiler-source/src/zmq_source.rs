@@ -157,10 +157,10 @@ async fn run_loop(endpoint: &str, tx: &Sender<Sample>, seen: &SeenDrones) -> Res
             // avoid the write lock on the hot path when the name is
             // already known.
             if let Some(name) = &s.drone_name {
-                let known = seen.read().map(|g| g.contains(name)).unwrap_or(true);
+                let known = seen.read().map(|g| g.contains(name.as_ref())).unwrap_or(true);
                 if !known {
                     if let Ok(mut g) = seen.write() {
-                        if g.insert(name.clone()) {
+                        if g.insert(name.to_string()) {
                             log::info!("ZmqSource: discovered drone '{name}'");
                         }
                     }

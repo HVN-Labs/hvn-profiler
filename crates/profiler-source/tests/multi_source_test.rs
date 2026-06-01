@@ -37,7 +37,7 @@ fn sample(ts: f64, key: &str, value: f64, name: Option<&str>) -> Sample {
         ts,
         key: key.into(),
         value,
-        drone_name: name.map(str::to_string),
+        drone_name: name.map(std::sync::Arc::from),
     }
 }
 
@@ -58,12 +58,12 @@ fn mock_dual_source_stamps_distinct_drone_names() {
     // Drain ~200 samples (mock emits at 60 Hz, sleep is tricky; the test
     // tolerates whatever shows up in the first batch as long as both
     // fallback names appear).
-    let mut got = std::collections::HashSet::new();
+    let mut got: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut drained = 0;
     for _ in 0..400 {
         if let Some(s) = src.try_recv() {
-            if let Some(n) = s.drone_name {
-                got.insert(n);
+            if let Some(n) = &s.drone_name {
+                got.insert(n.to_string());
             }
             drained += 1;
             if got.len() >= 2 {

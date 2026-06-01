@@ -428,6 +428,24 @@ impl Template {
     pub fn to_pretty_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).context("serialising template to JSON")
     }
+
+    /// v0.10.1 — minimal in-memory template the picker's "+ New blank
+    /// template…" entry bootstraps. A 1×1 grid with zero cells; the operator
+    /// populates it via "+ Add Panel", and the grid auto-grows when a new
+    /// cell is added beyond the current `rows` / `cols` (see
+    /// `apply_panel_draft`).
+    pub fn blank(name: impl Into<String>) -> Template {
+        Template {
+            name: name.into(),
+            description: String::new(),
+            grid: Grid { rows: 1, cols: 1 },
+            sections: Vec::new(),
+            cells: Vec::new(),
+            view_3d: None,
+            view_slider: None,
+            ui_state: None,
+        }
+    }
 }
 
 /// Backwards-compatible free function (v0.0.1 API).

@@ -80,20 +80,31 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
     if draft.source_key.trim().is_empty() {
         return Err("source key must not be empty".into());
     }
-    if draft.row >= tpl.grid.rows {
-        return Err(format!(
-            "row {} is out of range (grid has {} rows)",
-            draft.row, tpl.grid.rows,
-        ));
-    }
-    if draft.col >= tpl.grid.cols {
-        return Err(format!(
-            "col {} is out of range (grid has {} cols)",
-            draft.col, tpl.grid.cols,
-        ));
-    }
     if draft.primitive == Primitive::Diff && draft.minus.trim().is_empty() {
         return Err("diff primitive requires a subtrahend key".into());
+    }
+    // v0.10.1 — auto-grow the grid so the "+ New blank template…" flow can
+    // start at 1×1 and expand as the operator adds panels. Capped to keep a
+    // typo (e.g. 9999) from blowing the renderer up; 64×64 is well past what
+    // we'd ever ship.
+    const MAX_GRID_DIM: usize = 64;
+    if draft.row >= MAX_GRID_DIM {
+        return Err(format!(
+            "row {} exceeds maximum grid dimension ({MAX_GRID_DIM})",
+            draft.row,
+        ));
+    }
+    if draft.col >= MAX_GRID_DIM {
+        return Err(format!(
+            "col {} exceeds maximum grid dimension ({MAX_GRID_DIM})",
+            draft.col,
+        ));
+    }
+    if draft.row >= tpl.grid.rows {
+        tpl.grid.rows = draft.row + 1;
+    }
+    if draft.col >= tpl.grid.cols {
+        tpl.grid.cols = draft.col + 1;
     }
 
     // Primary source.
@@ -149,15 +160,39 @@ pub fn remove_cell_at(tpl: &mut Template, row: usize, col: usize) -> Result<(), 
     }
 }
 
-/// Replace the cell at `(row, col)` with the draft contents — used by the
-/// per-cell "Edit panel..." flow. Equivalent to `remove_cell_at` followed by
-/// `apply_panel_draft`, but tolerates "no existing cell" (acts as add).
+/// Replace the cell originally at `(row, col)` with the draft contents — used
+/// by the per-cell "Edit panel..." flow.
+///
+/// v0.10.1 — the draft's own `(row, col)` is honoured: if the operator drags
+/// the panel to a new slot, the original cell at `(row, col)` is removed and
+/// the new entry is inserted at `(draft.row, draft.col)`. Pure replacement
+/// (when `(draft.row, draft.col) == (row, col)`) is the common case and works
+/// as before. Returns `Err` if the destination is already occupied by a
+/// DIFFERENT cell — the modal should stay open with a status-bar message.
 pub fn replace_cell_at(tpl: &mut Template, row: usize, col: usize, draft: &PanelDraft) -> Result<(), String> {
-    let mut new_draft = draft.clone();
-    new_draft.row = row;
-    new_draft.col = col;
-    let _ = remove_cell_at(tpl, row, col); // ok if nothing was there
-    apply_panel_draft(tpl, &new_draft)
+    let new_row = draft.row;
+    let new_col = draft.col;
+    let relocating = (new_row, new_col) != (row, col);
+    if relocating {
+        // Refuse to silently clobber an unrelated cell at the destination.
+        let occupied = tpl
+            .cells
+            .iter()
+            .any(|c| c.row == new_row && c.col == new_col);
+        if occupied {
+            return Err(format!(
+                "destination ({new_row}, {new_col}) is already occupied; \
+                 delete that cell first"
+            ));
+        }
+    }
+    // Remove the cell at the ORIGINAL coordinates (`(row, col)` — the menu-
+    // invocation slot). Tolerate "no existing cell" so this also works as a
+    // pure add.
+    let _ = remove_cell_at(tpl, row, col);
+    // `apply_panel_draft` already uses `draft.row` / `draft.col` as the
+    // insert location, so the relocation just works.
+    apply_panel_draft(tpl, draft)
 }
 
 /// Draft state for the "+ Add Trail" 3D modal.
@@ -390,15 +425,76 @@ mod tests {
             &PanelDraft { row: 1, col: 1, source_key: "old".into(), ..Default::default() },
         )
         .unwrap();
+        // Pure replace (same row/col) — common case.
         replace_cell_at(
             &mut tpl,
             1,
             1,
-            &PanelDraft { source_key: "new".into(), ..Default::default() },
+            &PanelDraft { row: 1, col: 1, source_key: "new".into(), ..Default::default() },
         )
         .unwrap();
         assert_eq!(tpl.cells.len(), 1);
         assert_eq!(tpl.cells[0].sources[0].key, "new");
+        assert_eq!((tpl.cells[0].row, tpl.cells[0].col), (1, 1));
+    }
+
+    /// v0.10.1 — Edit modal honours the form's row/col: moving a panel to a
+    /// new slot relocates it. The original coordinates are emptied; the new
+    /// coordinates are populated.
+    #[test]
+    fn replace_cell_at_relocates_when_draft_has_new_row_col() {
+        let mut tpl = empty_template();
+        apply_panel_draft(
+            &mut tpl,
+            &PanelDraft { row: 2, col: 1, source_key: "moved".into(), ..Default::default() },
+        )
+        .unwrap();
+        // Operator opens Edit on (2, 1), changes Row/Col to (1, 2) in the
+        // form, clicks Apply. Old cell at (2, 1) disappears; new cell at
+        // (1, 2) appears.
+        replace_cell_at(
+            &mut tpl,
+            2,
+            1,
+            &PanelDraft { row: 1, col: 2, source_key: "moved".into(), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(tpl.cells.len(), 1);
+        assert_eq!((tpl.cells[0].row, tpl.cells[0].col), (1, 2));
+        assert!(
+            !tpl.cells.iter().any(|c| (c.row, c.col) == (2, 1)),
+            "original slot is empty after a relocation"
+        );
+    }
+
+    /// v0.10.1 — relocating onto an already-occupied slot must error so the
+    /// modal can stay open with a status-bar message.
+    #[test]
+    fn replace_cell_at_rejects_relocation_to_occupied_slot() {
+        let mut tpl = empty_template();
+        apply_panel_draft(
+            &mut tpl,
+            &PanelDraft { row: 0, col: 0, source_key: "a".into(), ..Default::default() },
+        )
+        .unwrap();
+        apply_panel_draft(
+            &mut tpl,
+            &PanelDraft { row: 1, col: 1, source_key: "b".into(), ..Default::default() },
+        )
+        .unwrap();
+        let err = replace_cell_at(
+            &mut tpl,
+            0,
+            0,
+            &PanelDraft { row: 1, col: 1, source_key: "a".into(), ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("occupied"),
+            "error message mentions occupancy: {err}"
+        );
+        // Both cells preserved — modal stays open, no state mutation.
+        assert_eq!(tpl.cells.len(), 2);
     }
 
     #[test]

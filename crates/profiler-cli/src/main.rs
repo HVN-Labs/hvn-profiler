@@ -538,9 +538,12 @@ impl App {
         while n < MAX_DRAIN_PER_FRAME {
             match self.source.try_recv() {
                 Some(s) => {
+                    // v0.10.1 — Sample.drone_name is `Arc<str>`; route via a
+                    // single `to_string()` for the HashMap key.
                     let drone_key = s
                         .drone_name
-                        .clone()
+                        .as_deref()
+                        .map(str::to_string)
                         .unwrap_or_else(|| UNNAMED_DRONE.to_string());
                     let is_new = !self.stores.contains_key(&drone_key);
                     let store = self
@@ -1059,6 +1062,9 @@ enum TemplateAction {
     OpenFile,
     /// "Save as..." — show a save dialog, write to chosen path.
     SaveAs,
+    /// v0.10.1 — "+ New blank template..." — prompt for a filename, then
+    /// bootstrap an empty 1×1 grid the operator populates via "+ Add Panel".
+    NewBlank,
 }
 
 impl App {
@@ -1088,6 +1094,11 @@ impl App {
                 ui.separator();
                 if ui.button("📁 Open template file…").clicked() {
                     action = Some(TemplateAction::OpenFile);
+                }
+                // v0.10.1 — bootstrap an empty template the user populates
+                // via "+ Add Panel".
+                if ui.button("✨ + New blank template…").clicked() {
+                    action = Some(TemplateAction::NewBlank);
                 }
                 // The Save button is enabled only when a savable entry is
                 // selected. Bundled entries pop "Save as..." instead.
@@ -1152,6 +1163,7 @@ impl App {
             TemplateAction::Select(i) => self.load_template_at(i),
             TemplateAction::OpenFile => self.open_template_dialog(),
             TemplateAction::SaveAs => self.save_as_dialog(),
+            TemplateAction::NewBlank => self.new_blank_template_dialog(),
         }
     }
 
@@ -1232,6 +1244,57 @@ impl App {
                 self.last_template_action = Some(msg);
             }
         }
+    }
+
+    /// v0.10.1 — "+ New blank template…": prompt for a filename in the user
+    /// templates directory, then bootstrap an in-memory `Template::blank()`.
+    /// The file is NOT written here — Ctrl+S writes the JSON once the
+    /// operator has added at least one panel. Cancelling the dialog is a
+    /// no-op (no state mutation, no status-bar message).
+    ///
+    /// After load:
+    /// - The new template is registered as a `Cli`-origin entry so the
+    ///   picker selects it (in-place Save targets the chosen path).
+    /// - `template_dirty` is set to `true` so the toolbar shows `●` even
+    ///   before the first edit, signalling "this template has not been
+    ///   written to disk yet."
+    fn new_blank_template_dialog(&mut self) {
+        let dir = profiler_template::user_templates_dir();
+        let res = rfd::FileDialog::new()
+            .add_filter("HVN profiler template", &["json"])
+            .set_directory(&dir)
+            .set_file_name("untitled.json")
+            .save_file();
+        let Some(path) = res else { return };
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+            .to_string();
+        let tpl = Template::blank(stem);
+
+        // Append a fresh Cli-origin entry pointing at the chosen path. We do
+        // not re-discover here so the operator's choice survives even if the
+        // path sits outside the user-templates dir.
+        let entry = TemplateEntry {
+            name: tpl.name.clone(),
+            origin: TemplateOrigin::Cli { path: path.clone() },
+        };
+        self.templates.push(entry);
+        let idx = self.templates.len() - 1;
+
+        // Default 2D-grid view (blank template has no 3D block).
+        self.mode = ViewMode::Grid;
+        self.template = Some(tpl);
+        self.current_template = Some(idx);
+        self.view3d_inited = false;
+        self.template_dirty = true;
+        self.last_template_action = Some(format!(
+            "New blank template (save to {})",
+            path.display(),
+        ));
+        log::info!("created blank template at {}", path.display());
     }
 
     fn save_as_dialog(&mut self) {
@@ -1438,7 +1501,9 @@ impl App {
             return;
         };
 
-        let mut keep_open = true;
+        // The modal's open-state is driven entirely by `next`: error branches
+        // re-emit the editor mode so the modal stays open with the failure
+        // message in `last_template_action`; success branches let it drop.
         let mut next: Option<EditorMode> = None;
 
         match mode {
@@ -1474,7 +1539,6 @@ impl App {
                                 self.last_template_action = Some(format!("Add failed: {e}"));
                                 // Keep the modal open so operator can fix.
                                 next = Some(EditorMode::AddPanel(draft));
-                                keep_open = false;
                             }
                         }
                     }
@@ -1508,14 +1572,23 @@ impl App {
                         match replace_cell_at(tpl, row, col, &draft) {
                             Ok(()) => {
                                 self.template_dirty = true;
-                                self.last_template_action = Some(format!(
-                                    "Updated cell at ({row}, {col})",
-                                ));
+                                // v0.10.1 — if the operator changed Row/Col in
+                                // the form, the cell has relocated; surface
+                                // both the source and destination so it's
+                                // obvious from the status bar.
+                                let msg = if (draft.row, draft.col) == (row, col) {
+                                    format!("Updated cell at ({row}, {col})")
+                                } else {
+                                    format!(
+                                        "Moved cell ({row}, {col}) → ({}, {})",
+                                        draft.row, draft.col,
+                                    )
+                                };
+                                self.last_template_action = Some(msg);
                             }
                             Err(e) => {
                                 self.last_template_action = Some(format!("Apply failed: {e}"));
                                 next = Some(EditorMode::EditPanel { row, col, draft });
-                                keep_open = false;
                             }
                         }
                     }
@@ -1557,7 +1630,6 @@ impl App {
                             Err(e) => {
                                 self.last_template_action = Some(format!("Add failed: {e}"));
                                 next = Some(EditorMode::AddTrail(draft));
-                                keep_open = false;
                             }
                         }
                     }
@@ -1570,10 +1642,8 @@ impl App {
         }
 
         // Reinstate the editor if the operator didn't commit/cancel this
-        // frame. `keep_open == false` is used by error paths to leave a
-        // sticky modal-open state with the failure message in
-        // `last_template_action`.
-        let _ = keep_open;
+        // frame. Error paths re-emit the mode via `next` so the modal stays
+        // open with the failure message in `last_template_action`.
         self.editor = next;
     }
 }

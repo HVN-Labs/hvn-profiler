@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use egui::{Align2, Color32, Rect, RichText, TextStyle, UiBuilder, Vec2};
-use egui_plot::{HLine, Legend, Line, Plot, PlotPoints};
+use egui_plot::{Corner, HLine, Legend, Line, Plot, PlotPoints};
 
 use profiler_template::{Cell, CellSource, LabelMode, Primitive, Section, Template};
 
@@ -474,7 +474,11 @@ fn render_cell(
     // user interacts; after that, the per-cell `locked` flag stays `true`
     // until the right-click "Reset zoom" or a double-click flips it off.
     let resp = Plot::new(plot_id)
-        .legend(Legend::default())
+        // v0.10.1 — pin the legend to the top-left so it stays clear of the
+        // most-recent samples on a rolling X window (which always end at the
+        // RIGHT edge of the plot). With the default `RightTop` position the
+        // legend overlapped the live trace tip every frame.
+        .legend(Legend::default().position(Corner::LeftTop))
         .show_axes([true, true])
         .show_grid([true, true])
         // Force the plot footprint to the cell rect minus the title strip.
@@ -888,12 +892,18 @@ pub fn build_label_text(
     }
 }
 
-/// Paint the per-panel `label_mode` overlay onto `plot_rect`'s top-right corner
+/// Paint the per-panel `label_mode` overlay onto `plot_rect`'s top-left corner
 /// using the parent ui's painter (so it never participates in layout).
 ///
 /// `plot_rect` is the screen-space rect returned by `Plot::show()` —
 /// `PlotResponse::response.rect`. The overlay is drawn as a translucent black
 /// rounded rectangle with the label text painted on top in [`TextStyle::Small`].
+///
+/// v0.10.1 — anchor moved from top-right to top-left to match the legend
+/// position. On a rolling-window plot the live trace tip is pinned to the
+/// RIGHT edge, so right-anchored overlays were continuously occluding fresh
+/// data. The left edge holds the oldest samples, which are far more
+/// tolerant of an overlay rectangle.
 fn draw_label_overlay(
     ui: &mut egui::Ui,
     plot_rect: Rect,
@@ -910,12 +920,9 @@ fn draw_label_overlay(
     let galley = ui.painter().layout_no_wrap(text.clone(), font.clone(), text_color);
     let text_size = galley.size();
 
-    // Top-right corner of the plot rect, inset by OVERLAY_PAD on both axes.
+    // Top-left corner of the plot rect, inset by OVERLAY_PAD on both axes.
     let bg_size = text_size + 2.0 * OVERLAY_TEXT_INSET;
-    let bg_min = egui::pos2(
-        plot_rect.right() - OVERLAY_PAD - bg_size.x,
-        plot_rect.top() + OVERLAY_PAD,
-    );
+    let bg_min = compute_overlay_pos(plot_rect, text_size);
     let bg_rect = Rect::from_min_size(bg_min, bg_size);
 
     // Clip to the plot rect so an oversized label can't bleed into adjacent
@@ -928,6 +935,20 @@ fn draw_label_overlay(
 
     // Paint the galley at the inset position inside the background box.
     painter.galley(bg_min + OVERLAY_TEXT_INSET, galley, text_color);
+}
+
+/// Pure helper: top-left anchor of the label overlay's background rect for a
+/// given `plot_rect` and measured `text_size`. Exposed so layout tests can
+/// pin the v0.10.1 top-left anchor without spinning up a real egui context.
+///
+/// `text_size` is unused for the anchor itself but kept in the signature to
+/// match `draw_label_overlay`'s callsite and make the intent explicit (the
+/// box grows from the anchor to the right + down).
+pub fn compute_overlay_pos(plot_rect: Rect, _text_size: Vec2) -> egui::Pos2 {
+    egui::pos2(
+        plot_rect.left() + OVERLAY_PAD,
+        plot_rect.top() + OVERLAY_PAD,
+    )
 }
 
 /// Pure helper for layout tests: how much screen space the label overlay would

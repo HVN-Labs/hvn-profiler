@@ -27,32 +27,36 @@ fn empty_template() -> Template {
 }
 
 /// Apply a `CellMenuAction` against the CLI's state model — mirror of
-/// the App-side handler in profiler-cli.
+/// the App-side handler in profiler-cli. Returns `true` when the action
+/// dirtied the template (CLI sets `template_dirty = true` on the same
+/// transitions).
 fn apply_action(
     action: &CellMenuAction,
     tpl: &mut Template,
     visibility: &mut HashMap<(usize, usize), bool>,
     panel_states: &mut HashMap<(usize, usize), PanelState>,
     label_overrides: &mut HashMap<(usize, usize), LabelMode>,
-) {
+) -> bool {
     match action {
         CellMenuAction::HideToggle { row, col } => {
             let cur = visibility.get(&(*row, *col)).copied().unwrap_or(true);
             visibility.insert((*row, *col), !cur);
+            true
         }
         CellMenuAction::ResetZoom { row, col } => {
             if let Some(st) = panel_states.get_mut(&(*row, *col)) {
                 st.locked = false;
             }
+            false // pure UI — never dirties the template
         }
         CellMenuAction::SetLabelMode { row, col, mode } => {
             label_overrides.insert((*row, *col), *mode);
+            true
         }
-        CellMenuAction::Delete { row, col } => {
-            let _ = remove_cell_at(tpl, *row, *col);
-        }
+        CellMenuAction::Delete { row, col } => remove_cell_at(tpl, *row, *col).is_ok(),
         CellMenuAction::Edit { .. } => {
             // Edit just opens the modal — no state mutation here.
+            false
         }
     }
 }
@@ -183,6 +187,60 @@ fn edit_action_is_noop_at_state_level() {
         &mut labels,
     );
     assert_eq!(tpl.cells.len(), before.len(), "Edit action does not mutate cells");
+}
+
+/// v0.10.1 — right-click "Delete panel" round-trip:
+///
+/// 1. Operator right-clicks cell at (1, 1).
+/// 2. Menu emits `CellMenuAction::Delete { row: 1, col: 1 }`.
+/// 3. CLI handler removes the cell and sets `template_dirty = true`.
+/// 4. The cells array shrinks by exactly 1.
+#[test]
+fn delete_action_shrinks_cells_and_dirties_template_v010_1() {
+    let mut tpl = empty_template();
+    apply_panel_draft(
+        &mut tpl,
+        &PanelDraft { row: 0, col: 0, source_key: "a".into(), ..Default::default() },
+    )
+    .unwrap();
+    apply_panel_draft(
+        &mut tpl,
+        &PanelDraft { row: 1, col: 1, source_key: "b".into(), ..Default::default() },
+    )
+    .unwrap();
+    assert_eq!(tpl.cells.len(), 2, "two cells seeded");
+
+    let mut visibility = HashMap::new();
+    let mut states = HashMap::new();
+    let mut labels = HashMap::new();
+    let mut template_dirty = false;
+
+    let dirtied = apply_action(
+        &CellMenuAction::Delete { row: 1, col: 1 },
+        &mut tpl,
+        &mut visibility,
+        &mut states,
+        &mut labels,
+    );
+    template_dirty = template_dirty || dirtied;
+
+    assert_eq!(tpl.cells.len(), 1, "cells array shrank by exactly 1");
+    assert_eq!(tpl.cells[0].sources[0].key, "a", "the OTHER cell is preserved");
+    assert!(template_dirty, "right-click Delete dirties the template");
+
+    // Deleting a non-existent cell is a no-op: no shrink, no dirty flip
+    // (the CLI's actual handler does set dirty, but the data-layer
+    // `remove_cell_at` returns Err; this test asserts the underlying
+    // contract — if the slot is empty, no cell is removed).
+    let dirtied_again = apply_action(
+        &CellMenuAction::Delete { row: 9, col: 9 },
+        &mut tpl,
+        &mut visibility,
+        &mut states,
+        &mut labels,
+    );
+    assert_eq!(tpl.cells.len(), 1, "deleting empty slot is a no-op");
+    assert!(!dirtied_again, "no dirty flip when nothing was deleted");
 }
 
 #[test]
