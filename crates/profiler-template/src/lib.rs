@@ -148,6 +148,9 @@ pub struct LabelMetadata {
     pub source_path: String,
     #[serde(default)]
     pub units: String,
+    /// Expected per-stream sample rate in Hz. `None` → omitted from the overlay.
+    #[serde(default)]
+    pub stream_rate_hz: Option<f64>,
 }
 
 /// One panel in the grid.

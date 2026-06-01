@@ -23,12 +23,15 @@
 
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
-use profiler_render::{render_view3d, TraceStore, View3dState};
+use profiler_render::{
+    render_template_grid_with_override, render_view3d_with_override, LabelOverride, TraceStore,
+    View3dState,
+};
 use profiler_source::{from_uri, Source};
-use profiler_template::Template;
+use profiler_template::{LabelMode, Template};
 
 /// Max samples drained from the source per render frame. Caps wall-clock
 /// time spent in `update` when the ZMQ backend is wildly ahead.
@@ -57,6 +60,38 @@ struct Cli {
     /// to v0.1.0 single-trace mode.
     #[arg(long)]
     template: Option<String>,
+
+    /// Global per-panel label overlay mode override (v0.5.0).
+    ///
+    /// `template` (default) honours each cell's own `label_mode` from the JSON
+    /// template. `off`/`data`/`metadata` force every cell into that mode at
+    /// startup; the toolbar selector can flip it at runtime.
+    #[arg(long, value_enum, default_value_t = LabelArg::Template)]
+    labels: LabelArg,
+}
+
+/// CLI value for `--labels`. Maps onto [`LabelOverride`] / [`LabelMode`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum LabelArg {
+    /// Honour each cell's own `label_mode` from the template.
+    Template,
+    /// Force every cell to draw no overlay.
+    Off,
+    /// Force every cell to draw the data overlay.
+    Data,
+    /// Force every cell to draw the metadata overlay.
+    Metadata,
+}
+
+impl LabelArg {
+    fn to_override(self) -> LabelOverride {
+        match self {
+            LabelArg::Template => LabelOverride::Respect,
+            LabelArg::Off => LabelOverride::Force(LabelMode::Off),
+            LabelArg::Data => LabelOverride::Force(LabelMode::Data),
+            LabelArg::Metadata => LabelOverride::Force(LabelMode::Metadata),
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -64,10 +99,11 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     log::info!(
-        "hvn-profiler v{} starting (source={}, template={:?})",
+        "hvn-profiler v{} starting (source={}, template={:?}, labels={:?})",
         env!("CARGO_PKG_VERSION"),
         cli.source,
         cli.template,
+        cli.labels,
     );
 
     let source = from_uri(&cli.source)?;
@@ -118,7 +154,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "hvn-profiler",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(App::new(source, source_desc, template)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(source, source_desc, template, cli.labels)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe::run_native failed: {e}"))
 }
@@ -150,6 +186,8 @@ struct App {
     view3d_state: View3dState,
     /// `true` once the 3D state has been seeded from the template defaults.
     view3d_inited: bool,
+    /// Global label-mode override (toolbar / CLI flag).
+    label_arg: LabelArg,
     started: Instant,
     drained_total: u64,
     /// Wall-clock of the last "samples-in-store" status log (1 Hz).
@@ -157,7 +195,12 @@ struct App {
 }
 
 impl App {
-    fn new(source: Box<dyn Source>, source_desc: String, template: Option<Template>) -> Self {
+    fn new(
+        source: Box<dyn Source>,
+        source_desc: String,
+        template: Option<Template>,
+        label_arg: LabelArg,
+    ) -> Self {
         let now = Instant::now();
         // Default mode: Split when the template ships a 3D view, else Grid.
         let has_3d = template
@@ -173,6 +216,7 @@ impl App {
             mode,
             view3d_state: View3dState::default(),
             view3d_inited: false,
+            label_arg,
             started: now,
             drained_total: 0,
             last_status_log: now,
@@ -238,6 +282,16 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.mode, ViewMode::Grid, "2D grid");
                 ui.selectable_value(&mut self.mode, ViewMode::View3d, "3D view");
                 ui.selectable_value(&mut self.mode, ViewMode::Split, "Split");
+            }
+
+            // Labels override (v0.5.0). Always available when a template is loaded.
+            if self.template.is_some() {
+                ui.separator();
+                ui.label("labels:");
+                ui.selectable_value(&mut self.label_arg, LabelArg::Template, "template");
+                ui.selectable_value(&mut self.label_arg, LabelArg::Off, "off");
+                ui.selectable_value(&mut self.label_arg, LabelArg::Data, "data");
+                ui.selectable_value(&mut self.label_arg, LabelArg::Metadata, "metadata");
             }
         });
         ui.separator();
@@ -314,7 +368,12 @@ impl App {
         // `take` to avoid borrowing `self` immutably while `render_template_grid`
         // also borrows `self.store` — same pattern as v0.2.0.
         let tpl = self.template.take().expect("render_grid called with template");
-        let stats = profiler_render::render_template_grid(ui, &tpl, &self.store);
+        let stats = render_template_grid_with_override(
+            ui,
+            &tpl,
+            &self.store,
+            self.label_arg.to_override(),
+        );
         self.template = Some(tpl);
         (stats.panels, stats.panels_with_data, stats.keys_with_data)
     }
@@ -333,7 +392,13 @@ impl App {
                 self.view3d_state.init_from(view, min_w, valinit);
                 self.view3d_inited = true;
             }
-            render_view3d(ui, view, &self.store, &mut self.view3d_state)
+            render_view3d_with_override(
+                ui,
+                view,
+                &self.store,
+                &mut self.view3d_state,
+                self.label_arg.to_override(),
+            )
         });
         self.template = Some(tpl);
         result

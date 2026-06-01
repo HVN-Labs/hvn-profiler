@@ -28,8 +28,9 @@ use std::collections::HashMap;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
-use profiler_template::{Trail3d, View3d};
+use profiler_template::{LabelMode, Trail3d, View3d};
 
+use crate::panels::LabelOverride;
 use crate::TraceStore;
 
 /// A trail's full `(t, [E, N, Up])` history before cropping.
@@ -309,7 +310,9 @@ pub fn integrate_deadreckon(
 
 /// Resolve a single trail to its full `(t, [E, N, Up])` history from the store
 /// (before any window / trail-length / decimation cropping).
-fn trail_world_points(trail: &Trail3d, store: &TraceStore) -> Vec<(f64, [f64; 3])> {
+///
+/// Exposed for the v0.5.0 trail-decode integration test.
+pub fn trail_world_points(trail: &Trail3d, store: &TraceStore) -> Vec<(f64, [f64; 3])> {
     if let Some(src) = &trail.sources {
         // Direct trail: E = x, N = y, Up = -(z_neg key).
         let xs = store.points(&src.x);
@@ -400,6 +403,23 @@ pub fn render_view3d(
     view: &View3d,
     store: &TraceStore,
     state: &mut View3dState,
+) -> View3dStats {
+    render_view3d_with_override(ui, view, store, state, LabelOverride::default())
+}
+
+/// Same as [`render_view3d`], with a global [`LabelOverride`] applied to the
+/// viewport's optional label-mode overlay (drawn in the bottom-left corner).
+///
+/// The 3D view honours `LabelOverride::Force(LabelMode::Data | Metadata)` and
+/// surfaces a small text block summarising the last trail tip (data) or the
+/// trail source bindings (metadata). `LabelOverride::Respect` is a no-op —
+/// the 3D view has no per-cell `label_mode` of its own.
+pub fn render_view3d_with_override(
+    ui: &mut egui::Ui,
+    view: &View3d,
+    store: &TraceStore,
+    state: &mut View3dState,
+    label_override: LabelOverride,
 ) -> View3dStats {
     // ── Controls strip ───────────────────────────────────────────────────
     ui.horizontal_wrapped(|ui| {
@@ -523,7 +543,61 @@ pub fn render_view3d(
         Color32::from_gray(150),
     );
 
+    // ── Bottom-left label overlay (v0.5.0) ───────────────────────────────
+    if let LabelOverride::Force(lm) = label_override {
+        let block = build_3d_label_block(lm, view, &drawn);
+        if !block.is_empty() {
+            painter.text(
+                rect.left_bottom() + Vec2::new(8.0, -8.0),
+                Align2::LEFT_BOTTOM,
+                block,
+                FontId::monospace(11.0),
+                Color32::from_gray(200),
+            );
+        }
+    }
+
     stats
+}
+
+/// Build the multi-line text for the 3D viewport's bottom-left label overlay.
+///
+/// `LabelMode::Data` lists each visible trail with its latest `(E, N, Up)` tip.
+/// `LabelMode::Metadata` lists each trail's name + source bindings (direct
+/// trails) or dead-reckon block (synthesised trails). `LabelMode::Off` is empty.
+fn build_3d_label_block(lm: LabelMode, view: &View3d, drawn: &[DrawnTrail]) -> String {
+    match lm {
+        LabelMode::Off => String::new(),
+        LabelMode::Data => {
+            let mut lines: Vec<String> = Vec::with_capacity(drawn.len());
+            for (name, _color, pts) in drawn {
+                if let Some(p) = pts.last() {
+                    lines.push(format!(
+                        "{name}: E {:+.2}  N {:+.2}  Up {:+.2}",
+                        p[0], p[1], p[2]
+                    ));
+                }
+            }
+            lines.join("\n")
+        }
+        LabelMode::Metadata => {
+            let mut lines: Vec<String> = Vec::with_capacity(view.trails.len());
+            for t in &view.trails {
+                if let Some(src) = &t.sources {
+                    lines.push(format!(
+                        "{}: x={}  y={}  z_neg={}",
+                        t.name, src.x, src.y, src.z_neg
+                    ));
+                } else if let Some(dk) = &t.deadreckon {
+                    lines.push(format!(
+                        "{}: dead-reckon accel={} quat={} seed={}",
+                        t.name, dk.accel, dk.quat, dk.seed_from
+                    ));
+                }
+            }
+            lines.join("\n")
+        }
+    }
 }
 
 /// Draw a faint ground grid in the world `z = 0` (Up = 0) plane, spanning a

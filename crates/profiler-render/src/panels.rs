@@ -21,6 +21,31 @@ use egui_plot::{HLine, Legend, Line, Plot, PlotPoint, PlotPoints, Text};
 
 use profiler_template::{Cell, CellSource, LabelMode, Primitive, Template};
 
+/// Global label-mode override applied to every cell at render time.
+///
+/// `Respect` honours each cell's own `label_mode` (the default — matches what
+/// the JSON template asked for). `Force(mode)` overrides every cell to render
+/// in `mode` regardless of the template, used by the v0.5.0 toolbar selector
+/// and `--labels` CLI flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LabelOverride {
+    /// Honour each cell's own `label_mode` from the template.
+    #[default]
+    Respect,
+    /// Globally force every cell to this label mode.
+    Force(LabelMode),
+}
+
+impl LabelOverride {
+    /// Resolve the effective label mode for a cell.
+    pub fn resolve(self, cell_mode: LabelMode) -> LabelMode {
+        match self {
+            LabelOverride::Respect => cell_mode,
+            LabelOverride::Force(m) => m,
+        }
+    }
+}
+
 use crate::TraceStore;
 
 /// Per-frame render stats, surfaced to the CLI for the 1 Hz status log.
@@ -41,6 +66,17 @@ pub struct GridStats {
 /// cells (`visible: false`) still reserve their grid slot so the layout keeps
 /// the template's row/column alignment.
 pub fn render_template_grid(ui: &mut egui::Ui, tpl: &Template, store: &TraceStore) -> GridStats {
+    render_template_grid_with_override(ui, tpl, store, LabelOverride::default())
+}
+
+/// Same as [`render_template_grid`], with an explicit [`LabelOverride`] applied
+/// uniformly to every cell. The default-arg helper above forwards `Respect`.
+pub fn render_template_grid_with_override(
+    ui: &mut egui::Ui,
+    tpl: &Template,
+    store: &TraceStore,
+    label_override: LabelOverride,
+) -> GridStats {
     let rows = tpl.grid.rows.max(1);
     let cols = tpl.grid.cols.max(1);
 
@@ -68,7 +104,8 @@ pub fn render_template_grid(ui: &mut egui::Ui, tpl: &Template, store: &TraceStor
                         match at[id] {
                             Some(cell) if cell.visible && !cell.sources.is_empty() => {
                                 stats.panels += 1;
-                                let had_data = render_cell(ui, cell, store, store.window_s);
+                                let had_data =
+                                    render_cell(ui, cell, store, store.window_s, label_override);
                                 if had_data {
                                     stats.panels_with_data += 1;
                                 }
@@ -123,7 +160,13 @@ fn count_keys_with_data(tpl: &Template, store: &TraceStore) -> usize {
 }
 
 /// Render a single panel. Returns `true` if any line had at least one point.
-fn render_cell(ui: &mut egui::Ui, cell: &Cell, store: &TraceStore, window_s: f64) -> bool {
+fn render_cell(
+    ui: &mut egui::Ui,
+    cell: &Cell,
+    store: &TraceStore,
+    window_s: f64,
+    label_override: LabelOverride,
+) -> bool {
     let plot_id = format!("cell_{}_{}", cell.row, cell.col);
 
     // Title above the plot.
@@ -171,7 +214,7 @@ fn render_cell(ui: &mut egui::Ui, cell: &Cell, store: &TraceStore, window_s: f64
                 );
             }
 
-            draw_label_overlay(plot_ui, cell, store, x_lo, x_hi);
+            draw_label_overlay(plot_ui, cell, store, x_lo, x_hi, label_override);
         });
 
     let _ = resp;
@@ -411,14 +454,19 @@ fn short_key(k: &str) -> &str {
 // ─── Label overlay ───────────────────────────────────────────────────────────
 
 /// Draw the per-panel `label_mode` overlay in the top-left corner.
+///
+/// `label_override` lets a global toolbar / CLI flag force every cell into a
+/// specific mode regardless of what the template asked for.
 fn draw_label_overlay(
     plot_ui: &mut egui_plot::PlotUi,
     cell: &Cell,
     store: &TraceStore,
     x_lo: f64,
     x_hi: f64,
+    label_override: LabelOverride,
 ) {
-    match cell.label_mode {
+    let mode = label_override.resolve(cell.label_mode);
+    match mode {
         LabelMode::Off => {}
         LabelMode::Data => {
             let Some(src) = cell.sources.first() else {
@@ -448,15 +496,30 @@ fn draw_label_overlay(
             place_corner_text(plot_ui, &text, x_lo, x_hi, Color32::from_gray(220));
         }
         LabelMode::Metadata => {
-            let Some(md) = &cell.label_metadata else {
-                return;
-            };
-            let mut parts = Vec::new();
-            if !md.source_path.is_empty() {
-                parts.push(md.source_path.clone());
-            }
-            if !md.units.is_empty() {
-                parts.push(md.units.clone());
+            // Build the metadata block. If the template provided a
+            // `label_metadata` struct, use it; otherwise (global override
+            // forcing metadata on cells without one) fall back to the
+            // primary source key.
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(md) = &cell.label_metadata {
+                if !md.source_path.is_empty() {
+                    parts.push(md.source_path.clone());
+                }
+                if !md.units.is_empty() {
+                    parts.push(md.units.clone());
+                }
+                if let Some(hz) = md.stream_rate_hz {
+                    // Trim trailing zero/`.0` for whole-number rates so we get
+                    // `4 Hz` and `12.5 Hz`, not `4.00 Hz`.
+                    let txt = if (hz - hz.round()).abs() < 1e-9 {
+                        format!("{} Hz", hz as i64)
+                    } else {
+                        format!("{hz} Hz")
+                    };
+                    parts.push(txt);
+                }
+            } else if let Some(src) = cell.sources.first() {
+                parts.push(src.key.clone());
             }
             if parts.is_empty() {
                 return;
@@ -491,25 +554,67 @@ fn place_corner_text(
     );
 }
 
-/// Best-effort translation of a Python `{:...}` format spec to a Rust-rendered
-/// string. We support the common cases used by the SITL templates:
-/// `{:+.2f}`, `{:.2f}`, `{:.Nf}`. Anything we don't recognise → `{:.2}`.
+/// Best-effort translation of a Python-style `{:...}` format spec into a
+/// Rust-rendered string, plus any literal suffix text outside the braces.
+///
+/// Exposed for integration testing (see `tests/format_spec_test.rs`).
+#[doc(hidden)]
+pub fn format_value_pub(spec: &str, v: f64) -> String {
+    format_value(spec, v)
+}
+
+#[doc(hidden)]
+///
+/// Supported mini-language (enough for the SITL templates):
+/// - sign flag `+`            → forces leading sign
+/// - optional width `N`       → minimum integer width (zero-padding ignored)
+/// - precision `.N`           → decimal places (default 2)
+/// - type `f`/`e`/`g`         → fixed / scientific (lowercase) / default
+/// - literal text outside the braces (e.g. `{:.1f}°`, `{:.2f} m/s`) is
+///   concatenated verbatim after the numeric body.
+///
+/// Examples (handled):
+/// - `"{:.1f}"`        → `"1.2"`
+/// - `"{:+.2f}°"`     → `"+1.23°"`
+/// - `"{:.3e} m"`     → `"1.234e0 m"`
+/// - `""` or unparseable → `"{v:.2}"` Rust default.
 fn format_value(spec: &str, v: f64) -> String {
-    // Strip the surrounding braces if present.
-    let inner = spec.trim().trim_start_matches('{').trim_end_matches('}');
-    let inner = inner.trim_start_matches(':');
-    let plus = inner.starts_with('+');
-    let body = inner.trim_start_matches('+');
-    // Parse precision from `.<n>f`.
-    let prec = body
-        .split_once('.')
-        .and_then(|(_, rest)| rest.trim_end_matches('f').parse::<usize>().ok())
-        .unwrap_or(2);
-    if plus {
-        format!("{v:+.prec$}")
-    } else {
-        format!("{v:.prec$}")
+    if spec.is_empty() {
+        return format!("{v:.2}");
     }
+    // Split into: prefix-literal { inner } suffix-literal
+    let (prefix, rest) = match spec.find('{') {
+        Some(i) => (&spec[..i], &spec[i + 1..]),
+        None => return spec.to_string(),
+    };
+    let (inner, suffix) = match rest.find('}') {
+        Some(j) => (&rest[..j], &rest[j + 1..]),
+        None => return format!("{prefix}{rest}"),
+    };
+    // inner is `:[flags][width][.prec][type]` — drop the leading colon if any.
+    let body = inner.trim_start_matches(':');
+    let plus = body.starts_with('+');
+    let body = body.trim_start_matches('+');
+    // Split body into "width_part" and "prec+type_part" at the dot.
+    let (_width_part, prec_type_part) = match body.split_once('.') {
+        Some((w, p)) => (w, p),
+        None => (body, ""),
+    };
+    // Detect type suffix (last char of prec_type_part if it is `f`/`e`/`g`).
+    let (prec_digits, ty) = match prec_type_part.chars().last() {
+        Some(c) if c == 'f' || c == 'e' || c == 'g' => (&prec_type_part[..prec_type_part.len() - c.len_utf8()], c),
+        _ => (prec_type_part, 'f'),
+    };
+    let prec: usize = prec_digits.parse().unwrap_or(2);
+    let num = match (ty, plus) {
+        ('e', true) => format!("{v:+.prec$e}"),
+        ('e', false) => format!("{v:.prec$e}"),
+        ('g', true) => format!("{v:+.prec$}"),
+        ('g', false) => format!("{v:.prec$}"),
+        (_, true) => format!("{v:+.prec$}"),
+        (_, false) => format!("{v:.prec$}"),
+    };
+    format!("{prefix}{num}{suffix}")
 }
 
 // ─── Colors ──────────────────────────────────────────────────────────────────

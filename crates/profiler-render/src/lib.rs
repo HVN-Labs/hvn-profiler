@@ -12,8 +12,11 @@ use std::collections::{HashMap, VecDeque};
 
 pub mod panels;
 pub mod view3d;
-pub use panels::{render_template_grid, GridStats};
-pub use view3d::{render_view3d, OrbitCamera, View3dState, View3dStats};
+pub use panels::{
+    format_value_pub, render_template_grid, render_template_grid_with_override, GridStats,
+    LabelOverride,
+};
+pub use view3d::{render_view3d, render_view3d_with_override, OrbitCamera, View3dState, View3dStats};
 
 /// Build-time crate version, for logging from the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
