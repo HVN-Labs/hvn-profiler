@@ -27,10 +27,11 @@ use clap::{Parser, ValueEnum};
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use profiler_render::{
-    render_faults_panel, render_template_grid_with_override, render_view3d_with_override,
-    FaultsPanelState, LabelOverride, PendingCommand, TraceStore, View3dState,
+    render_faults_panel, render_gen_panel, render_template_grid_with_override,
+    render_view3d_with_override, FaultsPanelState, GeneratorPanelState, LabelOverride,
+    PendingCommand, SeenDrones, TraceStore, View3dState,
 };
-use profiler_source::{from_uri, FaultCommand, FaultPublisher, Source};
+use profiler_source::{from_uri_with_discovery, FaultCommand, FaultPublisher, Source};
 use profiler_template::{LabelMode, Template};
 
 /// Max samples drained from the source per render frame. Caps wall-clock
@@ -86,6 +87,33 @@ struct Cli {
     /// out to all running sims.
     #[arg(long, default_value = "tcp://127.0.0.1:9003")]
     fault_channel: String,
+
+    /// Force a specific drone as the initial Target in the Faults panel (v0.7.0).
+    ///
+    /// Useful for headless / scripted runs where you want commands aimed at
+    /// a particular drone before the streamer's first envelope from it has
+    /// arrived. The name is appended to the dropdown's discovered list
+    /// (deduplicated). Falls back to `"all"` when omitted.
+    #[arg(long)]
+    drone: Option<String>,
+
+    /// Show the Signal Generators panel (v0.7.0).
+    ///
+    /// `off` (default) keeps the v0.6.0 behaviour intact. `on` opens the
+    /// panel for adding waveform-driven generators that write into the
+    /// Faults sliders at 20 Hz. Implies `--fault-panel on` because
+    /// generators feed the Faults publisher.
+    #[arg(long, value_enum, default_value_t = GeneratorsArg::Off)]
+    generators: GeneratorsArg,
+}
+
+/// CLI on/off for `--generators`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum GeneratorsArg {
+    /// Panel hidden, no auto-drive (v0.6.0 default).
+    Off,
+    /// Open the Signal Generators panel; implies `--fault-panel on`.
+    On,
 }
 
 /// CLI on/off for `--fault-panel`.
@@ -126,20 +154,31 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     log::info!(
-        "hvn-profiler v{} starting (source={}, template={:?}, labels={:?}, fault_panel={:?})",
+        "hvn-profiler v{} starting (source={}, template={:?}, labels={:?}, fault_panel={:?}, generators={:?}, drone={:?})",
         env!("CARGO_PKG_VERSION"),
         cli.source,
         cli.template,
         cli.labels,
         cli.fault_panel,
+        cli.generators,
+        cli.drone,
     );
 
-    let source = from_uri(&cli.source)?;
+    let (source, seen_drones) = from_uri_with_discovery(&cli.source)?;
     let source_desc = source.describe();
+
+    // --generators on implies --fault-panel on (generators feed the Faults
+    // publisher). Resolve the effective fault_panel state up-front so the
+    // rest of the wiring sees a single source of truth.
+    let generators_on = matches!(cli.generators, GeneratorsArg::On);
+    let effective_fault_panel = match (cli.fault_panel, generators_on) {
+        (FaultPanelArg::On, _) | (_, true) => FaultPanelArg::On,
+        _ => FaultPanelArg::Off,
+    };
 
     // Open the outbound fault channel only when explicitly requested.
     // `--fault-panel off` (the default) keeps the v0.5.0 read-only contract.
-    let fault_publisher = match cli.fault_panel {
+    let fault_publisher = match effective_fault_panel {
         FaultPanelArg::On => {
             let pubr = FaultPublisher::new(&cli.fault_channel).map_err(|e| {
                 anyhow::anyhow!("opening fault channel {}: {e}", cli.fault_channel)
@@ -149,7 +188,8 @@ fn main() -> anyhow::Result<()> {
         }
         FaultPanelArg::Off => None,
     };
-    let fault_panel_initial = matches!(cli.fault_panel, FaultPanelArg::On);
+    let fault_panel_initial = matches!(effective_fault_panel, FaultPanelArg::On);
+    let drone_override = cli.drone.clone();
 
     // Load the template if given. A parse failure is fatal (the user asked for
     // a specific layout) — surface it rather than silently falling back.
@@ -204,6 +244,9 @@ fn main() -> anyhow::Result<()> {
                 cli.labels,
                 fault_publisher,
                 fault_panel_initial,
+                seen_drones,
+                drone_override,
+                generators_on,
             )))
         }),
     )
@@ -247,6 +290,8 @@ struct App {
     pending_fault_cmds: Vec<PendingCommand>,
     /// v0.6.0: cumulative count of fault commands published (for the status row).
     fault_sent: u64,
+    /// v0.7.0: Signal Generators panel UI state.
+    gen_state: GeneratorPanelState,
     started: Instant,
     drained_total: u64,
     /// Wall-clock of the last "samples-in-store" status log (1 Hz).
@@ -254,6 +299,7 @@ struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source: Box<dyn Source>,
         source_desc: String,
@@ -261,6 +307,9 @@ impl App {
         label_arg: LabelArg,
         fault_publisher: Option<FaultPublisher>,
         fault_panel_initial: bool,
+        seen_drones: Option<SeenDrones>,
+        drone_override: Option<String>,
+        generators_initial: bool,
     ) -> Self {
         let now = Instant::now();
         // Default mode: Split when the template ships a 3D view, else Grid.
@@ -271,6 +320,15 @@ impl App {
         let mode = if has_3d { ViewMode::Split } else { ViewMode::Grid };
         let mut faults_state = FaultsPanelState::default();
         faults_state.visible = fault_panel_initial && fault_publisher.is_some();
+        faults_state.seen_drones = seen_drones;
+        if let Some(name) = drone_override {
+            faults_state.extras.push(name.clone());
+            faults_state.drone = name;
+        }
+        let gen_state = GeneratorPanelState {
+            visible: generators_initial && fault_publisher.is_some(),
+            ..Default::default()
+        };
         Self {
             source,
             source_desc,
@@ -284,6 +342,7 @@ impl App {
             faults_state,
             pending_fault_cmds: Vec::new(),
             fault_sent: 0,
+            gen_state,
             started: now,
             drained_total: 0,
             last_status_log: now,
@@ -382,6 +441,30 @@ impl eframe::App for App {
             if has_publisher {
                 ui.label(format!("fault_sent={}", self.fault_sent));
             }
+
+            // v0.7.0 — Signal Generators toggle. Same enable-gate as Faults
+            // (the generators feed the Faults publisher).
+            let gen_label = if self.gen_state.visible {
+                "Hide Generators"
+            } else {
+                "Show Generators"
+            };
+            let gbtn = ui.add_enabled(has_publisher, egui::Button::new(gen_label));
+            if !has_publisher {
+                gbtn.on_hover_text(
+                    "Restart with `--generators on` (or `--fault-panel on`) to enable Signal Generators.",
+                );
+            } else if gbtn.clicked() {
+                self.gen_state.visible = !self.gen_state.visible;
+            }
+            if has_publisher && !self.gen_state.rows.is_empty() {
+                let running = self.gen_state.rows.iter().filter(|g| g.running).count();
+                ui.label(format!(
+                    "gen={}/{}",
+                    running,
+                    self.gen_state.rows.len()
+                ));
+            }
         });
         ui.separator();
 
@@ -416,6 +499,36 @@ impl eframe::App for App {
         // Rendered as a floating Window so it overlays without disturbing
         // the existing CentralPanel layout. Visibility is toggled by the
         // toolbar button; once open it stays open until closed.
+        //
+        // v0.7.0: The Signal Generators panel is rendered FIRST so it can
+        // tick its running generators into the Faults state before the
+        // Faults panel's debounce flush picks them up the same frame.
+        if self.fault_publisher.is_some() && self.gen_state.visible {
+            let ctx = ui.ctx().clone();
+            let now_ms = self.started.elapsed().as_millis() as u64;
+            let mut visible = self.gen_state.visible;
+            egui::Window::new("Signal Generators")
+                .open(&mut visible)
+                .default_width(720.0)
+                .default_pos([60.0, 480.0])
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    render_gen_panel(
+                        ui,
+                        &mut self.gen_state,
+                        &mut self.faults_state,
+                        now_ms,
+                    );
+                });
+            self.gen_state.visible = visible;
+        } else if self.fault_publisher.is_some() {
+            // Panel hidden but generators may still be running (Pause is
+            // per-row, Hide doesn't auto-pause). Continue ticking so the
+            // operator's last waveform keeps driving the slider.
+            let now_ms = self.started.elapsed().as_millis() as u64;
+            self.gen_state.tick_and_apply(now_ms, &mut self.faults_state);
+        }
+
         if self.fault_publisher.is_some() && self.faults_state.visible {
             let ctx = ui.ctx().clone();
             let now_s = ctx.input(|i| i.time);
@@ -437,6 +550,44 @@ impl eframe::App for App {
             self.faults_state.visible = visible;
 
             // Forward emitted commands to the publisher.
+            if !self.pending_fault_cmds.is_empty() {
+                if let Some(pubr) = &self.fault_publisher {
+                    for pc in self.pending_fault_cmds.drain(..) {
+                        let cmd = FaultCommand {
+                            feature: pc.feature,
+                            drone: pc.drone,
+                            command: pc.label,
+                            args: pc.args,
+                            reset: pc.reset,
+                        };
+                        match pubr.send(&cmd) {
+                            Ok(()) => self.fault_sent += 1,
+                            Err(e) => log::warn!("fault publish failed: {e}"),
+                        }
+                    }
+                }
+            }
+        } else if self.fault_publisher.is_some() && !self.gen_state.rows.is_empty() {
+            // Faults panel closed but generators are running — we still
+            // need to drain the dirty bookkeeping into the publisher so
+            // generated values don't queue up unsent. Re-invoke the panel
+            // headlessly (no Window).
+            let ctx = ui.ctx().clone();
+            let now_s = ctx.input(|i| i.time);
+            self.pending_fault_cmds.clear();
+            // Stand-alone Area lets us drive `render_faults_panel` without
+            // actually showing it. Cheap (one frame).
+            egui::Area::new(egui::Id::new("faults_headless"))
+                .interactable(false)
+                .fixed_pos([-10000.0, -10000.0])
+                .show(&ctx, |ui| {
+                    render_faults_panel(
+                        ui,
+                        &mut self.faults_state,
+                        &mut self.pending_fault_cmds,
+                        now_s,
+                    );
+                });
             if !self.pending_fault_cmds.is_empty() {
                 if let Some(pubr) = &self.fault_publisher {
                     for pc in self.pending_fault_cmds.drain(..) {

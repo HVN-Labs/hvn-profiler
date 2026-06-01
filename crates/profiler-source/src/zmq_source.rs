@@ -9,6 +9,8 @@
 //! the eframe/egui mainloop free of any async machinery — `try_recv` is a
 //! plain non-blocking channel pop.
 
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -18,6 +20,11 @@ use zeromq::{Socket, SocketRecv, SubSocket};
 
 use crate::{flatten_msgpack, Sample, Source};
 
+/// Shared set of drone names this source has seen on the wire so far. Cloned
+/// into the Faults panel state so the Target dropdown can populate from real
+/// telemetry rather than a hardcoded `drone_1..drone_10` list.
+pub type SeenDrones = Arc<RwLock<HashSet<String>>>;
+
 /// Channel capacity. ~5 s of headroom even at 1 kHz envelopes × ~20 keys.
 const CHANNEL_CAPACITY: usize = 100_000;
 
@@ -25,6 +32,10 @@ const CHANNEL_CAPACITY: usize = 100_000;
 pub struct ZmqSource {
     rx: Receiver<Sample>,
     endpoint: String,
+    /// Names of drones whose envelopes have arrived on this socket. Shared
+    /// (Arc<RwLock<_>>) with the Faults panel so its target dropdown can
+    /// reflect what's actually streaming.
+    seen_drones: SeenDrones,
     /// Kept alive so the worker thread (and tokio runtime) shut down when
     /// `ZmqSource` is dropped. We don't actually `join` — letting the
     /// thread drop is fine because the runtime owns no shared state.
@@ -40,19 +51,29 @@ impl ZmqSource {
     pub fn connect(endpoint: &str) -> Result<Self> {
         let endpoint = endpoint.to_string();
         let (tx, rx) = crossbeam_channel::bounded::<Sample>(CHANNEL_CAPACITY);
+        let seen_drones: SeenDrones = Arc::new(RwLock::new(HashSet::new()));
 
         let ep_for_thread = endpoint.clone();
+        let seen_for_thread = Arc::clone(&seen_drones);
         let worker = thread::Builder::new()
             .name("profiler-zmq".into())
-            .spawn(move || worker_main(ep_for_thread, tx))
+            .spawn(move || worker_main(ep_for_thread, tx, seen_for_thread))
             .context("spawning ZMQ worker thread")?;
 
         log::info!("ZmqSource: spawned worker, connecting to {endpoint}");
         Ok(Self {
             rx,
             endpoint,
+            seen_drones,
             _worker: worker,
         })
+    }
+
+    /// Shared handle to the seen-drones set. Cloned into UI state so the
+    /// Faults panel can read it each frame; the worker thread writes new
+    /// names into it as envelopes arrive.
+    pub fn seen_drones(&self) -> SeenDrones {
+        Arc::clone(&self.seen_drones)
     }
 }
 
@@ -66,7 +87,7 @@ impl Source for ZmqSource {
     }
 }
 
-fn worker_main(endpoint: String, tx: Sender<Sample>) {
+fn worker_main(endpoint: String, tx: Sender<Sample>, seen: SeenDrones) {
     // Single-threaded runtime is plenty — one socket, one decode loop.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -79,13 +100,13 @@ fn worker_main(endpoint: String, tx: Sender<Sample>) {
         }
     };
     rt.block_on(async move {
-        if let Err(e) = run_loop(&endpoint, &tx).await {
+        if let Err(e) = run_loop(&endpoint, &tx, &seen).await {
             log::error!("ZmqSource worker exited: {e}");
         }
     });
 }
 
-async fn run_loop(endpoint: &str, tx: &Sender<Sample>) -> Result<()> {
+async fn run_loop(endpoint: &str, tx: &Sender<Sample>, seen: &SeenDrones) -> Result<()> {
     let mut sock = SubSocket::new();
     // Subscribe to ALL messages — the streamer doesn't topic-prefix today.
     sock.subscribe("")
@@ -132,6 +153,19 @@ async fn run_loop(endpoint: &str, tx: &Sender<Sample>) -> Result<()> {
         };
 
         for s in samples {
+            // Drone-name discovery (v0.7.0). Take the read lock first to
+            // avoid the write lock on the hot path when the name is
+            // already known.
+            if let Some(name) = &s.drone_name {
+                let known = seen.read().map(|g| g.contains(name)).unwrap_or(true);
+                if !known {
+                    if let Ok(mut g) = seen.write() {
+                        if g.insert(name.clone()) {
+                            log::info!("ZmqSource: discovered drone '{name}'");
+                        }
+                    }
+                }
+            }
             match tx.try_send(s) {
                 Ok(()) => decoded += 1,
                 Err(TrySendError::Full(_)) => {

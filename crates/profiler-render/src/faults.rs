@@ -47,9 +47,17 @@
 //! the slider provides realistic resolution but the spinbox accepts any
 //! finite value the operator types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
+
+/// Shared set of drone names this profiler has seen on the wire so far.
+/// Re-declared here (instead of importing from profiler-source) so the
+/// render crate stays free of any IO / channel dependency. The CLI clones
+/// the `ZmqSource::seen_drones()` handle into this type and the panel
+/// reads it each frame.
+pub type SeenDrones = Arc<RwLock<HashSet<String>>>;
 
 /// One outbound runtime-control command queued by the panel.
 ///
@@ -69,15 +77,30 @@ pub struct PendingCommand {
 /// Mutable slider state for the Faults panel. Defaults are all zeros
 /// (matches the matplotlib panel's clean-baseline policy: HIL toggling
 /// should not inject noise the user didn't ask for).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FaultsPanelState {
     /// Currently visible? Bound to the toolbar toggle button.
     pub visible: bool,
     /// Currently selected drone topic ("all" / "drone_1" / …).
     pub drone: String,
-    /// Drone choices in the dropdown. v0.6.0 ships a fixed list;
-    /// v0.7.0 will discover names from the stream.
+    /// Drone choices in the dropdown. v0.6.0 shipped a fixed list of
+    /// `drone_1..drone_10`; v0.7.0 populates from `seen_drones` when
+    /// connected to a ZMQ source. The `extras` list lives alongside so a
+    /// CLI `--drone` override stays selectable even before that name's
+    /// first envelope lands.
     pub drone_choices: Vec<String>,
+
+    /// Shared set of names the profiler has observed on the wire. `None`
+    /// when the configured source has no discovery (Mock / MAVLink /
+    /// fault-panel-off) — the panel then falls back to `drone_choices`
+    /// + `extras` only. Built in the CLI via
+    ///   `ZmqSource::seen_drones()`.
+    pub seen_drones: Option<SeenDrones>,
+
+    /// Operator-supplied extras (`--drone` CLI flag). Always appended after
+    /// the discovered names so a forced choice stays selectable even when
+    /// it hasn't been seen yet.
+    pub extras: Vec<String>,
 
     // GPS sliders
     pub gps_sigma_p: f32,
@@ -118,12 +141,26 @@ pub struct FaultsPanelState {
     baro_dirty_since: Option<f64>,
 }
 
+impl std::fmt::Debug for FaultsPanelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultsPanelState")
+            .field("visible", &self.visible)
+            .field("drone", &self.drone)
+            .field("drone_choices", &self.drone_choices)
+            .field("extras", &self.extras)
+            .field("seen_drones_attached", &self.seen_drones.is_some())
+            .finish()
+    }
+}
+
 impl Default for FaultsPanelState {
     fn default() -> Self {
         Self {
             visible: false,
             drone: "all".into(),
             drone_choices: default_drone_choices(),
+            seen_drones: None,
+            extras: Vec::new(),
             gps_sigma_p: 0.0,
             gps_sigma_v: 0.0,
             gps_bias_n: 0.0,
@@ -153,14 +190,60 @@ impl Default for FaultsPanelState {
     }
 }
 
-/// Default drone choices in the dropdown. `all` first (broadcast), then
-/// `drone_1 … drone_10` matching the dt_runner naming convention.
+/// Default drone choices in the dropdown — used as a fallback when the
+/// source has no discovery and no CLI override is supplied.
+///
+/// `all` first (broadcast), then `drone_1 … drone_10` matching the
+/// dt_runner naming convention.
 pub fn default_drone_choices() -> Vec<String> {
     let mut v = vec!["all".to_string()];
     for i in 1..=10 {
         v.push(format!("drone_{i}"));
     }
     v
+}
+
+impl FaultsPanelState {
+    /// Compute the dropdown choices for the current frame.
+    ///
+    /// Order: `"all"` (always first) → discovered names from
+    /// [`seen_drones`](Self::seen_drones) (sorted) → operator extras
+    /// (`--drone` CLI overrides). Falls back to [`default_drone_choices`]
+    /// when no discovery handle is attached AND no extras were supplied
+    /// (preserves the v0.6.0 UX even with a Mock / MAVLink source).
+    ///
+    /// Deduplicates while preserving order.
+    pub fn current_choices(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec!["all".into()];
+        let mut seen: HashSet<String> = HashSet::from(["all".into()]);
+
+        // Discovered names — sorted for stable rendering.
+        let mut discovered: Vec<String> = self
+            .seen_drones
+            .as_ref()
+            .and_then(|s| s.read().ok().map(|g| g.iter().cloned().collect()))
+            .unwrap_or_default();
+        discovered.sort();
+        for name in discovered {
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
+        }
+
+        // Operator extras (CLI override).
+        for name in &self.extras {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+
+        // Hard fallback: nothing discovered, no extras, no source → keep the
+        // v0.6.0 fixed list so the dropdown isn't a one-item ("all") dead-end.
+        if out.len() == 1 && self.seen_drones.is_none() {
+            return self.drone_choices.clone();
+        }
+        out
+    }
 }
 
 /// Debounce window between the last slider tick and the actual ZMQ push.
@@ -246,6 +329,33 @@ impl FaultsPanelState {
     fn touch(dirty: &mut Option<f64>, now_s: f64) {
         *dirty = Some(now_s);
     }
+
+    /// Mark the section whose slider matches `target` dirty so the
+    /// existing debounce flush emits a new command. Used by the signal
+    /// generators panel (`gen_panel::apply_to_faults`) to inject a value
+    /// without going through an egui slider response. `now_s` is the same
+    /// `ctx.input(|i| i.time)` the panel already uses; we use 0.0 as a
+    /// safe "now-ish" stamp because the panel re-flushes the section on
+    /// the very next frame anyway (the debounce window resets each tick).
+    pub fn mark_external_change(&mut self, target: &str) {
+        // Map the target prefix back to the per-section dirty bookkeeping.
+        // We can't read `ctx.input(|i| i.time)` here because that requires
+        // an egui::Context; instead, write a sentinel `Some(f64::MIN)` so
+        // `flush_if_due` always considers the section due on the NEXT
+        // render call. This matches the matplotlib panel's "tick → push
+        // immediately" behaviour for generated signals (no extra debounce
+        // beyond what the generator's own 20 Hz already imposes).
+        let dirty: &mut Option<f64> = match target.split('.').next().unwrap_or("") {
+            "gps" => &mut self.gps_dirty_since,
+            "imu" => &mut self.imu_dirty_since,
+            "mag" => &mut self.mag_dirty_since,
+            "baro" => &mut self.baro_dirty_since,
+            _ => return,
+        };
+        // Use f64::MIN so `now_s - t0 >= DEBOUNCE_S` always holds — generated
+        // signals flush on the next render frame without waiting 50 ms.
+        *dirty = Some(f64::MIN);
+    }
 }
 
 /// Egui side-panel renderer. Drains debounced slider changes and one-shot
@@ -272,15 +382,28 @@ pub fn render_faults_panel(
     ui.separator();
 
     // ── Drone selector ──────────────────────────────────────────────
+    // v0.7.0: populate from drones the profiler has actually seen in
+    // the stream (sorted), plus operator extras (--drone) and always
+    // `"all"` first. Falls back to the v0.6.0 fixed list when no
+    // discovery is wired up (Mock / MAVLink sources).
+    let choices = state.current_choices();
     ui.horizontal(|ui| {
         ui.label("Target drone:");
         egui::ComboBox::from_id_salt("faults_drone_select")
             .selected_text(&state.drone)
             .show_ui(ui, |ui| {
-                for choice in &state.drone_choices {
+                for choice in &choices {
                     ui.selectable_value(&mut state.drone, choice.clone(), choice);
                 }
             });
+        if state.seen_drones.is_some() {
+            let n = choices.len().saturating_sub(1);
+            ui.label(
+                egui::RichText::new(format!("{n} seen"))
+                    .small()
+                    .color(egui::Color32::from_gray(140)),
+            );
+        }
     });
     ui.separator();
 
@@ -535,6 +658,7 @@ fn reset_cmd(feature: &str, drone: &str) -> PendingCommand {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -599,4 +723,68 @@ mod tests {
         assert!(cmd.args.is_empty());
     }
 
+    #[test]
+    fn current_choices_falls_back_to_default_with_no_discovery() {
+        let s = FaultsPanelState::default();
+        // No seen_drones attached, no extras → preserve v0.6.0 fixed list.
+        let choices = s.current_choices();
+        assert!(choices.contains(&"all".to_string()));
+        assert!(choices.contains(&"drone_1".to_string()));
+        assert!(choices.contains(&"drone_10".to_string()));
+    }
+
+    #[test]
+    fn current_choices_includes_discovered_names_sorted() {
+        let seen: SeenDrones = Arc::new(RwLock::new(HashSet::from([
+            "zulu".to_string(),
+            "alpha".to_string(),
+            "mike".to_string(),
+        ])));
+        let s = FaultsPanelState {
+            seen_drones: Some(seen),
+            ..Default::default()
+        };
+        let choices = s.current_choices();
+        // "all" first, then sorted discovered names.
+        assert_eq!(choices[0], "all");
+        assert_eq!(choices[1], "alpha");
+        assert_eq!(choices[2], "mike");
+        assert_eq!(choices[3], "zulu");
+    }
+
+    #[test]
+    fn current_choices_includes_extras_after_discovered() {
+        let s = FaultsPanelState {
+            seen_drones: Some(Arc::new(RwLock::new(HashSet::from([
+                "drone_1".to_string(),
+            ])))),
+            extras: vec!["override_drone".to_string()],
+            ..Default::default()
+        };
+        let choices = s.current_choices();
+        assert_eq!(choices, vec!["all", "drone_1", "override_drone"]);
+    }
+
+    #[test]
+    fn current_choices_deduplicates() {
+        let s = FaultsPanelState {
+            seen_drones: Some(Arc::new(RwLock::new(HashSet::from([
+                "all".to_string(),       // would dup with the hardcoded "all"
+                "drone_1".to_string(),
+            ])))),
+            extras: vec!["drone_1".to_string(), "drone_2".to_string()],
+            ..Default::default()
+        };
+        let choices = s.current_choices();
+        // "all" appears once, "drone_1" once.
+        assert_eq!(
+            choices.iter().filter(|s| *s == "all").count(),
+            1,
+        );
+        assert_eq!(
+            choices.iter().filter(|s| *s == "drone_1").count(),
+            1,
+        );
+        assert!(choices.contains(&"drone_2".to_string()));
+    }
 }

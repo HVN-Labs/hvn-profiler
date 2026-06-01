@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub mod zmq_source;
-pub use zmq_source::ZmqSource;
+pub use zmq_source::{SeenDrones, ZmqSource};
 
 #[cfg(feature = "mavlink-source")]
 pub mod mavlink_source;
@@ -45,6 +45,11 @@ pub struct Sample {
     pub key: String,
     /// Scalar value.
     pub value: f64,
+    /// Drone name from the envelope (e.g. `"eric_1"`). `None` when the
+    /// streamer didn't supply one (older streamer, MAVLink CLI without
+    /// `--drone-name`, etc.). The profiler treats missing names as
+    /// "unknown" rather than crashing.
+    pub drone_name: Option<String>,
 }
 
 /// A pull-based telemetry source. The render loop calls `try_recv` in a
@@ -108,6 +113,24 @@ fn mavlink_from_addr(_scheme: &str, _rest: &str) -> Result<Box<dyn Source>> {
     )
 }
 
+/// Like [`from_uri`], but also returns an optional [`SeenDrones`] handle
+/// when the scheme supports drone-name discovery. Currently only `zmq://`
+/// surfaces one; every other scheme returns `None` and the Faults panel
+/// falls back to its default / CLI-supplied choices.
+pub fn from_uri_with_discovery(uri: &str) -> Result<(Box<dyn Source>, Option<SeenDrones>)> {
+    if let Some(rest) = uri.strip_prefix("zmq://") {
+        let endpoint = format!("tcp://{}", rest.trim_end_matches('/'));
+        let zmq = ZmqSource::connect(&endpoint)
+            .with_context(|| format!("opening ZMQ source at {endpoint}"))?;
+        let seen = zmq.seen_drones();
+        Ok((Box::new(zmq), Some(seen)))
+    } else {
+        // Mock / MAVLink — no name discovery on the wire.
+        let src = from_uri(uri)?;
+        Ok((src, None))
+    }
+}
+
 // ─── MockSource ────────────────────────────────────────────────────────────
 
 /// Synthetic sine-wave source. Used for the v0.0.1 toolchain-proof demo and
@@ -146,6 +169,7 @@ impl Source for MockSource {
             ts: t,
             key: "mock.sine".to_string(),
             value: (t * std::f64::consts::TAU * 0.5).sin(),
+            drone_name: None,
         })
     }
 
@@ -164,6 +188,11 @@ pub struct Envelope {
     pub ts: f64,
     #[serde(default)]
     pub source: String,
+    /// Producing drone (e.g. `"eric_1"`). Added in v0.7.0 / SITL v0.7.18.4
+    /// for Faults-panel target discovery. `None` when the streamer didn't
+    /// supply one (older SITL versions, MAVLink CLI without `--drone-name`).
+    #[serde(default)]
+    pub drone_name: Option<String>,
     /// Flat-ish map of channel name → scalar | array | null. Stored as a raw
     /// `rmpv::Value` so we can flatten dynamically without a static schema.
     pub values: rmpv::Value,
@@ -186,9 +215,14 @@ pub fn flatten_msgpack(bytes: &[u8]) -> Result<Vec<Sample>> {
 
 /// Flatten an already-decoded envelope. Split out from [`flatten_msgpack`]
 /// so unit tests can exercise the schema logic without round-tripping bytes.
+///
+/// Every emitted [`Sample`] inherits `env.drone_name` so downstream consumers
+/// (the `ZmqSource` seen-drones set, the Faults panel target dropdown) can
+/// trace each scalar back to the producing sim without re-decoding.
 pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
     let mut out = Vec::new();
     let ts = env.ts;
+    let drone_name = env.drone_name.clone();
     let map = match env.values.as_map() {
         Some(m) => m,
         None => return out,
@@ -204,6 +238,7 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
                 ts,
                 key: key.to_string(),
                 value: if *b { 1.0 } else { 0.0 },
+                drone_name: drone_name.clone(),
             }),
             rmpv::Value::Integer(i) => {
                 if let Some(f) = i.as_f64() {
@@ -211,6 +246,7 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
                         ts,
                         key: key.to_string(),
                         value: f,
+                        drone_name: drone_name.clone(),
                     });
                 }
             }
@@ -218,11 +254,13 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
                 ts,
                 key: key.to_string(),
                 value: *f as f64,
+                drone_name: drone_name.clone(),
             }),
             rmpv::Value::F64(f) => out.push(Sample {
                 ts,
                 key: key.to_string(),
                 value: *f,
+                drone_name: drone_name.clone(),
             }),
             rmpv::Value::Array(arr) => {
                 for (i, elt) in arr.iter().enumerate() {
@@ -231,6 +269,7 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
                             ts,
                             key: format!("{key}[{i}]"),
                             value: v,
+                            drone_name: drone_name.clone(),
                         });
                     }
                     // non-scalar / null elements drop silently

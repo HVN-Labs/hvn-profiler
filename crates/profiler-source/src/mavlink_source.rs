@@ -181,6 +181,10 @@ pub fn decode_to_samples(msg: &MavMessage, ts: f64) -> Vec<Sample> {
         ts,
         key: key.to_string(),
         value,
+        // Direct MAVLink UDP carries no drone identity in its frames; the
+        // operator-supplied --drone CLI flag is what surfaces in the Faults
+        // panel for this transport.
+        drone_name: None,
     };
     match msg {
         MavMessage::ATTITUDE(d) => vec![

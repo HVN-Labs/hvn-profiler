@@ -28,7 +28,9 @@ mavlink = { workspace = true, optional = true }
 [dev-dependencies]
 zeromq = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 
 [features]
 default = ["fault-channel"]

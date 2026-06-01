@@ -11,11 +11,15 @@
 use std::collections::{HashMap, VecDeque};
 
 pub mod faults;
+pub mod gen_panel;
+pub mod generators;
 pub mod panels;
 pub mod view3d;
 pub use faults::{
-    default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand,
+    default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,
 };
+pub use gen_panel::{render_gen_panel, GeneratorPanelState, SLIDER_TARGETS};
+pub use generators::{Generator, Waveform};
 pub use panels::{
     format_value_pub, render_template_grid, render_template_grid_with_override, GridStats,
     LabelOverride,
