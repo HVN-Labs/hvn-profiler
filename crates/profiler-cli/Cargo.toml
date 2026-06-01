@@ -29,3 +29,7 @@ profiler-render   = { workspace = true }
 # are unaffected. See profiler-source's `mavlink-source` feature.
 profiler-source   = { workspace = true, features = ["mavlink-source"] }
 profiler-template = { workspace = true }
+
+# v0.8.0 — native file dialog for template Open / Save-as.
+rfd = { workspace = true }
+serde_json = { workspace = true }

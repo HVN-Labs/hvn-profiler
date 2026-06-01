@@ -31,8 +31,13 @@ use profiler_render::{
     render_view3d_with_override, FaultsPanelState, GeneratorPanelState, LabelOverride,
     PendingCommand, SeenDrones, TraceStore, View3dState,
 };
-use profiler_source::{from_uri_with_discovery, FaultCommand, FaultPublisher, Source};
-use profiler_template::{LabelMode, Template};
+use profiler_source::{
+    from_uri_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
+};
+use profiler_template::{
+    discover as discover_templates, ensure_user_templates_dir, load_entry_json, LabelMode,
+    Template, TemplateEntry, TemplateOrigin, UiState,
+};
 
 /// Max samples drained from the source per render frame. Caps wall-clock
 /// time spent in `update` when the ZMQ backend is wildly ahead.
@@ -105,6 +110,29 @@ struct Cli {
     /// generators feed the Faults publisher.
     #[arg(long, value_enum, default_value_t = GeneratorsArg::Off)]
     generators: GeneratorsArg,
+
+    /// MAVLink passive-listener mode (v0.8.0).
+    ///
+    /// `off` (default) — when the source is `mavlink://` or `mavlinkout://`,
+    /// the profiler acts as an active GCS: sends a 1 Hz HEARTBEAT on the
+    /// same socket and a one-shot `REQUEST_DATA_STREAM(ALL, 10 Hz)` after
+    /// the vehicle's first inbound HEARTBEAT. This is what wakes the rich
+    /// messages on real ArduPilot serials whose stock stream is just
+    /// `GLOBAL_POSITION_INT` / `GPS_RAW_INT` / `SYS_STATUS` / `HEARTBEAT`.
+    /// `on` — restores the v0.4.0 listen-only behaviour (no outgoing
+    /// traffic), useful when sharing a port with another GCS that already
+    /// drives stream requests, or for sniffing via `mavlinkrouter`.
+    #[arg(long, value_enum, default_value_t = MavlinkPassiveArg::Off)]
+    mavlink_passive: MavlinkPassiveArg,
+}
+
+/// CLI on/off for `--mavlink-passive`. (v0.8.0)
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum MavlinkPassiveArg {
+    /// Active GCS (heartbeat + REQUEST_DATA_STREAM) — v0.8.0 default.
+    Off,
+    /// Listen-only — restores v0.4.0 behaviour.
+    On,
 }
 
 /// CLI on/off for `--generators`.
@@ -164,7 +192,10 @@ fn main() -> anyhow::Result<()> {
         cli.drone,
     );
 
-    let (source, seen_drones) = from_uri_with_discovery(&cli.source)?;
+    let mav_cfg = MavlinkConfig {
+        passive: matches!(cli.mavlink_passive, MavlinkPassiveArg::On),
+    };
+    let (source, seen_drones) = from_uri_with_discovery_opts(&cli.source, mav_cfg)?;
     let source_desc = source.describe();
 
     // --generators on implies --fault-panel on (generators feed the Faults
@@ -212,6 +243,40 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // v0.8.0 — discover bundled + user templates and pick the index for the
+    // currently-loaded one (so the picker dropdown shows it as selected).
+    // The user templates directory is created lazily so a fresh install can
+    // do its first "Save as..." without manual `mkdir`.
+    if let Err(e) = ensure_user_templates_dir() {
+        log::warn!("could not create user templates dir: {e}");
+    }
+    let cli_template_path = cli.template.as_ref().map(std::path::PathBuf::from);
+    let templates =
+        discover_templates(cli_template_path.as_deref());
+    let current_template_idx = template.as_ref().and_then(|tpl| {
+        let by_name = templates.iter().position(|t| t.name == tpl.name);
+        // Prefer matching by CLI path (so "current" pinning is exact when
+        // a CLI template's name collides with a bundled one).
+        if let Some(path) = cli_template_path.as_deref() {
+            let abs = std::fs::canonicalize(path).ok();
+            for (i, e) in templates.iter().enumerate() {
+                if let Some(p) = e.origin.path() {
+                    if abs.is_some()
+                        && std::fs::canonicalize(p).ok() == abs
+                    {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        by_name
+    });
+    log::info!(
+        "template picker: {} entries discovered (current: {:?})",
+        templates.len(),
+        current_template_idx
+    );
+
     let title = match &template {
         Some(t) => format!(
             "hvn-profiler v{} — {} — {}",
@@ -247,6 +312,8 @@ fn main() -> anyhow::Result<()> {
                 seen_drones,
                 drone_override,
                 generators_on,
+                templates,
+                current_template_idx,
             )))
         }),
     )
@@ -296,6 +363,13 @@ struct App {
     drained_total: u64,
     /// Wall-clock of the last "samples-in-store" status log (1 Hz).
     last_status_log: Instant,
+    /// v0.8.0: known templates surfaced by the picker dropdown.
+    templates: Vec<TemplateEntry>,
+    /// v0.8.0: index into `templates` for the currently-active entry.
+    current_template: Option<usize>,
+    /// v0.8.0: most recent status text from a Save / Save-as / Open action,
+    /// shown briefly in the toolbar.
+    last_template_action: Option<String>,
 }
 
 impl App {
@@ -310,6 +384,8 @@ impl App {
         seen_drones: Option<SeenDrones>,
         drone_override: Option<String>,
         generators_initial: bool,
+        templates: Vec<TemplateEntry>,
+        current_template: Option<usize>,
     ) -> Self {
         let now = Instant::now();
         // Default mode: Split when the template ships a 3D view, else Grid.
@@ -346,6 +422,9 @@ impl App {
             started: now,
             drained_total: 0,
             last_status_log: now,
+            templates,
+            current_template,
+            last_template_action: None,
         }
     }
 
@@ -387,14 +466,22 @@ impl eframe::App for App {
             .and_then(|t| t.view_3d.as_ref())
             .is_some();
 
+        // Ctrl+S — save the current template's UI state in place (v0.8.0).
+        let ctrl_s = ui
+            .ctx()
+            .input(|i| i.modifiers.command && i.key_pressed(egui::Key::S));
+        if ctrl_s {
+            self.handle_save_in_place();
+        }
+
         // ── Top toolbar: status + view-mode switch ────────────────────────
+        let mut picker_action: Option<TemplateAction> = None;
         ui.horizontal(|ui| {
             ui.heading(format!("hvn-profiler v{}", env!("CARGO_PKG_VERSION")));
             ui.separator();
-            if let Some(t) = &self.template {
-                ui.label(format!("template: {}", t.name));
-                ui.separator();
-            }
+            // v0.8.0 — template picker dropdown.
+            picker_action = self.render_template_picker(ui);
+            ui.separator();
             ui.label(format!("t = {elapsed:7.2} s"));
             ui.separator();
             ui.label(&self.source_desc);
@@ -466,6 +553,12 @@ impl eframe::App for App {
                 ));
             }
         });
+        // v0.8.0 — apply any action the picker queued during the toolbar
+        // closure (kept outside so we can borrow `self` mutably for the
+        // load / save handlers).
+        if let Some(action) = picker_action {
+            self.handle_template_action(action);
+        }
         ui.separator();
 
         // Status-log bookkeeping is mode-specific.
@@ -721,4 +814,286 @@ impl App {
             count,
         ));
     }
+}
+
+// ─── v0.8.0 template picker + save / save-as plumbing ─────────────────────
+
+/// Action requested by the template picker dropdown — applied by `App` after
+/// the toolbar closure finishes (so we can borrow `self` mutably).
+enum TemplateAction {
+    /// Switch to entry at index in `App.templates`.
+    Select(usize),
+    /// "Open template file..." — show a file dialog, then load.
+    OpenFile,
+    /// "Save as..." — show a save dialog, write to chosen path.
+    SaveAs,
+}
+
+impl App {
+    /// Render the toolbar's template picker. Returns the user's choice, if
+    /// any — applied after the toolbar closure exits.
+    fn render_template_picker(&mut self, ui: &mut egui::Ui) -> Option<TemplateAction> {
+        let mut action: Option<TemplateAction> = None;
+        // Selected label for the button face.
+        let current_label = self
+            .current_template
+            .and_then(|i| self.templates.get(i))
+            .map(|e| {
+                format!("Template: {} ({})", e.name, e.origin_label())
+            })
+            .unwrap_or_else(|| "Template: (none)".to_string());
+
+        egui::ComboBox::from_id_salt("hvn-profiler-template-picker")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                for (i, entry) in self.templates.iter().enumerate() {
+                    let label = format!("{} ({})", entry.name, entry.origin_label());
+                    let selected = Some(i) == self.current_template;
+                    if ui.selectable_label(selected, label).clicked() {
+                        action = Some(TemplateAction::Select(i));
+                    }
+                }
+                ui.separator();
+                if ui.button("📁 Open template file…").clicked() {
+                    action = Some(TemplateAction::OpenFile);
+                }
+                // The Save button is enabled only when a savable entry is
+                // selected. Bundled entries pop "Save as..." instead.
+                let is_savable = self
+                    .current_template
+                    .and_then(|i| self.templates.get(i))
+                    .map(|e| e.origin.is_savable_in_place())
+                    .unwrap_or(false);
+                if is_savable && ui.button("💾 Save (Ctrl+S)").clicked() {
+                    // Tunnel through the same picker_action plumbing by
+                    // reusing the existing "in-place save" code path —
+                    // close the menu then run save.
+                    self.handle_save_in_place();
+                }
+                if ui.button("💾 Save as…").clicked() {
+                    action = Some(TemplateAction::SaveAs);
+                }
+            });
+
+        if let Some(txt) = &self.last_template_action {
+            ui.weak(txt);
+        }
+
+        action
+    }
+
+    fn handle_template_action(&mut self, action: TemplateAction) {
+        match action {
+            TemplateAction::Select(i) => self.load_template_at(i),
+            TemplateAction::OpenFile => self.open_template_dialog(),
+            TemplateAction::SaveAs => self.save_as_dialog(),
+        }
+    }
+
+    /// Switch the active template to `templates[i]`, preserving the store
+    /// (so live data keeps flowing) and toolbar state (labels, fault panel,
+    /// generators). Resets only the bits that depend on the template
+    /// itself: the view3d init flag (so the 3D camera re-fits to the new
+    /// trail set) and the picked index.
+    fn load_template_at(&mut self, i: usize) {
+        let entry = match self.templates.get(i).cloned() {
+            Some(e) => e,
+            None => return,
+        };
+        let json = match load_entry_json(&entry) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("Open failed: {e}");
+                log::warn!("{msg}");
+                self.last_template_action = Some(msg);
+                return;
+            }
+        };
+        let mut tpl = match Template::from_str(&json) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format!("Parse failed: {e}");
+                log::warn!("{msg}");
+                self.last_template_action = Some(msg);
+                return;
+            }
+        };
+        // Apply any persisted UI state.
+        if let Some(ui) = tpl.ui_state.clone() {
+            tpl.apply_ui_state(&ui);
+        }
+        log::info!(
+            "switched to template '{}' ({})",
+            tpl.name,
+            entry.origin_label()
+        );
+        self.last_template_action =
+            Some(format!("Loaded '{}' ({})", tpl.name, entry.origin_label()));
+        // Default view mode: Split if the template carries a 3D block.
+        let has_3d = tpl.view_3d.is_some();
+        self.mode = if has_3d { ViewMode::Split } else { ViewMode::Grid };
+        self.template = Some(tpl);
+        self.view3d_inited = false;
+        self.current_template = Some(i);
+    }
+
+    fn open_template_dialog(&mut self) {
+        let res = rfd::FileDialog::new()
+            .add_filter("HVN profiler template", &["json"])
+            .set_directory(profiler_template::user_templates_dir())
+            .pick_file();
+        let Some(path) = res else { return };
+        // Insert (or reuse) an entry pointing at this path.
+        match load_path_into_templates(&mut self.templates, &path) {
+            Ok(i) => self.load_template_at(i),
+            Err(e) => {
+                let msg = format!("Open failed: {e}");
+                log::warn!("{msg}");
+                self.last_template_action = Some(msg);
+            }
+        }
+    }
+
+    fn save_as_dialog(&mut self) {
+        let res = rfd::FileDialog::new()
+            .add_filter("HVN profiler template", &["json"])
+            .set_directory(profiler_template::user_templates_dir())
+            .set_file_name("my-template.json")
+            .save_file();
+        let Some(path) = res else { return };
+        self.write_current_template_to(&path);
+    }
+
+    /// Ctrl+S — overwrite the currently-loaded user/CLI template. Bundled
+    /// templates trigger a Save-as instead.
+    fn handle_save_in_place(&mut self) {
+        let entry_path: Option<std::path::PathBuf> = self
+            .current_template
+            .and_then(|i| self.templates.get(i))
+            .and_then(|e| e.origin.path().map(|p| p.to_path_buf()));
+        match entry_path {
+            Some(p) => self.write_current_template_to(&p),
+            None => self.save_as_dialog(),
+        }
+    }
+
+    fn write_current_template_to(&mut self, path: &std::path::Path) {
+        let mut tpl = match self.template.clone() {
+            Some(t) => t,
+            None => {
+                self.last_template_action =
+                    Some("Save failed: no template loaded".into());
+                return;
+            }
+        };
+        tpl.ui_state = Some(self.capture_ui_state(&tpl));
+        let json = match tpl.to_pretty_json() {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("Save failed: {e}");
+                log::warn!("{msg}");
+                self.last_template_action = Some(msg);
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        if let Err(e) = std::fs::write(path, json.as_bytes()) {
+            let msg = format!("Save failed: {e}");
+            log::warn!("{msg}");
+            self.last_template_action = Some(msg);
+            return;
+        }
+        log::info!("saved template to {}", path.display());
+        self.last_template_action = Some(format!("Saved to {}", path.display()));
+        // Refresh discovery so the new file (if any) shows up.
+        let cli_path_dummy: Option<&std::path::Path> = None;
+        let mut new_list = profiler_template::discover(cli_path_dummy);
+        // Pin to the just-saved path so the dropdown highlights it.
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut idx = None;
+        for (i, e) in new_list.iter().enumerate() {
+            if let Some(p) = e.origin.path() {
+                if std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == abs {
+                    idx = Some(i);
+                    break;
+                }
+            }
+        }
+        // If we couldn't find it (path outside the user dir), insert as Cli.
+        if idx.is_none() {
+            new_list.push(TemplateEntry {
+                name: tpl.name.clone(),
+                origin: TemplateOrigin::Cli { path: path.to_path_buf() },
+            });
+            idx = Some(new_list.len() - 1);
+        }
+        self.templates = new_list;
+        self.current_template = idx;
+    }
+
+    /// Snapshot the live UI state into a [`UiState`].
+    fn capture_ui_state(&self, tpl: &Template) -> UiState {
+        let mut ui = UiState::default();
+        // Cell visibility — persist any cell whose current `visible` flag
+        // overrides the original JSON (in v0.8.0 we don't expose runtime
+        // visibility toggles outside save-as yet, so this is a faithful copy
+        // of the loaded template's state).
+        for cell in &tpl.cells {
+            let key = format!("{},{}", cell.row, cell.col);
+            ui.cell_visibility.insert(key.clone(), cell.visible);
+            ui.cell_label_mode.insert(key, cell.label_mode);
+        }
+        // If the global label override is forcing a mode, stamp it onto
+        // every entry (round-trip the "I want metadata everywhere" flag).
+        if let profiler_render::LabelOverride::Force(mode) = self.label_arg.to_override() {
+            for v in ui.cell_label_mode.values_mut() {
+                *v = mode;
+            }
+        }
+        // 3D trail visibility + trail length (only if view3d state was
+        // touched; otherwise the snapshot omits trail keys).
+        if tpl.view_3d.is_some() {
+            for (k, v) in &self.view3d_state.visible {
+                ui.trail_visibility.insert(k.clone(), *v);
+            }
+            ui.trail_frac = Some(self.view3d_state.trail_frac);
+            ui.view_frac = Some(self.view3d_state.view_frac);
+        }
+        ui
+    }
+}
+
+/// Insert (or find-and-reuse) a `TemplateEntry` for `path` in `templates`,
+/// returning its index. Used by the "Open template file..." dialog.
+fn load_path_into_templates(
+    templates: &mut Vec<TemplateEntry>,
+    path: &std::path::Path,
+) -> std::io::Result<usize> {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for (i, e) in templates.iter().enumerate() {
+        if let Some(p) = e.origin.path() {
+            if std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == abs {
+                return Ok(i);
+            }
+        }
+    }
+    let text = std::fs::read_to_string(path)?;
+    let name = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v["name"].as_str().map(str::to_string))
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("opened")
+                .to_string()
+        });
+    templates.push(TemplateEntry {
+        name,
+        origin: TemplateOrigin::Cli { path: path.to_path_buf() },
+    });
+    Ok(templates.len() - 1)
 }

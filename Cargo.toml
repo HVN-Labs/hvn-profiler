@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 authors = ["HVN Labs <engineering@hvn-labs.com>"]
@@ -40,6 +40,15 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 crossbeam-channel = "0.5"
 rmpv = { version = "1", features = ["with-serde"] }
+
+# v0.8.0: platform dirs for user-template discovery + native file dialog.
+# Both pure-Rust, cross-platform (Windows / Linux / macOS).
+dirs = "5"
+# `rfd` brings a native blocking file picker. On Linux the default backend
+# is GTK; we override to the XDG desktop portal so no system GTK dev libs are
+# needed at compile time (`xdg-portal` is pure-Rust + DBus). Windows + macOS
+# pick up their native dialogs unchanged.
+rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
 
 # Workspace-internal
 profiler-render   = { path = "crates/profiler-render" }

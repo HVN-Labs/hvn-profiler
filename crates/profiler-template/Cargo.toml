@@ -12,3 +12,9 @@ description = "JSON template loader (layout, traces, units) for hvn-profiler."
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+# v0.8.0: user-templates directory discovery (cross-platform, pure Rust).
+dirs = { workspace = true }
+
+[dev-dependencies]
+# v0.8.0 — discovery tests scan a temp directory of synthetic templates.
+tempfile = "3"

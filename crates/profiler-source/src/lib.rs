@@ -26,7 +26,7 @@ pub use zmq_source::{SeenDrones, ZmqSource};
 #[cfg(feature = "mavlink-source")]
 pub mod mavlink_source;
 #[cfg(feature = "mavlink-source")]
-pub use mavlink_source::MavlinkSource;
+pub use mavlink_source::{MavlinkOptions, MavlinkSource};
 
 #[cfg(feature = "fault-channel")]
 pub mod fault_publisher;
@@ -75,12 +75,26 @@ pub trait Source: Send {
 /// The two `mavlink*` schemes require the `mavlink-source` feature (on by
 /// default in the shipped binary).
 pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
+    from_uri_with_options(uri, MavlinkConfig::default())
+}
+
+/// Profiler-side options that affect which sources are constructed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MavlinkConfig {
+    /// When `true`, opens MAVLink sources in passive listen-only mode (no
+    /// HEARTBEAT sender, no `REQUEST_DATA_STREAM`). v0.4.0 behaviour.
+    pub passive: bool,
+}
+
+/// Like [`from_uri`] but lets the caller pass [`MavlinkConfig`] (controls
+/// the v0.8.0 active-GCS heartbeat / stream-request behaviour).
+pub fn from_uri_with_options(uri: &str, cfg: MavlinkConfig) -> Result<Box<dyn Source>> {
     if uri == "mock://" || uri.starts_with("mock://") {
         Ok(Box::new(MockSource::default()))
     } else if let Some(rest) = uri.strip_prefix("mavlinkout://") {
-        mavlink_from_addr("udpout", rest)
+        mavlink_from_addr("udpout", rest, cfg)
     } else if let Some(rest) = uri.strip_prefix("mavlink://") {
-        mavlink_from_addr("udpin", rest)
+        mavlink_from_addr("udpin", rest, cfg)
     } else if let Some(rest) = uri.strip_prefix("zmq://") {
         // `host:port` → `tcp://host:port` for zeromq's connect string.
         let endpoint = format!("tcp://{}", rest.trim_end_matches('/'));
@@ -96,9 +110,12 @@ pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
 /// Build a [`MavlinkSource`] from a UDP `scheme` (`"udpin"` / `"udpout"`) and
 /// a trailing `host:port`. Gated on the `mavlink-source` feature.
 #[cfg(feature = "mavlink-source")]
-fn mavlink_from_addr(scheme: &str, rest: &str) -> Result<Box<dyn Source>> {
+fn mavlink_from_addr(scheme: &str, rest: &str, cfg: MavlinkConfig) -> Result<Box<dyn Source>> {
     let conn_str = format!("{scheme}:{}", rest.trim_end_matches('/'));
-    let src = MavlinkSource::connect(&conn_str)
+    let opts = MavlinkOptions {
+        passive: cfg.passive,
+    };
+    let src = MavlinkSource::connect_with(&conn_str, opts)
         .with_context(|| format!("opening MAVLink source at {conn_str}"))?;
     Ok(Box::new(src))
 }
@@ -106,7 +123,7 @@ fn mavlink_from_addr(scheme: &str, rest: &str) -> Result<Box<dyn Source>> {
 /// Stub used when the `mavlink-source` feature is compiled out: surface a
 /// clear error rather than silently falling back to `mock://`.
 #[cfg(not(feature = "mavlink-source"))]
-fn mavlink_from_addr(_scheme: &str, _rest: &str) -> Result<Box<dyn Source>> {
+fn mavlink_from_addr(_scheme: &str, _rest: &str, _cfg: MavlinkConfig) -> Result<Box<dyn Source>> {
     anyhow::bail!(
         "this binary was built without the `mavlink-source` feature; \
          rebuild with `--features mavlink-source` to use mavlink:// sources"
@@ -118,6 +135,14 @@ fn mavlink_from_addr(_scheme: &str, _rest: &str) -> Result<Box<dyn Source>> {
 /// surfaces one; every other scheme returns `None` and the Faults panel
 /// falls back to its default / CLI-supplied choices.
 pub fn from_uri_with_discovery(uri: &str) -> Result<(Box<dyn Source>, Option<SeenDrones>)> {
+    from_uri_with_discovery_opts(uri, MavlinkConfig::default())
+}
+
+/// Like [`from_uri_with_discovery`] with MAVLink-specific knobs (v0.8.0).
+pub fn from_uri_with_discovery_opts(
+    uri: &str,
+    cfg: MavlinkConfig,
+) -> Result<(Box<dyn Source>, Option<SeenDrones>)> {
     if let Some(rest) = uri.strip_prefix("zmq://") {
         let endpoint = format!("tcp://{}", rest.trim_end_matches('/'));
         let zmq = ZmqSource::connect(&endpoint)
@@ -126,7 +151,7 @@ pub fn from_uri_with_discovery(uri: &str) -> Result<(Box<dyn Source>, Option<See
         Ok((Box::new(zmq), Some(seen)))
     } else {
         // Mock / MAVLink — no name discovery on the wire.
-        let src = from_uri(uri)?;
+        let src = from_uri_with_options(uri, cfg)?;
         Ok((src, None))
     }
 }

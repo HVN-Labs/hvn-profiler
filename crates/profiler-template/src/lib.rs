@@ -18,6 +18,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod bundled;
+pub mod discovery;
+
+pub use discovery::{
+    bundled_json, discover, ensure_user_templates_dir, load_entry_json, scan_user_templates,
+    user_templates_dir, TemplateEntry, TemplateOrigin,
+};
+
 /// Build-time crate version, for logging from the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -47,6 +55,36 @@ pub struct Template {
     /// `min_window_s` / `valinit` from here.
     #[serde(default)]
     pub view_slider: Option<ViewSlider>,
+    /// v0.8.0 — persisted UI state for Save / Save-as. Optional; templates
+    /// authored before v0.8.0 omit this and load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_state: Option<UiState>,
+}
+
+/// v0.8.0 — UI-state snapshot persisted alongside the template by Save / Save-as.
+///
+/// Pure JSON-compatible additive fields. All sub-fields default to "absent"
+/// so an existing template (no `ui_state` block) loads unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiState {
+    /// Per-cell visibility overrides, keyed by `"row,col"` (e.g. `"3,1"`).
+    /// `false` overrides the JSON `cells[].visible` value at load time.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cell_visibility: std::collections::BTreeMap<String, bool>,
+    /// Per-cell label-mode overrides, keyed by `"row,col"`. When the global
+    /// label override is `LabelMode::Off|Data|Metadata` at save time, that
+    /// mode is stamped into the per-cell entries so it round-trips.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cell_label_mode: std::collections::BTreeMap<String, LabelMode>,
+    /// 3D view trail visibility, keyed by trail name (e.g. `"truth"`, `"ekf"`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub trail_visibility: std::collections::BTreeMap<String, bool>,
+    /// 3D view trail-length slider position (0..1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_frac: Option<f64>,
+    /// 3D view "view fraction" slider position (0..1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_frac: Option<f64>,
 }
 
 /// 2D grid dimensions.
@@ -357,6 +395,38 @@ impl Template {
     /// Visible cells only (skips `visible: false` placeholders).
     pub fn visible_cells(&self) -> impl Iterator<Item = &Cell> {
         self.cells.iter().filter(|c| c.visible)
+    }
+
+    /// v0.8.0 — apply a [`UiState`] snapshot onto the template, mutating in
+    /// place. Used after loading a saved user template so the grid + 3D view
+    /// boot up in the same state the operator captured.
+    pub fn apply_ui_state(&mut self, ui: &UiState) {
+        for cell in self.cells.iter_mut() {
+            let key = format!("{},{}", cell.row, cell.col);
+            if let Some(vis) = ui.cell_visibility.get(&key) {
+                cell.visible = *vis;
+            }
+            if let Some(mode) = ui.cell_label_mode.get(&key) {
+                cell.label_mode = *mode;
+            }
+        }
+        if let Some(view) = self.view_3d.as_mut() {
+            if let Some(tf) = ui.trail_frac {
+                view.trail_slider_initial = tf.clamp(0.01, 1.0);
+            }
+        }
+        if let Some(vf) = ui.view_frac {
+            let vs = self
+                .view_slider
+                .get_or_insert_with(ViewSlider::default);
+            vs.valinit = vf.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Serialise the template (including any `ui_state` block) to a pretty
+    /// JSON string. Used by Save / Save-as.
+    pub fn to_pretty_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).context("serialising template to JSON")
     }
 }
 
