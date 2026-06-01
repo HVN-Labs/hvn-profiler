@@ -28,6 +28,11 @@ pub mod mavlink_source;
 #[cfg(feature = "mavlink-source")]
 pub use mavlink_source::MavlinkSource;
 
+#[cfg(feature = "fault-channel")]
+pub mod fault_publisher;
+#[cfg(feature = "fault-channel")]
+pub use fault_publisher::{encode_command, FaultCommand, FaultPublisher};
+
 // ─── Sample / trait ────────────────────────────────────────────────────────
 
 /// A single flattened telemetry sample. One envelope from the streamer

@@ -27,10 +27,10 @@ use clap::{Parser, ValueEnum};
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use profiler_render::{
-    render_template_grid_with_override, render_view3d_with_override, LabelOverride, TraceStore,
-    View3dState,
+    render_faults_panel, render_template_grid_with_override, render_view3d_with_override,
+    FaultsPanelState, LabelOverride, PendingCommand, TraceStore, View3dState,
 };
-use profiler_source::{from_uri, Source};
+use profiler_source::{from_uri, FaultCommand, FaultPublisher, Source};
 use profiler_template::{LabelMode, Template};
 
 /// Max samples drained from the source per render frame. Caps wall-clock
@@ -68,6 +68,33 @@ struct Cli {
     /// startup; the toolbar selector can flip it at runtime.
     #[arg(long, value_enum, default_value_t = LabelArg::Template)]
     labels: LabelArg,
+
+    /// Show the Faults & Interference side panel (v0.6.0).
+    ///
+    /// `off` (default) keeps the v0.5.0 read-only behaviour intact.
+    /// `on` opens an outbound ZMQ PUB to `--fault-channel` and renders a
+    /// collapsible right-side panel with GPS / IMU / Mag / Baro sliders +
+    /// one-shot dropout / freeze / spike buttons. The panel can also be
+    /// toggled at runtime via the toolbar button.
+    #[arg(long, value_enum, default_value_t = FaultPanelArg::Off)]
+    fault_panel: FaultPanelArg,
+
+    /// Endpoint the FaultPublisher PUBs to when `--fault-panel on` (v0.6.0).
+    ///
+    /// Defaults to the SITL `runtime_control` dispatcher frontend
+    /// (`tcp://127.0.0.1:9003`) — the PUB → XSUB proxy that fans commands
+    /// out to all running sims.
+    #[arg(long, default_value = "tcp://127.0.0.1:9003")]
+    fault_channel: String,
+}
+
+/// CLI on/off for `--fault-panel`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum FaultPanelArg {
+    /// Read-only (v0.5.0 default) — no ZMQ PUB opened, no panel shown.
+    Off,
+    /// Open the PUB socket and render the panel. Toolbar can toggle visibility.
+    On,
 }
 
 /// CLI value for `--labels`. Maps onto [`LabelOverride`] / [`LabelMode`].
@@ -99,15 +126,30 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     log::info!(
-        "hvn-profiler v{} starting (source={}, template={:?}, labels={:?})",
+        "hvn-profiler v{} starting (source={}, template={:?}, labels={:?}, fault_panel={:?})",
         env!("CARGO_PKG_VERSION"),
         cli.source,
         cli.template,
         cli.labels,
+        cli.fault_panel,
     );
 
     let source = from_uri(&cli.source)?;
     let source_desc = source.describe();
+
+    // Open the outbound fault channel only when explicitly requested.
+    // `--fault-panel off` (the default) keeps the v0.5.0 read-only contract.
+    let fault_publisher = match cli.fault_panel {
+        FaultPanelArg::On => {
+            let pubr = FaultPublisher::new(&cli.fault_channel).map_err(|e| {
+                anyhow::anyhow!("opening fault channel {}: {e}", cli.fault_channel)
+            })?;
+            log::info!("FaultPublisher ready on {}", cli.fault_channel);
+            Some(pubr)
+        }
+        FaultPanelArg::Off => None,
+    };
+    let fault_panel_initial = matches!(cli.fault_panel, FaultPanelArg::On);
 
     // Load the template if given. A parse failure is fatal (the user asked for
     // a specific layout) — surface it rather than silently falling back.
@@ -154,7 +196,16 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "hvn-profiler",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(App::new(source, source_desc, template, cli.labels)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(App::new(
+                source,
+                source_desc,
+                template,
+                cli.labels,
+                fault_publisher,
+                fault_panel_initial,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe::run_native failed: {e}"))
 }
@@ -188,6 +239,14 @@ struct App {
     view3d_inited: bool,
     /// Global label-mode override (toolbar / CLI flag).
     label_arg: LabelArg,
+    /// v0.6.0: outbound runtime-control publisher. `None` when `--fault-panel off`.
+    fault_publisher: Option<FaultPublisher>,
+    /// v0.6.0: Faults panel UI state.
+    faults_state: FaultsPanelState,
+    /// v0.6.0: scratch buffer for commands emitted by the panel each frame.
+    pending_fault_cmds: Vec<PendingCommand>,
+    /// v0.6.0: cumulative count of fault commands published (for the status row).
+    fault_sent: u64,
     started: Instant,
     drained_total: u64,
     /// Wall-clock of the last "samples-in-store" status log (1 Hz).
@@ -200,6 +259,8 @@ impl App {
         source_desc: String,
         template: Option<Template>,
         label_arg: LabelArg,
+        fault_publisher: Option<FaultPublisher>,
+        fault_panel_initial: bool,
     ) -> Self {
         let now = Instant::now();
         // Default mode: Split when the template ships a 3D view, else Grid.
@@ -208,6 +269,8 @@ impl App {
             .and_then(|t| t.view_3d.as_ref())
             .is_some();
         let mode = if has_3d { ViewMode::Split } else { ViewMode::Grid };
+        let mut faults_state = FaultsPanelState::default();
+        faults_state.visible = fault_panel_initial && fault_publisher.is_some();
         Self {
             source,
             source_desc,
@@ -217,6 +280,10 @@ impl App {
             view3d_state: View3dState::default(),
             view3d_inited: false,
             label_arg,
+            fault_publisher,
+            faults_state,
+            pending_fault_cmds: Vec::new(),
+            fault_sent: 0,
             started: now,
             drained_total: 0,
             last_status_log: now,
@@ -293,6 +360,28 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.label_arg, LabelArg::Data, "data");
                 ui.selectable_value(&mut self.label_arg, LabelArg::Metadata, "metadata");
             }
+
+            // Faults panel toggle (v0.6.0). Only available when --fault-panel on
+            // opened the publisher; if it didn't, the button is grayed out with
+            // an explanatory tooltip — restarting with the flag is required.
+            ui.separator();
+            let has_publisher = self.fault_publisher.is_some();
+            let label = if self.faults_state.visible {
+                "Hide Faults"
+            } else {
+                "Show Faults"
+            };
+            let btn = ui.add_enabled(has_publisher, egui::Button::new(label));
+            if !has_publisher {
+                btn.on_hover_text(
+                    "Restart with `--fault-panel on` to enable the Faults panel.",
+                );
+            } else if btn.clicked() {
+                self.faults_state.visible = !self.faults_state.visible;
+            }
+            if has_publisher {
+                ui.label(format!("fault_sent={}", self.fault_sent));
+            }
         });
         ui.separator();
 
@@ -319,6 +408,50 @@ impl eframe::App for App {
                         grid_log = Some(self.render_grid(&mut cols[0]));
                         v3d_log = self.render_3d(&mut cols[1]);
                     });
+                }
+            }
+        }
+
+        // ── v0.6.0 Faults panel ─────────────────────────────────────────
+        // Rendered as a floating Window so it overlays without disturbing
+        // the existing CentralPanel layout. Visibility is toggled by the
+        // toolbar button; once open it stays open until closed.
+        if self.fault_publisher.is_some() && self.faults_state.visible {
+            let ctx = ui.ctx().clone();
+            let now_s = ctx.input(|i| i.time);
+            self.pending_fault_cmds.clear();
+            let mut visible = self.faults_state.visible;
+            egui::Window::new("Faults & Interference")
+                .open(&mut visible)
+                .default_width(340.0)
+                .default_pos([900.0, 80.0])
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    render_faults_panel(
+                        ui,
+                        &mut self.faults_state,
+                        &mut self.pending_fault_cmds,
+                        now_s,
+                    );
+                });
+            self.faults_state.visible = visible;
+
+            // Forward emitted commands to the publisher.
+            if !self.pending_fault_cmds.is_empty() {
+                if let Some(pubr) = &self.fault_publisher {
+                    for pc in self.pending_fault_cmds.drain(..) {
+                        let cmd = FaultCommand {
+                            feature: pc.feature,
+                            drone: pc.drone,
+                            command: pc.label,
+                            args: pc.args,
+                            reset: pc.reset,
+                        };
+                        match pubr.send(&cmd) {
+                            Ok(()) => self.fault_sent += 1,
+                            Err(e) => log::warn!("fault publish failed: {e}"),
+                        }
+                    }
                 }
             }
         }

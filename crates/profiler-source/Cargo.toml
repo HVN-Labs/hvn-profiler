@@ -25,6 +25,14 @@ crossbeam-channel = { workspace = true }
 # Heavy backends — kept optional so the CLI builds without libzmq on Windows.
 mavlink = { workspace = true, optional = true }
 
+[dev-dependencies]
+zeromq = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
 [features]
-default = []
+default = ["fault-channel"]
 mavlink-source = ["dep:mavlink"]
+# Outbound ZMQ PUB channel for runtime fault / interference commands.
+# Matches HVN-SITL's `runtime_control` dispatcher schema (see fault_publisher.rs).
+fault-channel = []
