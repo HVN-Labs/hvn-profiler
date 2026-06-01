@@ -156,6 +156,169 @@ pub fn from_uri_with_discovery_opts(
     }
 }
 
+/// v0.9.0 — Multi-URI fan-in.
+///
+/// Each URI is opened with [`from_uri_with_discovery_opts`] and wrapped into a
+/// single [`MultiSource`]. The returned [`SeenDrones`] is a SHARED set: every
+/// underlying source whose scheme supports discovery writes into it, so the
+/// Faults panel / view-drone dropdown see the union of names across all
+/// sources.
+///
+/// Each sample is tagged with a synthetic `drone_name` derived from the
+/// source URI (`"src1:host:port"`) when the underlying source didn't provide
+/// one. Real ZMQ envelopes already include their drone name and are passed
+/// through untouched.
+pub fn multi_from_uris_with_discovery_opts(
+    uris: &[String],
+    cfg: MavlinkConfig,
+) -> Result<(Box<dyn Source>, Option<SeenDrones>)> {
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+
+    anyhow::ensure!(!uris.is_empty(), "at least one --source URI is required");
+
+    // Single-source fast path — preserves v0.8.0 behaviour bit-for-bit. The
+    // returned `SeenDrones` is whatever the single source surfaces (Arc-shared
+    // with the worker thread, no copy / merging).
+    if uris.len() == 1 {
+        return from_uri_with_discovery_opts(&uris[0], cfg);
+    }
+
+    let merged: SeenDrones = Arc::new(RwLock::new(HashSet::new()));
+    let mut subs: Vec<MultiSubSource> = Vec::with_capacity(uris.len());
+
+    for (i, uri) in uris.iter().enumerate() {
+        let (src, seen_opt) = from_uri_with_discovery_opts(uri, cfg)?;
+        // Fallback drone name when the source has no native discovery (mock /
+        // mavlink): derive from URI host:port (strip the scheme).
+        let fallback_name = fallback_drone_name_from_uri(uri, i);
+        // Merge: spawn a tiny watcher to copy this sub's seen set into merged.
+        // Cheap — only fires when new names appear (read-poll once per push).
+        subs.push(MultiSubSource {
+            inner: src,
+            fallback_name,
+            inner_seen: seen_opt,
+            merged: Arc::clone(&merged),
+        });
+    }
+
+    Ok((Box::new(MultiSource { subs, rr_cursor: 0 }), Some(merged)))
+}
+
+/// Derive a drone name from a source URI when the source has no native
+/// discovery. `idx` is the 0-based position on the command line, used as a
+/// last-resort tag (`"src0"`) for `mock://` which has no host/port.
+fn fallback_drone_name_from_uri(uri: &str, idx: usize) -> String {
+    let trimmed = uri
+        .strip_prefix("zmq://")
+        .or_else(|| uri.strip_prefix("mavlinkout://"))
+        .or_else(|| uri.strip_prefix("mavlink://"))
+        .unwrap_or(uri)
+        .trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.starts_with("mock") {
+        format!("src{idx}")
+    } else {
+        // Replace `:` with `_` for readability ("127.0.0.1_9005").
+        trimmed.replace(':', "_")
+    }
+}
+
+/// One leg of a [`MultiSource`]: the underlying [`Source`], a fallback
+/// drone-name to stamp on samples that arrive without one, and an
+/// optional handle to the leg's own `SeenDrones` set (re-published into the
+/// merged set on every push).
+struct MultiSubSource {
+    inner: Box<dyn Source>,
+    /// Stamped into samples whose `drone_name` is `None` (mock, mavlink).
+    /// For ZMQ legs the envelope's own name wins.
+    fallback_name: String,
+    /// The leg's own discovery set (`ZmqSource::seen_drones()` clone) when
+    /// available. Polled on each push and the new entries unioned into
+    /// `merged`.
+    inner_seen: Option<SeenDrones>,
+    /// Shared merged set across all legs of the parent [`MultiSource`].
+    merged: SeenDrones,
+}
+
+/// v0.9.0 — fan-in over multiple [`Source`] backends.
+///
+/// Round-robin drain: each call to [`Source::try_recv`] starts at a rotating
+/// cursor and walks each leg until one yields a sample. Cursor advances by
+/// one position per yielded sample (fair-merge). `None` when every leg is
+/// empty in this drain cycle.
+///
+/// Each sample is post-processed:
+/// 1. If `drone_name` is `None`, stamp the leg's `fallback_name`.
+/// 2. If the leg has a native `SeenDrones`, union new entries into the
+///    multi-source's `merged` set so the toolbar dropdown sees them.
+/// 3. If the sample carries a name, ensure that name is in `merged`.
+pub struct MultiSource {
+    subs: Vec<MultiSubSource>,
+    /// Round-robin cursor — the leg we try first on the next call.
+    rr_cursor: usize,
+}
+
+impl Source for MultiSource {
+    fn try_recv(&mut self) -> Option<Sample> {
+        let n = self.subs.len();
+        if n == 0 {
+            return None;
+        }
+        // Walk all legs once, starting at the cursor.
+        for offset in 0..n {
+            let i = (self.rr_cursor + offset) % n;
+            let leg = &mut self.subs[i];
+            if let Some(mut s) = leg.inner.try_recv() {
+                // Stamp the fallback name when the leg didn't supply one.
+                if s.drone_name.is_none() {
+                    s.drone_name = Some(leg.fallback_name.clone());
+                }
+                // Union into merged. Fast path: read-lock first.
+                if let Some(name) = &s.drone_name {
+                    let known = leg
+                        .merged
+                        .read()
+                        .map(|g| g.contains(name))
+                        .unwrap_or(true);
+                    if !known {
+                        if let Ok(mut g) = leg.merged.write() {
+                            g.insert(name.clone());
+                        }
+                    }
+                }
+                // Also drain the leg's own native discovery set into merged
+                // (covers names that arrived via samples we never saw because
+                // a different leg yielded first).
+                if let Some(inner) = &leg.inner_seen {
+                    let to_add: Vec<String> = inner
+                        .read()
+                        .map(|g| g.iter().cloned().collect())
+                        .unwrap_or_default();
+                    if !to_add.is_empty() {
+                        if let Ok(mut m) = leg.merged.write() {
+                            for n in to_add {
+                                m.insert(n);
+                            }
+                        }
+                    }
+                }
+                self.rr_cursor = (i + 1) % n;
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    fn describe(&self) -> String {
+        let parts: Vec<String> = self
+            .subs
+            .iter()
+            .map(|s| s.inner.describe())
+            .collect();
+        format!("multi:[{}]", parts.join(" + "))
+    }
+}
+
 // ─── MockSource ────────────────────────────────────────────────────────────
 
 /// Synthetic sine-wave source. Used for the v0.0.1 toolchain-proof demo and

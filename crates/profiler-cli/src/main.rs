@@ -32,7 +32,7 @@ use profiler_render::{
     PendingCommand, SeenDrones, TraceStore, View3dState,
 };
 use profiler_source::{
-    from_uri_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
+    multi_from_uris_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
 };
 use profiler_template::{
     discover as discover_templates, ensure_user_templates_dir, load_entry_json, LabelMode,
@@ -50,15 +50,26 @@ const PREFERRED_KEY: &str = "accel[0]";
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Telemetry source URI.
+    /// Telemetry source URI. Repeatable (v0.9.0).
     ///
-    /// Supported:
+    /// Pass `--source URI` once per drone you want to ingest from. Each URI
+    /// is opened with its own backend, and the per-drone TraceStore is keyed
+    /// by the `drone_name` carried on each envelope (or, for sources that
+    /// don't supply one, by a fallback derived from the URI). The toolbar's
+    /// "Drone" dropdown picks which drone's data the 2D / 3D panels display.
+    ///
+    /// Supported schemes:
     /// - `mock://`               — synthetic sine wave (default)
     /// - `zmq://host:port`       — subscribe to the SITL msgpack streamer
     /// - `mavlink://host:port` — direct MAVLink UDP, bind/listen (udpin)
     /// - `mavlinkout://host:port` — direct MAVLink UDP, send-first (udpout)
-    #[arg(long, default_value = "mock://")]
-    source: String,
+    ///
+    /// Examples:
+    /// - `--source zmq://127.0.0.1:9005`
+    /// - `--source zmq://127.0.0.1:9005 --source zmq://127.0.0.1:9006`
+    /// - `--source zmq://127.0.0.1:9005 --source mavlink://0.0.0.0:14550`
+    #[arg(long, default_values_t = vec!["mock://".to_string()])]
+    source: Vec<String>,
 
     /// Path to a JSON template describing the panel grid.
     ///
@@ -67,12 +78,15 @@ struct Cli {
     #[arg(long)]
     template: Option<String>,
 
-    /// Global per-panel label overlay mode override (v0.5.0).
+    /// Global per-panel label overlay mode override.
     ///
-    /// `template` (default) honours each cell's own `label_mode` from the JSON
-    /// template. `off`/`data`/`metadata` force every cell into that mode at
-    /// startup; the toolbar selector can flip it at runtime.
-    #[arg(long, value_enum, default_value_t = LabelArg::Template)]
+    /// `off` (default, v0.9.0) suppresses every cell's overlay regardless of
+    /// what the template asked for — launching with no flag produces clean,
+    /// label-free panels. `template` honours each cell's own `label_mode`
+    /// from the JSON template (the v0.5.0–v0.8.0 default). `data`/`metadata`
+    /// force every cell into that mode at startup. The toolbar selector
+    /// can flip the override at runtime.
+    #[arg(long, value_enum, default_value_t = LabelArg::Off)]
     labels: LabelArg,
 
     /// Show the Faults & Interference side panel (v0.6.0).
@@ -154,11 +168,17 @@ enum FaultPanelArg {
 }
 
 /// CLI value for `--labels`. Maps onto [`LabelOverride`] / [`LabelMode`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+///
+/// v0.9.0 flipped the default from `Template` → `Off`: launching the profiler
+/// with no flag now shows clean, label-free panels. Templates can still opt
+/// individual cells in via their own `label_mode` field, but the user has to
+/// pick `--labels template` (or the toolbar's "template" item) to honour them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum LabelArg {
     /// Honour each cell's own `label_mode` from the template.
     Template,
-    /// Force every cell to draw no overlay.
+    /// Force every cell to draw no overlay. v0.9.0 global default.
+    #[default]
     Off,
     /// Force every cell to draw the data overlay.
     Data,
@@ -182,7 +202,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     log::info!(
-        "hvn-profiler v{} starting (source={}, template={:?}, labels={:?}, fault_panel={:?}, generators={:?}, drone={:?})",
+        "hvn-profiler v{} starting (sources={:?}, template={:?}, labels={:?}, fault_panel={:?}, generators={:?}, drone={:?})",
         env!("CARGO_PKG_VERSION"),
         cli.source,
         cli.template,
@@ -195,7 +215,10 @@ fn main() -> anyhow::Result<()> {
     let mav_cfg = MavlinkConfig {
         passive: matches!(cli.mavlink_passive, MavlinkPassiveArg::On),
     };
-    let (source, seen_drones) = from_uri_with_discovery_opts(&cli.source, mav_cfg)?;
+    // v0.9.0 — multi-source fan-in. Single-URI is the fast path
+    // (preserves v0.8.0 behaviour bit-for-bit); >1 URI wraps every leg into
+    // a MultiSource with a merged SeenDrones set.
+    let (source, seen_drones) = multi_from_uris_with_discovery_opts(&cli.source, mav_cfg)?;
     let source_desc = source.describe();
 
     // --generators on implies --fault-panel on (generators feed the Faults
@@ -277,17 +300,23 @@ fn main() -> anyhow::Result<()> {
         current_template_idx
     );
 
+    // Compact "src1 + src2 + …" for the title bar (Vec<String> in v0.9.0).
+    let sources_summary = if cli.source.len() == 1 {
+        cli.source[0].clone()
+    } else {
+        format!("{} sources: {}", cli.source.len(), cli.source.join(" + "))
+    };
     let title = match &template {
         Some(t) => format!(
             "hvn-profiler v{} — {} — {}",
             env!("CARGO_PKG_VERSION"),
             t.name,
-            cli.source
+            sources_summary,
         ),
         None => format!(
             "hvn-profiler v{} — {}",
             env!("CARGO_PKG_VERSION"),
-            cli.source
+            sources_summary,
         ),
     };
 
@@ -335,10 +364,29 @@ enum ViewMode {
     Split,
 }
 
+/// Drone-name used in the per-drone store map when an envelope arrives with
+/// `drone_name == None`. Keeps single-source / single-drone flows working
+/// even when the streamer doesn't tag envelopes (older SITL, raw MAVLink).
+const UNNAMED_DRONE: &str = "(unnamed)";
+
 struct App {
     source: Box<dyn Source>,
     source_desc: String,
-    store: TraceStore,
+    /// v0.9.0: per-drone trace storage. Keyed by `Sample.drone_name`. Each
+    /// drone gets its own ring buffer so cross-drone keys don't collide
+    /// (every drone has its own `accel[0]`, `pos_ekf_ned[i]`, etc.).
+    ///
+    /// Samples without a `drone_name` fall under [`UNNAMED_DRONE`].
+    stores: std::collections::HashMap<String, TraceStore>,
+    /// v0.9.0: drone whose data is currently displayed by the renderer.
+    /// `None` until the first sample arrives; then bound to the first-seen
+    /// drone. The toolbar dropdown lets the user switch this independently
+    /// of the Faults panel's target.
+    view_drone: Option<String>,
+    /// v0.9.0: insertion-ordered list of discovered drone names. Used to
+    /// populate the toolbar dropdown — sorted by first-seen so the layout
+    /// stays stable as new drones appear.
+    discovered_drones: Vec<String>,
     /// Optional template — when present, render the multi-panel grid.
     template: Option<Template>,
     /// Current toolbar view mode.
@@ -408,7 +456,9 @@ impl App {
         Self {
             source,
             source_desc,
-            store: TraceStore::default(),
+            stores: std::collections::HashMap::new(),
+            view_drone: None,
+            discovered_drones: Vec::new(),
             template,
             mode,
             view3d_state: View3dState::default(),
@@ -428,13 +478,37 @@ impl App {
         }
     }
 
-    /// Drain the source, push into the store. Caps work per frame.
+    /// Drain the source, push into the per-drone store. Caps work per frame.
+    ///
+    /// Each sample is routed to `stores[drone_name]`, creating a fresh
+    /// `TraceStore` for any drone we hear for the first time. The first-seen
+    /// drone also seeds `view_drone` so launching with only one source picks
+    /// the right drone automatically.
     fn drain(&mut self) {
         let mut n = 0;
         while n < MAX_DRAIN_PER_FRAME {
             match self.source.try_recv() {
                 Some(s) => {
-                    self.store.push(s.ts, &s.key, s.value);
+                    let drone_key = s
+                        .drone_name
+                        .clone()
+                        .unwrap_or_else(|| UNNAMED_DRONE.to_string());
+                    let is_new = !self.stores.contains_key(&drone_key);
+                    let store = self
+                        .stores
+                        .entry(drone_key.clone())
+                        .or_default();
+                    store.push(s.ts, &s.key, s.value);
+                    if is_new {
+                        self.discovered_drones.push(drone_key.clone());
+                        log::info!(
+                            "discovered drone '{drone_key}' (now {} known)",
+                            self.discovered_drones.len(),
+                        );
+                        if self.view_drone.is_none() {
+                            self.view_drone = Some(drone_key.clone());
+                        }
+                    }
                     n += 1;
                 }
                 None => break,
@@ -443,12 +517,29 @@ impl App {
         self.drained_total += n as u64;
     }
 
-    /// Choose which trace to render this frame.
+    /// Reference to the store currently being displayed, or an empty default
+    /// when no samples have arrived yet. Always returns a usable store so the
+    /// renderers don't have to special-case the "no data" path beyond what
+    /// they already handle for empty rings.
+    fn view_store(&self) -> &TraceStore {
+        // The static empty store lives in a OnceLock so the borrow lifetime
+        // matches `&self`. Cheap (constructed once, retained for process life).
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<TraceStore> = OnceLock::new();
+        let empty = EMPTY.get_or_init(TraceStore::default);
+        match self.view_drone.as_deref().and_then(|d| self.stores.get(d)) {
+            Some(s) => s,
+            None => empty,
+        }
+    }
+
+    /// Choose which trace to render this frame (single-trace fallback mode).
     fn select_key(&self) -> Option<String> {
-        if self.store.len(PREFERRED_KEY) > 0 {
+        let store = self.view_store();
+        if store.len(PREFERRED_KEY) > 0 {
             Some(PREFERRED_KEY.to_string())
         } else {
-            self.store.busiest_key()
+            store.busiest_key()
         }
     }
 }
@@ -482,6 +573,9 @@ impl eframe::App for App {
             // v0.8.0 — template picker dropdown.
             picker_action = self.render_template_picker(ui);
             ui.separator();
+            // v0.9.0 — drone selector. Hidden until ≥2 drones are known
+            // (single-drone runs don't need the clutter).
+            self.render_drone_selector(ui);
             ui.label(format!("t = {elapsed:7.2} s"));
             ui.separator();
             ui.label(&self.source_desc);
@@ -704,17 +798,23 @@ impl eframe::App for App {
         // test greps for `view3d:` (3D modes) and `grid:` (2D / split).
         let now = Instant::now();
         if now.duration_since(self.last_status_log).as_secs_f32() >= 1.0 {
+            // v0.9.0: log against the *view* drone's store (multi-drone aware).
+            let view_store = self.view_store();
+            let drone = self.view_drone.as_deref().unwrap_or("-");
+            let drones_known = self.discovered_drones.len();
             if let Some((panels, with_data, keys_with_data)) = grid_log {
                 log::info!(
-                    "grid: panels={panels} panels_with_data={with_data} \
+                    "grid: drone={drone} drones_known={drones_known} \
+                     panels={panels} panels_with_data={with_data} \
                      keys_with_data={keys_with_data} drained_total={} latest_ts={:.2}",
                     self.drained_total,
-                    self.store.latest_ts(),
+                    view_store.latest_ts(),
                 );
             }
             if let Some(stats) = &v3d_log {
                 log::info!(
-                    "view3d: trails_visible={} truth_pts={} gps_pts={} ekf_pts={} dr_pts={} \
+                    "view3d: drone={drone} drones_known={drones_known} \
+                     trails_visible={} truth_pts={} gps_pts={} ekf_pts={} dr_pts={} \
                      drained_total={} latest_ts={:.2}",
                     stats.trails_visible,
                     stats.pts("truth"),
@@ -722,15 +822,16 @@ impl eframe::App for App {
                     stats.pts("ekf"),
                     stats.pts("dr"),
                     self.drained_total,
-                    self.store.latest_ts(),
+                    view_store.latest_ts(),
                 );
             }
             if grid_log.is_none() && v3d_log.is_none() {
                 log::info!(
-                    "store: keys={} drained_total={} latest_ts={:.2}",
-                    self.store.keys().len(),
+                    "store: drone={drone} drones_known={drones_known} \
+                     keys={} drained_total={} latest_ts={:.2}",
+                    view_store.keys().len(),
                     self.drained_total,
-                    self.store.latest_ts(),
+                    view_store.latest_ts(),
                 );
             }
             self.last_status_log = now;
@@ -739,16 +840,16 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Render the 2D grid (unchanged from v0.2.0). Returns the grid stats
-    /// tuple `(panels, panels_with_data, keys_with_data)` for the status log.
+    /// Render the 2D grid against the currently-selected drone's store.
+    /// Returns the grid stats tuple `(panels, panels_with_data, keys_with_data)`
+    /// for the status log.
     fn render_grid(&mut self, ui: &mut egui::Ui) -> (usize, usize, usize) {
-        // `take` to avoid borrowing `self` immutably while `render_template_grid`
-        // also borrows `self.store` — same pattern as v0.2.0.
         let tpl = self.template.take().expect("render_grid called with template");
+        let store = self.view_store();
         let stats = render_template_grid_with_override(
             ui,
             &tpl,
-            &self.store,
+            store,
             self.label_arg.to_override(),
         );
         self.template = Some(tpl);
@@ -769,10 +870,19 @@ impl App {
                 self.view3d_state.init_from(view, min_w, valinit);
                 self.view3d_inited = true;
             }
+            // Read the view-drone's store inline (split borrow with view3d_state).
+            let store = match self.view_drone.as_deref().and_then(|d| self.stores.get(d)) {
+                Some(s) => s,
+                None => {
+                    use std::sync::OnceLock;
+                    static EMPTY: OnceLock<TraceStore> = OnceLock::new();
+                    EMPTY.get_or_init(TraceStore::default)
+                }
+            };
             render_view3d_with_override(
                 ui,
                 view,
-                &self.store,
+                store,
                 &mut self.view3d_state,
                 self.label_arg.to_override(),
             )
@@ -781,7 +891,8 @@ impl App {
         result
     }
 
-    /// v0.1.0 single-trace fallback (no template given).
+    /// v0.1.0 single-trace fallback (no template given). Reads from the
+    /// view-drone's store (or empty default before first sample).
     fn render_single_trace(&mut self, ui: &mut egui::Ui) {
         let key = self.select_key();
         let title = match key.as_deref() {
@@ -790,9 +901,10 @@ impl App {
         };
         ui.label(&title);
 
+        let store = self.view_store();
         let points: Vec<[f64; 2]> = key
             .as_deref()
-            .map(|k| self.store.points(k))
+            .map(|k| store.points(k))
             .unwrap_or_default();
         let count = points.len();
 
@@ -810,7 +922,7 @@ impl App {
         ui.separator();
         ui.label(format!(
             "store: keys={} points-in-current-trace={}",
-            self.store.keys().len(),
+            self.view_store().keys().len(),
             count,
         ));
     }
@@ -880,6 +992,39 @@ impl App {
         }
 
         action
+    }
+
+    /// v0.9.0 — render the toolbar's drone selector dropdown.
+    ///
+    /// The dropdown only appears once ≥2 drones have been discovered; while
+    /// only one is known we don't clutter the toolbar. The list is populated
+    /// from `App.discovered_drones` (insertion-ordered), and the active
+    /// selection sits on `App.view_drone`.
+    ///
+    /// This is INDEPENDENT of the Faults panel's "Target" dropdown: the user
+    /// can watch drone A while injecting faults on drone B.
+    fn render_drone_selector(&mut self, ui: &mut egui::Ui) {
+        if self.discovered_drones.len() < 2 {
+            return;
+        }
+        let current = self
+            .view_drone
+            .clone()
+            .unwrap_or_else(|| self.discovered_drones[0].clone());
+        ui.label("Drone:");
+        egui::ComboBox::from_id_salt("hvn-profiler-drone-selector")
+            .selected_text(&current)
+            .show_ui(ui, |ui| {
+                for name in &self.discovered_drones {
+                    let selected = Some(name) == self.view_drone.as_ref();
+                    if ui.selectable_label(selected, name).clicked() {
+                        self.view_drone = Some(name.clone());
+                        // Reset 3D camera fit so the new drone's trail is centred.
+                        self.view3d_inited = false;
+                    }
+                }
+            });
+        ui.separator();
     }
 
     fn handle_template_action(&mut self, action: TemplateAction) {
@@ -1096,4 +1241,36 @@ fn load_path_into_templates(
         origin: TemplateOrigin::Cli { path: path.to_path_buf() },
     });
     Ok(templates.len() - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// v0.9.0 — the GLOBAL `--labels` default is `off` so launching the
+    /// profiler with no flag shows clean panels. Templates can still opt
+    /// cells in via `label_mode` by picking `--labels template`.
+    #[test]
+    fn cli_labels_default_is_off() {
+        // Parse with no arguments — `clap` applies the `default_value_t`.
+        let cli = Cli::parse_from(["hvn-profiler"]);
+        assert_eq!(cli.labels, LabelArg::Off, "v0.9.0: --labels defaults to Off");
+        // `LabelArg::default()` is also `Off` (used by the toolbar selector).
+        assert_eq!(LabelArg::default(), LabelArg::Off);
+        // The resolved override forces every cell to `Off`, suppressing any
+        // per-cell `label_mode` that the JSON template asked for.
+        assert_eq!(
+            LabelArg::default().to_override(),
+            LabelOverride::Force(LabelMode::Off),
+        );
+    }
+
+    #[test]
+    fn cli_labels_template_still_available() {
+        // Explicit opt-in still honours per-cell modes.
+        let cli = Cli::parse_from(["hvn-profiler", "--labels", "template"]);
+        assert_eq!(cli.labels, LabelArg::Template);
+        assert_eq!(cli.labels.to_override(), LabelOverride::Respect);
+    }
 }

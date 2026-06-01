@@ -21,8 +21,8 @@ pub use faults::{
 pub use gen_panel::{render_gen_panel, GeneratorPanelState, SLIDER_TARGETS};
 pub use generators::{Generator, Waveform};
 pub use panels::{
-    format_value_pub, render_template_grid, render_template_grid_with_override, GridStats,
-    LabelOverride,
+    build_label_text, format_value_pub, layout_cell_rects, overlay_box_size,
+    render_template_grid, render_template_grid_with_override, GridStats, LabelOverride,
 };
 pub use view3d::{render_view3d, render_view3d_with_override, OrbitCamera, View3dState, View3dStats};
 

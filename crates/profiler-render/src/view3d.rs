@@ -543,17 +543,25 @@ pub fn render_view3d_with_override(
         Color32::from_gray(150),
     );
 
-    // ── Bottom-left label overlay (v0.5.0) ───────────────────────────────
+    // ── Bottom-left label overlay (v0.5.0; v0.9.0 added translucent BG) ──
+    //
+    // Painter-based overlay inside the viewport rect — no layout reflow. The
+    // v0.9.0 refresh adds a semi-transparent rounded background so the text
+    // stays readable over busy trails (matches the 2D panel overlay style in
+    // `panels.rs::draw_label_overlay`). Bottom-left placement keeps the
+    // top-right corner free for the live/frozen status string above.
     if let LabelOverride::Force(lm) = label_override {
         let block = build_3d_label_block(lm, view, &drawn);
         if !block.is_empty() {
-            painter.text(
-                rect.left_bottom() + Vec2::new(8.0, -8.0),
-                Align2::LEFT_BOTTOM,
-                block,
-                FontId::monospace(11.0),
-                Color32::from_gray(200),
-            );
+            let font = FontId::monospace(11.0);
+            let text_color = Color32::from_gray(220);
+            let galley = painter.layout_no_wrap(block, font, text_color);
+            let inset = Vec2::new(6.0, 3.0);
+            let bg_size = galley.size() + 2.0 * inset;
+            let bg_min = rect.left_bottom() + Vec2::new(8.0, -8.0 - bg_size.y);
+            let bg_rect = egui::Rect::from_min_size(bg_min, bg_size);
+            painter.rect_filled(bg_rect, 3.0, Color32::from_black_alpha(160));
+            painter.galley(bg_min + inset, galley, text_color);
         }
     }
 
