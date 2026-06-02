@@ -24,6 +24,14 @@ use serde::Deserialize;
 pub mod zmq_source;
 pub use zmq_source::{LastDroneName, SeenDrones, ZmqSource};
 
+// v0.16.0 — localhost source auto-discovery (powers the `+ Add Source...`
+// dialog's "Detected on localhost:" list).
+pub mod discovery;
+pub use discovery::{
+    discover_localhost_sources, DiscoveredSource, DiscoveryStatus, SourceKind,
+    DEFAULT_PROBE_MS, MAVLINK_PORTS, ZMQ_PORT_RANGE,
+};
+
 #[cfg(feature = "mavlink-source")]
 pub mod mavlink_source;
 #[cfg(feature = "mavlink-source")]

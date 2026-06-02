@@ -33,3 +33,9 @@ profiler-template = { workspace = true }
 # v0.8.0 — native file dialog for template Open / Save-as.
 rfd = { workspace = true }
 serde_json = { workspace = true }
+
+# v0.16.0 — async runtime for the localhost source-discovery scan (the
+# Add Source dialog kicks one off when it opens, plus the bare-launch
+# auto-connect path). The runtime is created once at App boot and reused
+# for every scan, so the cost amortises to ~zero.
+tokio = { workspace = true }

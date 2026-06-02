@@ -29,15 +29,16 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 use std::collections::HashMap;
 
 use profiler_render::{
-    apply_panel_draft, apply_trail_draft, collect_source_keys, compact_cells, group_source_keys,
-    relocate_cell, remove_cell_at, replace_cell_at, render_faults_panel, render_gen_panel,
-    render_template_grid_full, render_view3d_with_override, swap_cells, CellMenuAction, EditHistory,
-    FaultsPanelState, GeneratorPanelState, GridRenderOptions, LabelOverride, PanelDraft,
-    PanelState, PendingCommand, SeenDrones, TraceStore, TrailDraft, View3dState,
+    add_panel_draft, apply_trail_draft, collect_source_keys, compact_cells, first_available_slot,
+    group_source_keys, relocate_cell, remove_cell_at, replace_cell_at, render_faults_panel,
+    render_gen_panel, render_template_grid_full, render_view3d_with_override, swap_cells,
+    CellMenuAction, EditHistory, FaultsPanelState, GeneratorPanelState, GridRenderOptions,
+    LabelOverride, PanelDraft, PanelState, PendingCommand, SeenDrones, TraceStore, TrailDraft,
+    View3dState,
 };
 use profiler_source::{
-    FaultCommand, FaultPublisher, MavlinkConfig, Source, SourceListEntry, SourceRegistry,
-    Value as SampleValue,
+    DiscoveredSource, DiscoveryStatus, FaultCommand, FaultPublisher, MavlinkConfig, Source,
+    SourceListEntry, SourceRegistry, Value as SampleValue, DEFAULT_PROBE_MS,
 };
 use profiler_template::{
     discover as discover_templates, ensure_user_templates_dir, load_entry_json, LabelMode,
@@ -73,7 +74,13 @@ struct Cli {
     /// - `--source zmq://127.0.0.1:9005`
     /// - `--source zmq://127.0.0.1:9005 --source zmq://127.0.0.1:9006`
     /// - `--source zmq://127.0.0.1:9005 --source mavlink://0.0.0.0:14550`
-    #[arg(long, default_values_t = vec!["mock://".to_string()])]
+    ///
+    /// v0.16.0 — when omitted, the profiler runs a one-shot localhost
+    /// discovery scan (`zmq://127.0.0.1:9005..=9020` + canonical MAVLink
+    /// ports) and auto-connects to every Live source it finds. If none are
+    /// found, it falls back to `mock://`. Passing `--source` at least once
+    /// disables auto-discovery — explicit URIs are honoured verbatim.
+    #[arg(long)]
     source: Vec<String>,
 
     /// Path to a JSON template describing the panel grid.
@@ -209,7 +216,7 @@ fn main() -> anyhow::Result<()> {
     log::info!(
         "hvn-profiler v{} starting (sources={:?}, template={:?}, labels={:?}, fault_panel={:?}, generators={:?}, drone={:?})",
         env!("CARGO_PKG_VERSION"),
-        cli.source,
+        if cli.source.is_empty() { vec!["(auto-discover)".to_string()] } else { cli.source.clone() },
         cli.template,
         cli.labels,
         cli.fault_panel,
@@ -226,13 +233,76 @@ fn main() -> anyhow::Result<()> {
         // envelope's own `drone_name`; this only applies to MAVLink legs.
         drone_name_override: cli.drone.clone(),
     };
+
+    // v0.16.0 — shared async runtime used for the Add-Source dialog's
+    // localhost discovery scan AND the bare-launch auto-connect path
+    // below. Multi-thread flavour so a scan-in-flight doesn't block the
+    // egui paint thread when it grabs the runtime to spawn the next one.
+    let runtime = std::sync::Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("hvn-profiler-discovery")
+            .build()
+            .map_err(|e| anyhow::anyhow!("building discovery tokio runtime: {e}"))?,
+    );
+
+    // v0.16.0 — ALWAYS run a one-shot localhost discovery scan at startup
+    // and auto-connect to every Live source it finds (in addition to any
+    // explicit --source URIs). The scan budget is `DEFAULT_PROBE_MS`
+    // (typically 500 ms), so launching the profiler stays snappy.
+    //
+    // Explicit URIs take precedence: discovery hits that match an explicit
+    // URI are not added a second time (the `SourceRegistry::add*` calls
+    // would no-op anyway, but skipping them keeps the startup log tidy).
+    //
+    // If neither the operator nor discovery provided any sources, fall
+    // back to `mock://` so the toolchain-proof demo still works.
+    let mut startup_uris: Vec<String> = cli.source.clone();
+    log::info!(
+        "running localhost discovery scan (≤ {} ms)",
+        profiler_source::DEFAULT_PROBE_MS,
+    );
+    let scan = runtime.block_on(profiler_source::discover_localhost_sources(
+        &startup_uris,
+        profiler_source::DEFAULT_PROBE_MS,
+    ));
+    let mut autodiscovered: Vec<String> = Vec::new();
+    for d in &scan {
+        if matches!(d.status, profiler_source::DiscoveryStatus::Live { .. })
+            && !startup_uris.iter().any(|u| u == &d.uri)
+        {
+            autodiscovered.push(d.uri.clone());
+        }
+    }
+    if autodiscovered.is_empty() {
+        if startup_uris.is_empty() {
+            log::info!(
+                "discovery found no live sources and no --source given → mock://",
+            );
+            startup_uris.push("mock://".to_string());
+        } else {
+            log::info!(
+                "discovery found no additional live sources beyond {:?}",
+                startup_uris,
+            );
+        }
+    } else {
+        log::info!(
+            "discovery: auto-connecting to {} additional live source(s): {:?}",
+            autodiscovered.len(),
+            autodiscovered,
+        );
+        startup_uris.extend(autodiscovered.iter().cloned());
+    }
+
     // v0.15.0 — `SourceRegistry` replaces `MultiSource` as the runtime
     // source container. CLI-supplied URIs are added at startup; the in-app
     // Sources dropdown can add/remove more after that. ZMQ sources are
     // routed through `add_zmq` so the toolbar can read the live
     // `last_drone_name` slot for the dropdown's "this is eric_1" label.
     let mut registry = SourceRegistry::new(mav_cfg.clone());
-    for uri in &cli.source {
+    for uri in &startup_uris {
         let res = if uri.starts_with("zmq://") {
             registry.add_zmq(uri)
         } else {
@@ -361,11 +431,14 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Compact "src1 + src2 + …" for the title bar (Vec<String> in v0.9.0).
-    let sources_summary = if cli.source.len() == 1 {
-        cli.source[0].clone()
+    // v0.16.0 — `startup_uris` is `cli.source` with any auto-discovered
+    // URIs appended (or `["mock://"]` when nothing was found).
+    let sources_summary = if startup_uris.len() == 1 {
+        startup_uris[0].clone()
     } else {
-        format!("{} sources: {}", cli.source.len(), cli.source.join(" + "))
+        format!("{} sources: {}", startup_uris.len(), startup_uris.join(" + "))
     };
+    let autodiscovered_for_app = autodiscovered.clone();
     let title = match &template {
         Some(t) => format!(
             "hvn-profiler v{} — {} — {}",
@@ -403,6 +476,8 @@ fn main() -> anyhow::Result<()> {
                 generators_on,
                 templates,
                 current_template_idx,
+                runtime,
+                autodiscovered_for_app,
             )))
         }),
     )
@@ -443,6 +518,20 @@ struct App {
     /// v0.15.0 — `+ Add Source...` dialog: in-progress URI text. `None`
     /// means the dialog is closed.
     add_source_uri: Option<String>,
+    /// v0.16.0 — shared tokio runtime used to spawn the Add-Source
+    /// dialog's localhost discovery scan. Same runtime that the bare-launch
+    /// auto-connect path used at boot.
+    discovery_runtime: std::sync::Arc<tokio::runtime::Runtime>,
+    /// v0.16.0 — shared slot for the in-progress / latest discovery scan
+    /// result. `(scanning, results)`: while a task is in flight `scanning`
+    /// is `true`; once it completes the results land in the `Vec`. The
+    /// dialog reads this each frame; the `[🔄 Rescan]` button kicks off a
+    /// fresh scan that overwrites the previous result.
+    discovery_state: std::sync::Arc<std::sync::Mutex<DiscoveryState>>,
+    /// v0.16.0 — banner toast for the bare-launch auto-discovery hit.
+    /// `Some` for the first ~5 s after start when ≥1 source was auto-
+    /// connected; cleared after the timeout fires so the toolbar relaxes.
+    autodiscover_toast: Option<(Instant, String)>,
     /// v0.15.0 — most recent template-fallback warning. Set whenever a
     /// cell's declared `source_uri` doesn't match any connected source;
     /// the toolbar paints it next to the source counter.
@@ -571,6 +660,8 @@ impl App {
         generators_initial: bool,
         templates: Vec<TemplateEntry>,
         current_template: Option<usize>,
+        discovery_runtime: std::sync::Arc<tokio::runtime::Runtime>,
+        autodiscovered: Vec<String>,
     ) -> Self {
         let now = Instant::now();
         // Default mode: Split when the template ships a 3D view, else Grid.
@@ -590,11 +681,27 @@ impl App {
             visible: generators_initial && fault_publisher.is_some(),
             ..Default::default()
         };
+        let autodiscover_toast = if autodiscovered.is_empty() {
+            None
+        } else {
+            Some((
+                now,
+                format!(
+                    "Auto-connected to {} source(s) discovered on localhost",
+                    autodiscovered.len(),
+                ),
+            ))
+        };
         Self {
             registry,
             source_desc,
             last_source_action: None,
             add_source_uri: None,
+            discovery_runtime,
+            discovery_state: std::sync::Arc::new(std::sync::Mutex::new(
+                DiscoveryState::default(),
+            )),
+            autodiscover_toast,
             template_fallback_warning: None,
             stores: std::collections::HashMap::new(),
             view_drone: None,
@@ -867,7 +974,20 @@ impl eframe::App for App {
                 ui.separator();
                 if ui.button("+ Add Panel").clicked() {
                     self.refresh_editor_source_keys();
-                    self.editor = Some(EditorMode::AddPanel(PanelDraft::default()));
+                    // v0.16.0 — default to the first unoccupied (row, col)
+                    // instead of always (0, 0). Repeated Add clicks used to
+                    // stack new cells on top of an existing (0, 0) panel,
+                    // causing overlapping plots to fight for the same rect.
+                    let (row, col) = self
+                        .template
+                        .as_ref()
+                        .map(first_available_slot)
+                        .unwrap_or((0, 0));
+                    self.editor = Some(EditorMode::AddPanel(PanelDraft {
+                        row,
+                        col,
+                        ..PanelDraft::default()
+                    }));
                 }
                 if has_3d && ui.button("+ Add Trail").clicked() {
                     self.refresh_editor_source_keys();
@@ -1356,10 +1476,39 @@ enum SourceAction {
     CancelAdd,
     /// Operator clicked `[×]` next to the given URI.
     Remove(String),
+    /// v0.16.0 — operator clicked `[🔄 Rescan]` in the Add-Source dialog.
+    /// Triggers a fresh localhost discovery scan without closing the dialog.
+    Rescan,
+    /// v0.16.0 — operator clicked `[+ Connect]` on a discovered row.
+    /// Adds the URI to the registry; dialog stays open so the operator can
+    /// pick more rows in succession.
+    ConnectDiscovered(String),
 }
 
 /// Live-threshold (seconds) for the `●`/`◌` indicator in the Sources popup.
 const SOURCES_LIVE_THRESHOLD_S: f64 = 3.0;
+
+/// v0.16.0 — how long the bare-launch auto-discovery toast stays visible
+/// before fading. Long enough to read, short enough not to clutter.
+const AUTODISCOVER_TOAST_S: f32 = 5.0;
+
+/// v0.16.0 — shared discovery scan state between the egui paint thread and
+/// the background tokio task that runs [`profiler_source::discover_localhost_sources`].
+///
+/// The dialog reads `scanning` to decide whether to draw a spinner, and
+/// `results` to render the row list. The kick-off helper sets `scanning =
+/// true` synchronously and clears it once the task completes; the
+/// `results` slot is replaced wholesale, never appended to.
+#[derive(Debug, Default)]
+struct DiscoveryState {
+    /// `true` while a scan task is in flight. The dialog draws "Scanning…"
+    /// while this is set.
+    scanning: bool,
+    /// Most recent scan result. `None` before the first scan, otherwise
+    /// the full Vec from [`profiler_source::discover_localhost_sources`].
+    /// Empty Vec means the scan ran but found nothing.
+    results: Option<Vec<DiscoveredSource>>,
+}
 
 // ─── v0.8.0 template picker + save / save-as plumbing ─────────────────────
 
@@ -1461,6 +1610,24 @@ impl App {
         if let Some(txt) = &last_status {
             ui.weak(txt);
         }
+        // v0.16.0 — bare-launch auto-discovery toast. Fades after
+        // AUTODISCOVER_TOAST_S so it doesn't clutter the toolbar forever.
+        let toast_clear = if let Some((shown_at, txt)) = &self.autodiscover_toast {
+            if shown_at.elapsed().as_secs_f32() < AUTODISCOVER_TOAST_S {
+                ui.label(
+                    egui::RichText::new(format!("✨ {txt}"))
+                        .color(egui::Color32::from_rgb(120, 200, 240)),
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if toast_clear {
+            self.autodiscover_toast = None;
+        }
         if warning_open {
             if let Some(w) = &self.template_fallback_warning {
                 ui.label(
@@ -1518,9 +1685,35 @@ impl App {
         match action {
             SourceAction::OpenAddDialog => {
                 self.add_source_uri = Some(String::new());
+                // v0.16.0 — kick off the localhost discovery scan in the
+                // background so the dialog has results to show by the time
+                // the operator is done reading the header.
+                self.kick_discovery_scan();
             }
             SourceAction::CancelAdd => {
                 self.add_source_uri = None;
+            }
+            SourceAction::Rescan => {
+                self.kick_discovery_scan();
+            }
+            SourceAction::ConnectDiscovered(uri) => {
+                // Same path as a manual Connect, but DON'T close the dialog:
+                // the operator may want to click [+ Connect] on several rows
+                // back-to-back without re-opening the modal.
+                let res = if uri.starts_with("zmq://") {
+                    self.registry.add_zmq(&uri)
+                } else {
+                    self.registry.add(&uri)
+                };
+                match res {
+                    Ok(()) => {
+                        self.last_source_action = Some(format!("Connected to {uri}"));
+                        self.source_desc = self.registry.describe();
+                    }
+                    Err(e) => {
+                        self.last_source_action = Some(format!("Connect failed: {e}"));
+                    }
+                }
             }
             SourceAction::Connect(uri) => {
                 let uri = uri.trim().to_string();
@@ -1561,19 +1754,209 @@ impl App {
         }
     }
 
-    /// v0.15.0 — render the `+ Add Source...` modal dialog. Driven by
+    /// v0.16.0 — kick off a background localhost discovery scan. Snapshots
+    /// the connected-source list under the registry's lock-free read, then
+    /// spawns the scan on the shared tokio runtime. The result lands in
+    /// `self.discovery_state` once the task completes.
+    ///
+    /// Idempotent: if a scan is already in flight, this is a no-op (the
+    /// in-flight task will refresh the slot when it finishes). The
+    /// `[🔄 Rescan]` button still calls this each click; the second call
+    /// during an in-flight scan just no-ops and the operator's existing
+    /// scan completes normally.
+    fn kick_discovery_scan(&mut self) {
+        // No-op when a scan is already pending.
+        if let Ok(g) = self.discovery_state.lock() {
+            if g.scanning {
+                return;
+            }
+        }
+        let connected = self.registry.uris();
+        let state = std::sync::Arc::clone(&self.discovery_state);
+        // Mark scanning BEFORE spawning so the dialog draws "Scanning..."
+        // immediately on the very next frame.
+        if let Ok(mut g) = state.lock() {
+            g.scanning = true;
+        }
+        let rt = std::sync::Arc::clone(&self.discovery_runtime);
+        rt.spawn(async move {
+            let results = profiler_source::discover_localhost_sources(
+                &connected,
+                DEFAULT_PROBE_MS,
+            )
+            .await;
+            if let Ok(mut g) = state.lock() {
+                g.results = Some(results);
+                g.scanning = false;
+            }
+        });
+    }
+
+    /// v0.16.0 — render the `+ Add Source...` modal dialog. Driven by
     /// `self.add_source_uri`: `None` means the dialog is closed; `Some(buf)`
     /// keeps it open and tracks the in-progress URI text.
+    ///
+    /// v0.16.0 adds a "Detected on localhost:" section above the URI input
+    /// that lists every source the background discovery scan found. The
+    /// scan kicks off automatically when the dialog opens; the `[🔄 Rescan]`
+    /// button refreshes the list in place.
     fn render_add_source_modal(&mut self, ctx: &egui::Context) -> Option<SourceAction> {
         let buf_owned = self.add_source_uri.clone()?;
         let mut buf = buf_owned;
         let mut connect_clicked = false;
         let mut cancel_clicked = false;
+        let mut rescan_clicked = false;
+        let mut discovered_connect: Option<String> = None;
+        // Snapshot the discovery slot under the lock so we don't hold it
+        // through the egui closure (which may panic-on-poison).
+        let (scanning, results_snapshot): (bool, Option<Vec<DiscoveredSource>>) =
+            match self.discovery_state.lock() {
+                Ok(g) => (g.scanning, g.results.clone()),
+                Err(_) => (false, None),
+            };
+        // Pre-compute the set of URIs already in the registry so we can
+        // grey out their [+ Connect] buttons even when the result entry
+        // was Live / Silent (e.g. operator clicked Connect, the entry got
+        // added, but the scan hasn't been re-run yet).
+        let connected_uris: std::collections::HashSet<String> =
+            self.registry.uris().into_iter().collect();
+
         egui::Window::new("+ Add Source")
             .collapsible(false)
             .resizable(false)
-            .default_width(420.0)
+            .default_width(460.0)
             .show(ctx, |ui| {
+                // ─ Header: "Detected on localhost:" + Rescan button ──────
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Detected on localhost:").strong());
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .button("🔄 Rescan")
+                                .on_hover_text(
+                                    "Re-run the localhost discovery scan",
+                                )
+                                .clicked()
+                            {
+                                rescan_clicked = true;
+                            }
+                        },
+                    );
+                });
+
+                // ─ Discovery list ────────────────────────────────────────
+                if scanning && results_snapshot.is_none() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Scanning…");
+                    });
+                } else if let Some(rows) = &results_snapshot {
+                    if rows.is_empty() {
+                        ui.weak("(none detected; enter a custom URI below)");
+                    } else {
+                        // v0.16.0 — re-render the spinner inline next to
+                        // the previous results when a fresh scan is in
+                        // flight, so the operator can still click rows
+                        // from the prior result while the next one cooks.
+                        if scanning {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.weak("Re-scanning…");
+                            });
+                        }
+                        for d in rows {
+                            let is_connected = connected_uris.contains(&d.uri)
+                                || matches!(d.status, DiscoveryStatus::InUse);
+                            ui.horizontal(|ui| {
+                                let (glyph, color) = match &d.status {
+                                    DiscoveryStatus::Live { .. } => (
+                                        "●",
+                                        egui::Color32::from_rgb(80, 200, 120),
+                                    ),
+                                    DiscoveryStatus::Silent => (
+                                        "◌",
+                                        egui::Color32::from_gray(140),
+                                    ),
+                                    DiscoveryStatus::InUse => (
+                                        "✓",
+                                        egui::Color32::from_rgb(100, 160, 220),
+                                    ),
+                                };
+                                if is_connected
+                                    && !matches!(d.status, DiscoveryStatus::InUse)
+                                {
+                                    // The scan said Live/Silent but the
+                                    // operator already added the URI in
+                                    // this session — re-tag as ✓.
+                                    ui.label(
+                                        egui::RichText::new("✓")
+                                            .color(egui::Color32::from_rgb(100, 160, 220))
+                                            .strong(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(glyph).color(color).strong(),
+                                    );
+                                }
+                                ui.label(&d.uri);
+                                // Drone name / status descriptor.
+                                let descriptor = match &d.status {
+                                    DiscoveryStatus::Live { drone_name } => {
+                                        drone_name
+                                            .clone()
+                                            .unwrap_or_else(|| "(live)".to_string())
+                                    }
+                                    DiscoveryStatus::Silent => "(silent)".into(),
+                                    DiscoveryStatus::InUse => "(already connected)".into(),
+                                };
+                                ui.weak(descriptor);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let btn_label = if is_connected {
+                                            "✓ Connected"
+                                        } else {
+                                            "+ Connect"
+                                        };
+                                        let btn = ui.add_enabled(
+                                            !is_connected,
+                                            egui::Button::new(btn_label),
+                                        );
+                                        if btn.clicked() {
+                                            discovered_connect = Some(d.uri.clone());
+                                            // Pre-fill the URI box too for
+                                            // visual feedback.
+                                            buf = d.uri.clone();
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        // Per-kind summary (helps the operator notice when
+                        // their MAVLink port range is exotic).
+                        let live_n = rows
+                            .iter()
+                            .filter(|r| matches!(r.status, DiscoveryStatus::Live { .. }))
+                            .count();
+                        let silent_n = rows
+                            .iter()
+                            .filter(|r| matches!(r.status, DiscoveryStatus::Silent))
+                            .count();
+                        let inuse_n = rows
+                            .iter()
+                            .filter(|r| matches!(r.status, DiscoveryStatus::InUse))
+                            .count();
+                        ui.weak(format!(
+                            "{live_n} live / {silent_n} silent / {inuse_n} connected",
+                        ));
+                    }
+                } else {
+                    ui.weak("(scan pending)");
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Or enter a custom URI:").strong());
                 egui::Grid::new("add_source_grid")
                     .num_columns(2)
                     .spacing([8.0, 4.0])
@@ -1598,11 +1981,7 @@ impl App {
                         ui.weak(scheme_hint);
                         ui.end_row();
                     });
-                ui.separator();
-                ui.label(egui::RichText::new("Examples:").weak());
-                ui.label("  zmq://127.0.0.1:9005       (HVN-SITL)");
-                ui.label("  mavlink://127.0.0.1:14550  (ArduPilot)");
-                ui.label("  mock://                    (synthetic)");
+                ui.weak("zmq:// or mavlink:// or mock://");
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -1615,6 +1994,12 @@ impl App {
             });
         // Persist the in-progress text back into self so future frames see it.
         self.add_source_uri = Some(buf.clone());
+        if let Some(uri) = discovered_connect {
+            return Some(SourceAction::ConnectDiscovered(uri));
+        }
+        if rescan_clicked {
+            return Some(SourceAction::Rescan);
+        }
         if connect_clicked {
             return Some(SourceAction::Connect(buf));
         }
@@ -2205,7 +2590,7 @@ impl App {
                     // (we re-emit the editor below on Err).
                     self.record_history();
                     if let Some(tpl) = self.template.as_mut() {
-                        match apply_panel_draft(tpl, &draft) {
+                        match add_panel_draft(tpl, &draft) {
                             Ok(()) => {
                                 self.template_dirty = true;
                                 self.last_template_action = Some(format!(

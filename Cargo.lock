@@ -2996,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3010,11 +3010,12 @@ dependencies = [
  "profiler-template",
  "rfd",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "profiler-render"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "egui",
  "egui_plot",
@@ -3028,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-source"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -3044,7 +3045,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-template"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "dirs",

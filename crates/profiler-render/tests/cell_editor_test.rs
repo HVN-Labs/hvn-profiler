@@ -6,8 +6,8 @@
 //! template-mutation contract that the modal commits to on click.
 
 use profiler_render::{
-    apply_panel_draft, apply_trail_draft, collect_source_keys, remove_cell_at, replace_cell_at,
-    PanelDraft, TraceStore, TrailDraft,
+    add_panel_draft, apply_panel_draft, apply_trail_draft, collect_source_keys,
+    first_available_slot, remove_cell_at, replace_cell_at, PanelDraft, TraceStore, TrailDraft,
 };
 use profiler_template::{LabelMode, Primitive, Template};
 
@@ -178,4 +178,123 @@ fn add_panel_dirties_template_via_save_serialisation() {
     let json = tpl.to_pretty_json().unwrap();
     assert!(json.contains("fresh_key"));
     assert!(json.contains("Fresh"));
+}
+
+// v0.16.0 — fix for "adding a new panel glitches the whole screen because I
+// add both at 0,0". The "+ Add Panel" modal now (a) defaults to the first
+// unoccupied (row, col) and (b) rejects an Add submit onto an already-
+// occupied slot. The Edit/Replace path goes through `replace_cell_at` and
+// is intentionally unaffected.
+
+#[test]
+fn test_add_panel_defaults_to_first_available_slot() {
+    // 2-column grid with cells at (0,0), (0,1), (1,0). Row 0 is fully
+    // occupied; row 1 col 0 is taken; first gap in row-major order is
+    // (1,1). That's what the Add Panel modal should default to.
+    let json = r#"{
+        "name": "two_col",
+        "grid": {"rows": 3, "cols": 2},
+        "cells": []
+    }"#;
+    let mut tpl = profiler_template::Template::from_str(json).unwrap();
+    for (r, c, k) in &[(0usize, 0usize, "a"), (0, 1, "b"), (1, 0, "c")] {
+        apply_panel_draft(
+            &mut tpl,
+            &PanelDraft {
+                row: *r,
+                col: *c,
+                source_key: (*k).into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(first_available_slot(&tpl), (1, 1));
+
+    // Sanity: an empty template just returns (0, 0).
+    let empty = empty_template();
+    assert_eq!(first_available_slot(&empty), (0, 0));
+}
+
+#[test]
+fn test_add_panel_rejects_occupied_slot() {
+    // Template with cell at (0,0); submit Add at (0,0); expect error AND
+    // template unchanged (no second cell appended).
+    let mut tpl = empty_template();
+    apply_panel_draft(
+        &mut tpl,
+        &PanelDraft {
+            row: 0,
+            col: 0,
+            source_key: "a".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(tpl.cells.len(), 1);
+
+    let err = add_panel_draft(
+        &mut tpl,
+        &PanelDraft {
+            row: 0,
+            col: 0,
+            source_key: "b".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("already exists"),
+        "error mentions duplicate: {err}"
+    );
+    assert_eq!(tpl.cells.len(), 1, "template untouched on rejected add");
+    assert_eq!(tpl.cells[0].sources[0].key, "a");
+}
+
+#[test]
+fn test_add_panel_to_full_grid_appends_row() {
+    // 2x2 grid fully occupied. first_available_slot returns (rows, 0) =
+    // (2, 0); submitting Add at that slot auto-grows the grid to 3 rows
+    // and appends the cell there.
+    let json = r#"{
+        "name": "two_by_two",
+        "grid": {"rows": 2, "cols": 2},
+        "cells": []
+    }"#;
+    let mut tpl = profiler_template::Template::from_str(json).unwrap();
+    for (r, c) in &[(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+        apply_panel_draft(
+            &mut tpl,
+            &PanelDraft {
+                row: *r,
+                col: *c,
+                source_key: format!("k{}{}", r, c),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(tpl.cells.len(), 4);
+    assert_eq!(tpl.grid.rows, 2);
+    assert_eq!(tpl.grid.cols, 2);
+
+    let (r, c) = first_available_slot(&tpl);
+    assert_eq!((r, c), (2, 0), "full grid → points past the last row");
+
+    add_panel_draft(
+        &mut tpl,
+        &PanelDraft {
+            row: r,
+            col: c,
+            source_key: "appended".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(tpl.cells.len(), 5);
+    assert_eq!(tpl.grid.rows, 3, "grid auto-grew on submit");
+    assert!(tpl
+        .cells
+        .iter()
+        .any(|cell| (cell.row, cell.col) == (2, 0) && cell.sources[0].key == "appended"));
 }

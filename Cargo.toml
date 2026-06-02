@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 license = "MIT"
 authors = ["HVN Labs <engineering@hvn-labs.com>"]
@@ -37,7 +37,7 @@ mavlink = "0.18"
 # Pure-Rust ZMQ — no libzmq C dep. Async-only, drives a tokio runtime in
 # `profiler-source` and bridges to the sync render loop via crossbeam-channel.
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "all-transport"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
 crossbeam-channel = "0.5"
 rmpv = { version = "1", features = ["with-serde"] }
 

@@ -17,11 +17,12 @@ pub mod generators;
 pub mod panels;
 pub mod view3d;
 pub use editor::{
-    apply_panel_draft, apply_trail_draft, categorize_key, classify_key, collect_source_keys,
-    compact_cells, default_status_kind, group_source_keys, infer_primitive, known_value_shape,
-    relocate_cell, remove_cell_at, replace_cell_at, resolve_source_uri, swap_cells,
-    ComboCollapseState, EditHistory, KeyFreshness, PanelDraft, PickerTypeFilter, ResolvedSource,
-    TrailDraft, ValueShape, KEY_GROUPS, KNOWN_HVN_SITL_KEYS, LIVE_THRESHOLD_S, STALE_THRESHOLD_S,
+    add_panel_draft, apply_panel_draft, apply_trail_draft, categorize_key, classify_key,
+    collect_source_keys, compact_cells, default_status_kind, first_available_slot,
+    group_source_keys, infer_primitive, known_value_shape, relocate_cell, remove_cell_at,
+    replace_cell_at, resolve_source_uri, swap_cells, ComboCollapseState, EditHistory,
+    KeyFreshness, PanelDraft, PickerTypeFilter, ResolvedSource, TrailDraft, ValueShape,
+    KEY_GROUPS, KNOWN_HVN_SITL_KEYS, LIVE_THRESHOLD_S, STALE_THRESHOLD_S,
 };
 pub use faults::{
     default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,

@@ -16,7 +16,7 @@
 //!   `collect_source_keys` against the live multi-drone store map — exposed
 //!   here so a future per-key autocomplete can swap in without API churn.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use profiler_template::{Cell, CellSource, LabelMode, Primitive, StatusKind, Template, Trail3d, Trail3dSources, View3d};
 
@@ -594,6 +594,64 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
     };
     tpl.cells.push(cell);
     Ok(())
+}
+
+/// v0.16.0 — find the first unoccupied `(row, col)` in row-major order for the
+/// "+ Add Panel" modal's default slot.
+///
+/// Returns the first `(r, c)` (scanning rows 0..grid.rows, cols 0..grid.cols)
+/// that has no cell. If the grid is completely full, returns `(grid.rows, 0)`
+/// — one row past the end — so [`apply_panel_draft`] auto-grows the grid on
+/// submit (existing behavior, see the `draft.row >= tpl.grid.rows` branch).
+///
+/// Background: previously the Add Panel modal always defaulted to `(0, 0)`.
+/// Repeated clicks of "+ Add Panel" with an Apply at the defaults stacked
+/// multiple cells at `(0, 0)`, which the renderer surfaces as overlapping
+/// plots fighting for the same screen rect (visible as flicker/glitch).
+pub fn first_available_slot(template: &Template) -> (usize, usize) {
+    let rows = template.grid.rows;
+    let cols = template.grid.cols;
+    let occupied: HashSet<(usize, usize)> = template
+        .cells
+        .iter()
+        .map(|c| (c.row, c.col))
+        .collect();
+    for r in 0..rows {
+        for c in 0..cols {
+            if !occupied.contains(&(r, c)) {
+                return (r, c);
+            }
+        }
+    }
+    // Grid is full — point at the row past the end so `apply_panel_draft`
+    // auto-grows the grid (existing behavior added in v0.10.1).
+    (rows, 0)
+}
+
+/// v0.16.0 — Add-only submit path: reject occupied slots up front so the
+/// "+ Add Panel" modal cannot stack two cells on the same `(row, col)`.
+///
+/// [`apply_panel_draft`] itself still accepts duplicates (the Edit path
+/// relies on a remove-then-apply round-trip via [`replace_cell_at`]). This
+/// wrapper is what the toolbar "+ Add Panel" commit handler calls.
+///
+/// On occupied slot, returns
+/// `Err("Panel already exists at (r,c); pick a different slot or delete the existing one first")`
+/// and leaves the template untouched.
+pub fn add_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), String> {
+    let row = draft.row;
+    let col = draft.col;
+    let occupied = tpl
+        .cells
+        .iter()
+        .any(|c| c.row == row && c.col == col);
+    if occupied {
+        return Err(format!(
+            "Panel already exists at ({row},{col}); \
+             pick a different slot or delete the existing one first"
+        ));
+    }
+    apply_panel_draft(tpl, draft)
 }
 
 /// Remove a cell from the template by `(row, col)`. Removes ALL entries at
