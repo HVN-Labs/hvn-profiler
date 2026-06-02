@@ -49,7 +49,7 @@
 //! another GCS that's already issuing the stream requests, or when listening
 //! to a `mavlinkrouter` fan-out that mustn't see profiler traffic.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -148,15 +148,55 @@ fn copter_mode_name(custom_mode: u32) -> String {
 /// string (the operator's `--drone NAME`), suppressing the default
 /// `system_id`-derived `sysid_<id>` naming. Useful when the operator knows
 /// there's only one vehicle on the link and wants a friendly label.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MavlinkOptions {
     /// When `true`, skip the 1 Hz HEARTBEAT and the `REQUEST_DATA_STREAM` —
     /// behave exactly like v0.4.0.
     pub passive: bool,
     /// v0.10.0 — when `Some(name)`, every emitted `Sample.drone_name` is set
     /// to `name` regardless of the inbound MAVLink frame's `system_id`. When
-    /// `None`, samples carry `sysid_<id>` derived from the frame header.
+    /// `None` AND `sysid_map` is empty, samples carry `drone_{id}` derived
+    /// from the frame header (v0.16.4 — pre-0.16.4 used the prefix `sysid_`).
+    ///
+    /// v0.16.4 — superseded by `sysid_map` whenever the map is non-empty.
     pub drone_name_override: Option<String>,
+    /// v0.16.4 — explicit `system_id` → drone_name lookup. When non-empty,
+    /// `drone_name_override` is IGNORED and every emitted Sample's
+    /// `drone_name` is resolved by the frame's sysid against this map.
+    /// Unmapped sysids fall back to `format!("drone_{sysid}")`.
+    ///
+    /// Used by HVN-SITL to label MAVLink samples consistently with the ZMQ
+    /// streamer's envelope (e.g. `1 → "eric_1"`, `2 → "eric_2"`) so the
+    /// picker merges samples from the same physical drone across both
+    /// transports.
+    pub sysid_map: HashMap<u8, String>,
+    /// v0.16.4 — active-GCS auto-stream-request. When `true` (default), on
+    /// every previously-unseen sysid we send one `REQUEST_DATA_STREAM(ALL,
+    /// 10 Hz)` aimed at `target_system = sysid`. Latched per-sysid so the
+    /// request fires exactly once per drone per source.
+    ///
+    /// Set to `false` (via `--no-mavlink-active-gcs` on the CLI) when
+    /// another GCS is already driving stream requests, or when listening to
+    /// a router-fanout that mustn't see profiler traffic.
+    ///
+    /// Note: `passive: true` overrides this (passive mode skips BOTH the
+    /// heartbeat sender AND every stream request, full-stop).
+    pub active_gcs: bool,
+}
+
+impl Default for MavlinkOptions {
+    /// v0.16.4 — active-GCS by default: stream-request fires on every newly
+    /// seen sysid; 1 Hz heartbeat keeps the link alive. To restore the
+    /// strictly-passive v0.4.0 behaviour, set `passive: true` (which also
+    /// implicitly disables `active_gcs`).
+    fn default() -> Self {
+        Self {
+            passive: false,
+            drone_name_override: None,
+            sysid_map: HashMap::new(),
+            active_gcs: true,
+        }
+    }
 }
 
 /// A direct MAVLink-over-UDP source. Spawns a worker thread that owns the
@@ -192,10 +232,12 @@ impl MavlinkSource {
     /// bad address or an already-bound port surfaces as an error from
     /// `from_uri` rather than silently dying inside the worker.
     pub fn connect_with(conn_str: &str, opts: MavlinkOptions) -> Result<Self> {
-        // Capture the small bool up front: the rest of `opts` (which now holds
-        // an owned `String` for the v0.10.0 drone-name override) is moved into
-        // the recv worker below.
+        // Capture the small bools up front: the rest of `opts` (which now
+        // holds an owned `String` for the v0.10.0 drone-name override and a
+        // HashMap for the v0.16.4 sysid table) is moved into the recv worker
+        // below.
         let passive = opts.passive;
+        let active_gcs = opts.active_gcs;
         let mut conn = mavlink::connect::<MavMessage>(conn_str)
             .with_context(|| format!("opening MAVLink connection at {conn_str}"))?;
 
@@ -253,7 +295,7 @@ impl MavlinkSource {
         };
 
         log::info!(
-            "MavlinkSource: spawned worker on {conn_str} (passive={passive})",
+            "MavlinkSource: spawned worker on {conn_str} (passive={passive}, active_gcs={active_gcs})",
         );
         Ok(Self {
             rx,
@@ -298,7 +340,22 @@ fn recv_worker_main(
     let started = Instant::now();
     let mut decoded = 0u64;
     let mut dropped_full = 0u64;
-    let mut stream_requested = false;
+    // v0.16.4 — per-sysid stream-request latch. Each newly seen sysid gets
+    // exactly one `REQUEST_DATA_STREAM(ALL, 10 Hz)` aimed at it; subsequent
+    // frames from the same sysid no-op. This is what wakes the rich
+    // vocabulary on 25 drones sharing a single port — each drone has a
+    // distinct sysid AND a distinct ephemeral source port, so the mavlink
+    // crate's `update_reply_destination` routes our send back to the right
+    // peer on the very next `send` after a recv from that sysid.
+    let mut stream_requested_for: HashSet<u8> = HashSet::new();
+    // Whether we've published anything to `peer` yet (informational only —
+    // the v0.8.0 mutex slot is retained for backwards compatibility with
+    // tests that read it).
+    let mut first_peer_published = false;
+    // v0.16.4 — effective active-GCS gate: only fire stream requests when
+    // BOTH `passive == false` (heartbeat sender on) AND `active_gcs == true`
+    // (user did not pass `--no-mavlink-active-gcs`).
+    let active_gcs = !opts.passive && opts.active_gcs;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -326,40 +383,66 @@ fn recv_worker_main(
             }
         };
 
-        // v0.8.0 — on the first inbound HEARTBEAT (in active-GCS mode), learn
-        // the peer's system/component id and fire one REQUEST_DATA_STREAM so
-        // stock-stream vehicles wake their rich-message output.
-        if !opts.passive
-            && !stream_requested
+        // v0.16.4 — per-sysid stream-request latch (replaces v0.8.0's
+        // one-shot single-peer behaviour). On EVERY newly seen sysid in
+        // active-GCS mode, fire one REQUEST_DATA_STREAM so 25 drones on a
+        // shared port each wake their rich vocabulary independently.
+        //
+        // The mavlink-crate's UDP connection auto-tracks `last_recv_address`
+        // and overwrites `dest` on the writer side via
+        // `update_reply_destination`, so a `send` immediately after a recv
+        // from a given peer goes back to THAT peer. We must therefore fire
+        // the request RIGHT NOW (between recv and any other send) for the
+        // routing to be correct.
+        if active_gcs
             && matches!(msg, MavMessage::HEARTBEAT(_))
+            && stream_requested_for.insert(header.system_id)
         {
-            let learned = (header.system_id, header.component_id);
-            *peer.lock().expect("peer mutex poisoned") = Some(learned);
-            if let Err(e) = send_request_data_stream(&*conn, learned.0, learned.1) {
+            if let Err(e) = send_request_data_stream(
+                &*conn,
+                header.system_id,
+                header.component_id,
+            ) {
                 log::warn!(
                     "MavlinkSource: REQUEST_DATA_STREAM to sys={} comp={} failed: {e}",
-                    learned.0, learned.1
+                    header.system_id, header.component_id,
                 );
             } else {
                 log::info!(
-                    "MavlinkSource: requested ALL streams @ {} Hz from sys={} comp={}",
-                    REQUEST_STREAM_RATE_HZ, learned.0, learned.1
+                    "MavlinkSource: requested ALL streams @ {} Hz from sys={} comp={} \
+                     ({} sysid(s) now subscribed)",
+                    REQUEST_STREAM_RATE_HZ,
+                    header.system_id,
+                    header.component_id,
+                    stream_requested_for.len(),
                 );
             }
-            stream_requested = true;
+            if !first_peer_published {
+                *peer.lock().expect("peer mutex poisoned") =
+                    Some((header.system_id, header.component_id));
+                first_peer_published = true;
+            }
         }
 
-        // v0.10.0 — demux by `system_id` so a single MAVLink leg carrying
-        // multiple vehicles fans out into distinct per-drone samples. The
-        // operator-supplied `--drone NAME` override (carried via
-        // `MavlinkOptions::drone_name_override`) wins when set.
+        // v0.10.0 / v0.16.4 — demux by `system_id` so a single MAVLink leg
+        // carrying multiple vehicles fans out into distinct per-drone
+        // samples. Resolution order:
+        //   1. `sysid_map[header.system_id]` (operator-supplied table) —
+        //      used by HVN-SITL to label MAVLink samples with the SAME name
+        //      the ZMQ envelope carries, so the picker dedupes by sysid.
+        //   2. `drone_name_override` (single-string, pre-v0.16.4 single-vehicle
+        //      shortcut) — only applies when `sysid_map` is empty.
+        //   3. Fallback `drone_{sysid}` — replaces the v0.10.0 `sysid_<id>`
+        //      naming; the `drone_` prefix is shorter and matches the
+        //      `eric_1` shape SITL ships.
         //
         // v0.10.1 — held as `Arc<str>` so every emitted `Sample` clones a
         // refcount instead of allocating a fresh `String`.
-        let drone_name: Arc<str> = match opts.drone_name_override.as_deref() {
-            Some(name) => Arc::from(name),
-            None => Arc::from(format!("sysid_{}", header.system_id).as_str()),
-        };
+        let drone_name: Arc<str> = resolve_mavlink_drone_name(
+            header.system_id,
+            &opts.sysid_map,
+            opts.drone_name_override.as_deref(),
+        );
 
         let ts = started.elapsed().as_secs_f64();
         for s in decode_to_samples_with_state(
@@ -368,6 +451,12 @@ fn recv_worker_main(
             Some(Arc::clone(&drone_name)),
             Some(&statustext_buf),
         ) {
+            // v0.16.4 — stamp every emitted sample with the frame's sysid so
+            // the picker's primary-identity model works. The decoder helpers
+            // intentionally don't know about MAVLink headers; the worker is
+            // the single point where (header, msg) live together.
+            let mut s = s;
+            s.sysid = Some(header.system_id);
             match tx.try_send(s) {
                 Ok(()) => decoded += 1,
                 Err(TrySendError::Full(_)) => {
@@ -389,6 +478,27 @@ fn recv_worker_main(
             }
         }
     }
+}
+
+/// v0.16.4 — pure resolution of `system_id → drone_name` per the rules
+/// documented on [`MavlinkOptions::sysid_map`]. Factored out so the picker
+/// identity tests can exercise the contract without spinning up a worker.
+pub fn resolve_mavlink_drone_name(
+    sysid: u8,
+    sysid_map: &HashMap<u8, String>,
+    drone_name_override: Option<&str>,
+) -> Arc<str> {
+    if !sysid_map.is_empty() {
+        if let Some(name) = sysid_map.get(&sysid) {
+            return Arc::from(name.as_str());
+        }
+        // Map non-empty but this sysid not present → consistent fallback.
+        return Arc::from(format!("drone_{sysid}").as_str());
+    }
+    if let Some(name) = drone_name_override {
+        return Arc::from(name);
+    }
+    Arc::from(format!("drone_{sysid}").as_str())
 }
 
 /// Heartbeat sender — emits one GCS HEARTBEAT per [`HEARTBEAT_PERIOD`] until
@@ -557,6 +667,9 @@ pub fn decode_to_samples_with_state(
         key: key.to_string(),
         value,
         drone_name: drone_name.as_ref().map(Arc::clone),
+        // v0.16.4 — decoder helper has no MAVLink header; the recv worker
+        // overwrites `sysid` per-frame before forwarding the sample.
+        sysid: None,
     };
     match msg {
         MavMessage::ATTITUDE(d) => vec![
@@ -857,6 +970,7 @@ fn scaled_imu_samples(
         key: base.to_string(),
         value: Value::Vector(comps.to_vec()),
         drone_name: drone_name.as_ref().map(Arc::clone),
+        sysid: None,
     });
     out
 }
@@ -890,6 +1004,7 @@ fn press_scaled_samples(
         key: base.to_string(),
         value: Value::Vector(comps.to_vec()),
         drone_name: drone_name.as_ref().map(Arc::clone),
+        sysid: None,
     });
     out
 }

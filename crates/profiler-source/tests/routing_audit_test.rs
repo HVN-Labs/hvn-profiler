@@ -49,6 +49,7 @@ fn sample(ts: f64, drone: &str, key: &str, value: f64) -> Sample {
         key: key.to_string(),
         value: Value::Scalar(value),
         drone_name: Some(Arc::from(drone)),
+        sysid: None,
     }
 }
 
@@ -208,6 +209,7 @@ fn unnamed_samples_route_into_unnamed_bucket_only() {
             key: "accel[0]".to_string(),
             value: Value::Scalar(i as f64),
             drone_name: None,
+            sysid: None,
         })
         .collect();
     let mut src = ScriptedSource { queue: q };

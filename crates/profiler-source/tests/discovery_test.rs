@@ -122,8 +122,11 @@ async fn two_pubs_are_both_discovered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_connected_yields_well_shaped_vec() {
     let results = discover_localhost_sources(&[], DEFAULT_PROBE_MS).await;
-    // Each row uses a 127.0.0.1 URI matching its kind's scheme — sanity
-    // check the contract every consumer relies on.
+    // Each row uses the canonical bind address for its kind:
+    //   - ZMQ → 127.0.0.1 (streamer always binds loopback).
+    //   - MAVLink → 0.0.0.0 (v0.16.4: probe binds all-zero so WSL2 vehicles
+    //     are visible. The URI matches the bind so manual entry of the
+    //     discovered URI round-trips into a working source.)
     for d in &results {
         match d.kind {
             SourceKind::Zmq => assert!(
@@ -132,8 +135,8 @@ async fn empty_connected_yields_well_shaped_vec() {
                 d.uri,
             ),
             SourceKind::Mavlink => assert!(
-                d.uri.starts_with("mavlink://127.0.0.1:"),
-                "MAVLink URI should be loopback: {}",
+                d.uri.starts_with("mavlink://0.0.0.0:"),
+                "MAVLink URI should bind 0.0.0.0 (v0.16.4): {}",
                 d.uri,
             ),
         }

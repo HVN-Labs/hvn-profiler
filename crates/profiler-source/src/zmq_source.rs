@@ -240,6 +240,10 @@ async fn run_loop(
         let drone_name_hint = samples
             .first()
             .and_then(|s| s.drone_name.clone());
+        // v0.16.4 — also extract the envelope's sysid (if any) to stamp on
+        // schema-only null samples below, so the picker's sysid-keyed
+        // identity model stays consistent across real and null channels.
+        let sysid_hint: Option<u8> = samples.first().and_then(|s| s.sysid);
 
         // v0.15.0 — publish the latest envelope's drone name to the shared
         // `last_drone_name` slot for the Sources toolbar dropdown. Skip the
@@ -264,6 +268,7 @@ async fn run_loop(
                 key,
                 value: Value::Null,
                 drone_name: drone_name_hint.clone(),
+                sysid: sysid_hint,
             })
             .collect();
 

@@ -167,6 +167,77 @@ struct Cli {
     /// on a 10 Hz multi-drone fleet.
     #[arg(long, default_value_t = false)]
     debug_routing: bool,
+
+    /// v0.16.4 — explicit MAVLink `system_id` → drone-name mapping.
+    ///
+    /// Comma-separated list of `SYSID=NAME` pairs, e.g.
+    /// `--drone-map "1=eric_1,2=eric_2,3=eric_3"`. Used by MAVLink sources
+    /// to label samples consistently with the ZMQ envelope's `drone_name`
+    /// so the picker merges samples from the same physical drone across
+    /// both transports (otherwise a `udpin:14560` link would produce a
+    /// `drone_1` entry alongside the ZMQ `eric_1` entry, double-counting
+    /// every vehicle).
+    ///
+    /// When absent or empty, MAVLink samples fall back to `drone_<sysid>`.
+    /// Unmapped sysids in a non-empty map ALSO fall back to `drone_<sysid>`
+    /// (the operator's mapping is an allowlist of labels, not a filter).
+    ///
+    /// Has no effect on ZMQ sources (the streamer envelope already carries
+    /// the authoritative `drone_name`).
+    #[arg(long, value_parser = parse_drone_map, default_value = "")]
+    drone_map: DroneMap,
+
+    /// v0.16.4 — disable the auto stream-request that fires on every newly
+    /// seen MAVLink sysid.
+    ///
+    /// Default (flag absent): on every previously-unseen `system_id` on a
+    /// `mavlink://` source, the profiler sends one `REQUEST_DATA_STREAM(ALL,
+    /// 10 Hz)` aimed at that sysid. This wakes the rich vocabulary
+    /// (EKF_STATUS_REPORT, ATTITUDE, RAW_IMU, …) on every drone sharing the
+    /// port — including the 25-drone fan-out on a single secondary GCS
+    /// mirror (e.g. `:14560`).
+    ///
+    /// Pass this flag to suppress the auto-request — use when another GCS
+    /// is already requesting streams from the same vehicle, or when
+    /// listening through a `mavlink-router` fan-out that mustn't see
+    /// profiler-originated traffic.
+    ///
+    /// Implies nothing about `--mavlink-passive` (which is a stricter
+    /// listen-only mode that also suppresses the 1 Hz heartbeat).
+    #[arg(long, default_value_t = false)]
+    no_mavlink_active_gcs: bool,
+}
+
+/// v0.16.4 — parsed `--drone-map` value: a `system_id → name` table.
+#[derive(Debug, Clone, Default)]
+struct DroneMap(std::collections::HashMap<u8, String>);
+
+fn parse_drone_map(raw: &str) -> Result<DroneMap, String> {
+    let mut map = std::collections::HashMap::new();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DroneMap(map));
+    }
+    for entry in trimmed.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (sysid_str, name) = entry.split_once('=').ok_or_else(|| {
+            format!("invalid --drone-map entry '{entry}': expected SYSID=NAME")
+        })?;
+        let sysid: u8 = sysid_str.trim().parse().map_err(|e| {
+            format!("invalid sysid in --drone-map entry '{entry}': {e}")
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!(
+                "empty drone name in --drone-map entry '{entry}'"
+            ));
+        }
+        map.insert(sysid, name.to_string());
+    }
+    Ok(DroneMap(map))
 }
 
 /// CLI on/off for `--mavlink-passive`. (v0.8.0)
@@ -245,11 +316,30 @@ fn main() -> anyhow::Result<()> {
         passive: matches!(cli.mavlink_passive, MavlinkPassiveArg::On),
         // v0.10.0 — when the operator passes `--drone NAME`, pin every MAVLink
         // sample's `drone_name` to that string instead of the default
-        // `sysid_<id>` demux. Useful for single-vehicle links where the
-        // operator already knows the friendly name. ZMQ sources still use the
-        // envelope's own `drone_name`; this only applies to MAVLink legs.
+        // `drone_{id}` demux. v0.16.4 — when `--drone-map` is non-empty it
+        // takes precedence; `--drone NAME` is only meaningful for single-
+        // vehicle links.
         drone_name_override: cli.drone.clone(),
+        // v0.16.4 — explicit sysid → drone_name table from `--drone-map`.
+        // Empty by default → MAVLink samples carry `drone_{sysid}`. Non-empty
+        // → SITL-style names like `eric_1` are stamped per sysid so the
+        // picker merges samples with ZMQ sources by sysid.
+        sysid_map: cli.drone_map.0.clone(),
+        // v0.16.4 — default ON. `--no-mavlink-active-gcs` turns it off so
+        // shared / router-fanned ports get a strictly-passive listener.
+        active_gcs: !cli.no_mavlink_active_gcs,
     };
+    if !mav_cfg.sysid_map.is_empty() {
+        log::info!(
+            "MAVLink sysid map: {} entr{} ({:?})",
+            mav_cfg.sysid_map.len(),
+            if mav_cfg.sysid_map.len() == 1 { "y" } else { "ies" },
+            mav_cfg.sysid_map,
+        );
+    }
+    if !mav_cfg.active_gcs {
+        log::info!("--no-mavlink-active-gcs: per-sysid REQUEST_DATA_STREAM disabled");
+    }
 
     // v0.16.0 — shared async runtime used for the Add-Source dialog's
     // localhost discovery scan AND the bare-launch auto-connect path
@@ -522,6 +612,15 @@ enum ViewMode {
 /// even when the streamer doesn't tag envelopes (older SITL, raw MAVLink).
 const UNNAMED_DRONE: &str = "(unnamed)";
 
+/// v0.16.4 — `true` when `name` is the synthetic `drone_<sysid>` label
+/// emitted by `MavlinkSource` when no `--drone-map` is supplied. Used by
+/// the drain loop's picker-identity merge to decide whether to upgrade the
+/// canonical name for a sysid (synthetic loses to meaningful).
+fn is_synthetic_drone_name(name: &str, sysid: u8) -> bool {
+    let expected = format!("drone_{sysid}");
+    name == expected
+}
+
 struct App {
     /// v0.15.0 — runtime-mutable source registry. Replaces the v0.9.0
     /// `Box<dyn Source>` (MultiSource) so the toolbar Sources dropdown can
@@ -655,6 +754,24 @@ struct App {
     /// the routing decision (drone_name → store key). Set from
     /// `--debug-routing` and consulted by [`Self::drain`].
     debug_routing: bool,
+    /// v0.16.4 — `system_id` → canonical drone-name resolution table.
+    ///
+    /// When a sample arrives carrying `sysid = Some(s)`, the drain loop
+    /// looks up the canonical drone name for `s` and rewrites the sample's
+    /// `drone_name` to that string before routing into `stores`. This is
+    /// what merges samples from ZMQ (drone_name `"eric_1"`, sysid 1) and
+    /// MAVLink (drone_name `"drone_1"`, sysid 1) into a single picker
+    /// entry — they both end up keyed under `"eric_1"` in `stores`, and
+    /// the picker shows ONE row, not two.
+    ///
+    /// Conflict resolution: the first non-synthetic name observed wins (a
+    /// name matching `drone_<sysid>` is treated as synthetic; anything
+    /// else — `"eric_1"`, an operator-supplied `--drone-map` label — is
+    /// authoritative and pins the canonical entry).
+    ///
+    /// When a sample lacks a sysid (mock / older streamer), it routes by
+    /// `drone_name` alone — same as the pre-v0.16.4 behaviour.
+    sysid_to_drone: HashMap<u8, String>,
 }
 
 /// v0.10.0 — what the modal editor is currently doing.
@@ -758,6 +875,7 @@ impl App {
             picker_filter: profiler_render::PickerTypeFilter::default(),
             split_3d_overlay_open: true,
             debug_routing,
+            sysid_to_drone: HashMap::new(),
         }
     }
 
@@ -774,11 +892,77 @@ impl App {
                 Some(s) => {
                     // v0.10.1 — Sample.drone_name is `Arc<str>`; route via a
                     // single `to_string()` for the HashMap key.
-                    let drone_key = s
+                    let raw_name = s
                         .drone_name
                         .as_deref()
                         .map(str::to_string)
                         .unwrap_or_else(|| UNNAMED_DRONE.to_string());
+                    // v0.16.4 — sysid-based picker identity merge.
+                    //
+                    // When the sample carries a sysid, register / look up
+                    // the canonical drone name for that sysid. The first
+                    // NON-SYNTHETIC name observed pins the canonical entry
+                    // (a synthetic name matches `drone_<sysid>` exactly —
+                    // produced by `MavlinkSource` when no `--drone-map` is
+                    // supplied; the ZMQ envelope or operator-mapped MAVLink
+                    // label otherwise wins).
+                    //
+                    // Without a sysid (mock, older streamer envelope), the
+                    // route falls back to drone_name alone (pre-v0.16.4
+                    // behaviour).
+                    let drone_key = match s.sysid {
+                        Some(sid) => {
+                            let synthetic = is_synthetic_drone_name(&raw_name, sid);
+                            match self.sysid_to_drone.get(&sid) {
+                                Some(canonical) => {
+                                    // Upgrade the canonical entry if we
+                                    // currently have a synthetic name AND
+                                    // the new sample carries a meaningful
+                                    // one (ZMQ arrived second after MAVLink
+                                    // synthetic).
+                                    let canonical_synthetic =
+                                        is_synthetic_drone_name(canonical, sid);
+                                    if canonical_synthetic && !synthetic {
+                                        // Migrate the existing store under
+                                        // the synthetic key to the new
+                                        // canonical key. Cheap: we just
+                                        // rename the HashMap entry.
+                                        let prev = canonical.clone();
+                                        self.sysid_to_drone
+                                            .insert(sid, raw_name.clone());
+                                        if let Some(prev_store) =
+                                            self.stores.remove(&prev)
+                                        {
+                                            self.stores.insert(
+                                                raw_name.clone(),
+                                                prev_store,
+                                            );
+                                        }
+                                        // Patch the discovered list / view
+                                        // selection so the picker shows the
+                                        // upgraded name.
+                                        for d in self.discovered_drones.iter_mut() {
+                                            if *d == prev {
+                                                *d = raw_name.clone();
+                                            }
+                                        }
+                                        if self.view_drone.as_deref() == Some(&prev) {
+                                            self.view_drone = Some(raw_name.clone());
+                                        }
+                                        raw_name.clone()
+                                    } else {
+                                        canonical.clone()
+                                    }
+                                }
+                                None => {
+                                    self.sysid_to_drone
+                                        .insert(sid, raw_name.clone());
+                                    raw_name.clone()
+                                }
+                            }
+                        }
+                        None => raw_name.clone(),
+                    };
                     // v0.16.2 — `--debug-routing`: one log line per drained
                     // envelope so the operator can audit the drone_name →
                     // store mapping when a panel renders the wrong drone's

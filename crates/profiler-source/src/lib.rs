@@ -157,6 +157,26 @@ impl Sample {
             key: key.into(),
             value: Value::Scalar(value),
             drone_name,
+            sysid: None,
+        }
+    }
+
+    /// v0.16.4 — convenience constructor that stamps a sysid alongside the
+    /// scalar payload. Used by [`crate::mavlink_source`]'s per-frame demux so
+    /// the picker can dedupe across ZMQ + MAVLink sources by sysid.
+    pub fn new_scalar_with_sysid(
+        ts: f64,
+        key: impl Into<String>,
+        value: f64,
+        drone_name: Option<Arc<str>>,
+        sysid: Option<u8>,
+    ) -> Self {
+        Self {
+            ts,
+            key: key.into(),
+            value: Value::Scalar(value),
+            drone_name,
+            sysid,
         }
     }
 }
@@ -188,6 +208,18 @@ pub struct Sample {
     /// eliminates ~300 short-lived String allocations per second on the
     /// MAVLink decode hot path.
     pub drone_name: Option<Arc<str>>,
+    /// v0.16.4 — MAVLink `system_id` of the producing vehicle, when known.
+    ///
+    /// Populated by [`crate::mavlink_source`] (from `MavHeader.system_id`)
+    /// and by [`crate::zmq_source`] when the streamer envelope's `sysid`
+    /// field is present. `None` for sources without a sysid (e.g. `mock://`,
+    /// older SITL streamers).
+    ///
+    /// The picker uses `sysid` as the PRIMARY drone identity when both
+    /// sources supply one, so the same physical drone fed through ZMQ
+    /// (drone_name `"eric_1"`) and MAVLink (drone_name `"sysid_1"` or
+    /// operator-mapped `"eric_1"`) merges into a single picker entry.
+    pub sysid: Option<u8>,
 }
 
 /// A pull-based telemetry source. The render loop calls `try_recv` in a
@@ -217,15 +249,37 @@ pub fn from_uri(uri: &str) -> Result<Box<dyn Source>> {
 }
 
 /// Profiler-side options that affect which sources are constructed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MavlinkConfig {
     /// When `true`, opens MAVLink sources in passive listen-only mode (no
     /// HEARTBEAT sender, no `REQUEST_DATA_STREAM`). v0.4.0 behaviour.
     pub passive: bool,
     /// v0.10.0 — pin every MAVLink-source sample's `drone_name` to this string,
-    /// overriding the default `sysid_<id>` demux. Useful when the operator
-    /// knows there's only one vehicle on the link.
+    /// overriding the default sysid demux. Useful when the operator knows
+    /// there's only one vehicle on the link. v0.16.4 — superseded by
+    /// `sysid_map` whenever the map is non-empty.
     pub drone_name_override: Option<String>,
+    /// v0.16.4 — explicit `system_id` → drone_name map, surfaced to the CLI
+    /// via `--drone-map "1=eric_1,2=eric_2"`. When non-empty, MAVLink samples
+    /// inherit the named drone label for their sysid, matching the ZMQ
+    /// envelope so the picker dedupes by sysid.
+    pub sysid_map: std::collections::HashMap<u8, String>,
+    /// v0.16.4 — active-GCS auto-stream-request. Default `true`; toggled by
+    /// `--no-mavlink-active-gcs`. When `false`, MAVLink sources skip the
+    /// per-sysid `REQUEST_DATA_STREAM` send (but still emit the 1 Hz GCS
+    /// heartbeat unless `passive` is also set).
+    pub active_gcs: bool,
+}
+
+impl Default for MavlinkConfig {
+    fn default() -> Self {
+        Self {
+            passive: false,
+            drone_name_override: None,
+            sysid_map: std::collections::HashMap::new(),
+            active_gcs: true,
+        }
+    }
 }
 
 /// Like [`from_uri`] but lets the caller pass [`MavlinkConfig`] (controls
@@ -253,14 +307,47 @@ pub fn from_uri_with_options(uri: &str, cfg: MavlinkConfig) -> Result<Box<dyn So
 /// a trailing `host:port`. Gated on the `mavlink-source` feature.
 #[cfg(feature = "mavlink-source")]
 fn mavlink_from_addr(scheme: &str, rest: &str, cfg: MavlinkConfig) -> Result<Box<dyn Source>> {
-    let conn_str = format!("{scheme}:{}", rest.trim_end_matches('/'));
+    // v0.16.4 — canonicalise `127.0.0.1` host to `0.0.0.0` for `udpin`
+    // bindings so the profiler accepts traffic from non-loopback peers
+    // (notably WSL2 ↔ Windows where the vehicle's source IP is 172.x.x.x).
+    // The `0.0.0.0` URI is the canonical form for discovery + manual entry;
+    // see `crate::discovery` for the matching probe-bind change. We only
+    // rewrite for `udpin` — `udpout` keeps the operator's literal host so
+    // outbound packets reach the intended peer.
+    let rest_trimmed = rest.trim_end_matches('/');
+    let bind_rest: String = if scheme == "udpin" {
+        canonicalise_udpin_host(rest_trimmed)
+    } else {
+        rest_trimmed.to_string()
+    };
+    let conn_str = format!("{scheme}:{bind_rest}");
     let opts = MavlinkOptions {
         passive: cfg.passive,
         drone_name_override: cfg.drone_name_override.clone(),
+        sysid_map: cfg.sysid_map.clone(),
+        active_gcs: cfg.active_gcs,
     };
     let src = MavlinkSource::connect_with(&conn_str, opts)
         .with_context(|| format!("opening MAVLink source at {conn_str}"))?;
     Ok(Box::new(src))
+}
+
+/// v0.16.4 — canonicalise the `host:port` portion of a `udpin://` URI so
+/// `127.0.0.1` becomes `0.0.0.0` (the mavlink crate honours both, but the
+/// loopback bind silently drops traffic from non-loopback peers — notably
+/// WSL2 vehicles whose source IP is the Hyper-V NIC).
+///
+/// Only rewrites when the host is exactly `127.0.0.1`; other hosts (including
+/// `localhost`, `0.0.0.0`, and explicit interface addresses) pass through
+/// unchanged so the operator's intent is preserved.
+#[cfg(feature = "mavlink-source")]
+pub fn canonicalise_udpin_host(host_port: &str) -> String {
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        if host == "127.0.0.1" {
+            return format!("0.0.0.0:{port}");
+        }
+    }
+    host_port.to_string()
 }
 
 /// Stub used when the `mavlink-source` feature is compiled out: surface a
@@ -347,6 +434,27 @@ pub fn multi_from_uris_with_discovery_opts(
     }
 
     Ok((Box::new(MultiSource { subs, rr_cursor: 0 }), Some(merged)))
+}
+
+/// v0.16.4 — canonicalise a source URI so equivalent forms collapse to a
+/// single entry in [`SourceRegistry`]. Currently:
+///
+/// - `mavlink://127.0.0.1:PORT` → `mavlink://0.0.0.0:PORT` (the discovery
+///   probe emits `0.0.0.0`; manual entry from the operator may use either).
+/// - `mavlinkout://` stays untouched (the operator's destination matters).
+/// - `zmq://127.0.0.1:PORT` stays untouched (streamer binds loopback).
+///
+/// Other URIs pass through unchanged.
+pub fn canonicalise_source_uri(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("mavlink://") {
+        let rest_trimmed = rest.trim_end_matches('/');
+        if let Some((host, port)) = rest_trimmed.rsplit_once(':') {
+            if host == "127.0.0.1" {
+                return format!("mavlink://0.0.0.0:{port}");
+            }
+        }
+    }
+    uri.to_string()
 }
 
 /// Derive a drone name from a source URI when the source has no native
@@ -529,6 +637,11 @@ impl SourceRegistry {
     /// Add a new source at runtime. Idempotent: if `uri` is already in the
     /// registry, returns `Ok(())` without opening a second connection.
     pub fn add(&mut self, uri: &str) -> Result<()> {
+        // v0.16.4 — canonicalise `mavlink://127.0.0.1:PORT` to
+        // `mavlink://0.0.0.0:PORT` so the manual-entry URI dedupes against
+        // the auto-discovered one (discovery emits the 0.0.0.0 form).
+        let uri = canonicalise_source_uri(uri);
+        let uri = uri.as_str();
         if self.entries.iter().any(|e| e.uri == uri) {
             log::info!("SourceRegistry: '{uri}' already connected, ignoring add");
             return Ok(());
@@ -592,6 +705,8 @@ impl SourceRegistry {
     /// thread exits within ~5 ms). Returns `true` if a source was removed,
     /// `false` if no source with that URI exists.
     pub fn remove(&mut self, uri: &str) -> bool {
+        let uri = canonicalise_source_uri(uri);
+        let uri = uri.as_str();
         let before = self.entries.len();
         self.entries.retain(|e| e.uri != uri);
         let removed = self.entries.len() != before;
@@ -851,6 +966,12 @@ pub struct Envelope {
     /// supply one (older SITL versions, MAVLink CLI without `--drone-name`).
     #[serde(default)]
     pub drone_name: Option<String>,
+    /// v0.16.4 — MAVLink `system_id` of the producing vehicle. Optional so
+    /// older streamers that omit the field still decode (defaulting to
+    /// `None`). When present, propagated onto every emitted [`Sample`] so
+    /// the picker can dedupe ZMQ + MAVLink sources by sysid.
+    #[serde(default)]
+    pub sysid: Option<u8>,
     /// Flat-ish map of channel name → scalar | array | null. Stored as a raw
     /// `rmpv::Value` so we can flatten dynamically without a static schema.
     pub values: rmpv::Value,
@@ -918,6 +1039,9 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
     let ts = env.ts;
     // v0.10.1 — one Arc<str> allocation, cloned (refcount bump) per sample.
     let drone_name: Option<Arc<str>> = env.drone_name.as_deref().map(Arc::from);
+    // v0.16.4 — sysid stamped on every emitted Sample (when the envelope
+    // carries one; older streamers will simply emit `None`).
+    let sysid: Option<u8> = env.sysid;
     let map = match env.values.as_map() {
         Some(m) => m,
         None => return (out, nulls),
@@ -939,17 +1063,18 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
                 key: key.to_string(),
                 value: Value::Bool(*b),
                 drone_name: drone_name.clone(),
+                sysid,
             }),
             rmpv::Value::Integer(i) => {
                 if let Some(f) = i.as_f64() {
-                    out.push(Sample::new_scalar(ts, key, f, drone_name.clone()));
+                    out.push(Sample::new_scalar_with_sysid(ts, key, f, drone_name.clone(), sysid));
                 }
             }
             rmpv::Value::F32(f) => {
-                out.push(Sample::new_scalar(ts, key, *f as f64, drone_name.clone()));
+                out.push(Sample::new_scalar_with_sysid(ts, key, *f as f64, drone_name.clone(), sysid));
             }
             rmpv::Value::F64(f) => {
-                out.push(Sample::new_scalar(ts, key, *f, drone_name.clone()));
+                out.push(Sample::new_scalar_with_sysid(ts, key, *f, drone_name.clone(), sysid));
             }
             rmpv::Value::String(s) => {
                 // v0.13.0 — preserve the string instead of dropping. The
@@ -962,6 +1087,7 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
                         key: key.to_string(),
                         value: Value::String(Arc::from(text)),
                         drone_name: drone_name.clone(),
+                        sysid,
                     });
                 }
             }
@@ -979,6 +1105,7 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
                         key: key.to_string(),
                         value: Value::TextLog(entries),
                         drone_name: drone_name.clone(),
+                        sysid,
                     });
                     continue;
                 }
@@ -999,13 +1126,15 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
                         key: key.to_string(),
                         value: Value::IntVector(ints.clone()),
                         drone_name: drone_name.clone(),
+                        sysid,
                     });
                     for (i, v) in ints.iter().enumerate() {
-                        out.push(Sample::new_scalar(
+                        out.push(Sample::new_scalar_with_sysid(
                             ts,
                             format!("{key}[{i}]"),
                             *v as f64,
                             drone_name.clone(),
+                            sysid,
                         ));
                     }
                     continue;
@@ -1017,15 +1146,17 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
                         key: key.to_string(),
                         value: Value::Vector(floats),
                         drone_name: drone_name.clone(),
+                        sysid,
                     });
                     // Legacy per-component scalar fan-out (unchanged).
                     for (i, elt) in arr.iter().enumerate() {
                         if let Some(v) = scalar_to_f64(elt) {
-                            out.push(Sample::new_scalar(
+                            out.push(Sample::new_scalar_with_sysid(
                                 ts,
                                 format!("{key}[{i}]"),
                                 v,
                                 drone_name.clone(),
+                                sysid,
                             ));
                         }
                     }
@@ -1035,11 +1166,12 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
                 // numeric components, preserving prior v0.11.0 behaviour.
                 for (i, elt) in arr.iter().enumerate() {
                     if let Some(v) = scalar_to_f64(elt) {
-                        out.push(Sample::new_scalar(
+                        out.push(Sample::new_scalar_with_sysid(
                             ts,
                             format!("{key}[{i}]"),
                             v,
                             drone_name.clone(),
+                            sysid,
                         ));
                     }
                     // non-scalar / null elements drop silently

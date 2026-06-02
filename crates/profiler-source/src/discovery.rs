@@ -149,9 +149,16 @@ pub async fn discover_localhost_sources(
     }
 
     // MAVLink scan.
+    //
+    // v0.16.4 — bind probe + advertised URI are both `0.0.0.0` so traffic
+    // arriving from non-loopback peers (WSL2 vehicles whose source IP is on
+    // the Hyper-V NIC) is actually received. The connected-source dedup
+    // checks BOTH forms (`127.0.0.1` and `0.0.0.0`) because either may
+    // appear in the operator's existing `--source` list.
     for &port in MAVLINK_PORTS {
-        let uri = format!("mavlink://127.0.0.1:{port}");
-        if connected.contains(&uri) {
+        let uri = format!("mavlink://0.0.0.0:{port}");
+        let loopback_alias = format!("mavlink://127.0.0.1:{port}");
+        if connected.contains(&uri) || connected.contains(&loopback_alias) {
             join.spawn(async move {
                 Some(DiscoveredSource {
                     uri,
@@ -300,8 +307,12 @@ fn decode_drone_name(payload: &[u8]) -> Option<String> {
 /// fails (port in use by another process) — the profiler can't open it
 /// anyway, so showing it in the dialog would be misleading.
 async fn probe_mavlink(port: u16, budget: Duration) -> Option<DiscoveredSource> {
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-    let uri = format!("mavlink://127.0.0.1:{port}");
+    // v0.16.4 — bind 0.0.0.0 (was 127.0.0.1) so the probe sees traffic from
+    // WSL2 vehicles whose source IP is the Hyper-V NIC (172.x.x.x). The URI
+    // advertised back to the dialog matches the bind, so manual entry of the
+    // discovered URI round-trips into a working source.
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
+    let uri = format!("mavlink://0.0.0.0:{port}");
 
     let sock = match UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
@@ -357,7 +368,7 @@ mod tests {
     fn sort_orders_live_silent_inuse() {
         let mut v = vec![
             DiscoveredSource {
-                uri: "mavlink://127.0.0.1:14550".into(),
+                uri: "mavlink://0.0.0.0:14550".into(),
                 kind: SourceKind::Mavlink,
                 status: DiscoveryStatus::Silent,
                 last_seen_ms: None,
@@ -395,7 +406,7 @@ mod tests {
                 "zmq://127.0.0.1:9005",         // Live, ZMQ
                 "zmq://127.0.0.1:9006",         // Live, ZMQ
                 "zmq://127.0.0.1:9007",         // Silent, ZMQ
-                "mavlink://127.0.0.1:14550",    // Silent, MAVLink
+                "mavlink://0.0.0.0:14550",      // Silent, MAVLink
                 "zmq://127.0.0.1:9008",         // InUse, ZMQ
             ],
         );
