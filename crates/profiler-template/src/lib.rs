@@ -152,6 +152,10 @@ pub enum Primitive {
     AttitudeRpy,
     /// Reserved — parsed but not plotted.
     StatusBadge,
+    /// v0.12.0 — colored text/chip cell driven by a non-plot data source
+    /// (flight mode string, armed bool, GPS fix type, status-text rolling log).
+    /// See [`Cell::status`] for the config.
+    Status,
 }
 
 /// Per-panel label overlay mode.
@@ -220,6 +224,51 @@ pub struct Cell {
     pub label_data: Option<LabelData>,
     #[serde(default)]
     pub label_metadata: Option<LabelMetadata>,
+    /// v0.12.0 — single source key for the [`Primitive::Status`] primitive.
+    /// Resolved against the store as either a string-typed key
+    /// (`flight_mode`), a bool (`armed`), an integer (`fix_type`), or a
+    /// rolling text-log (`statustexts`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// v0.12.0 — kind discriminant for the [`Primitive::Status`] primitive.
+    /// See [`StatusKind`] for the variants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<StatusKind>,
+    /// v0.12.0 — color lookup for the [`Primitive::Status`] primitive.
+    /// Keys match the resolved string form (e.g. `"GUIDED"`, `"True"`, the
+    /// fix-type number `"3"`); the value is a hex `#rrggbb` color.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub color_map: std::collections::BTreeMap<String, String>,
+    /// v0.12.0 — fallback color for the [`Primitive::Status`] primitive when
+    /// the value is unknown / unmapped. Defaults to `#aaa` (light gray).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_color: Option<String>,
+}
+
+/// v0.12.0 — kind discriminant for the `status` primitive.
+///
+/// The renderer dispatches on this to decide what to draw inside the chip:
+/// - `Text` / `Badge` — render the source's string value as-is.
+/// - `FixType` — map a small integer (0..6) to GPS fix-type colors.
+/// - `ArmedBool` — green "ARMED" / gray "DISARMED" chip.
+/// - `TextLog` — rolling list of the latest N statustext entries with
+///   severity-driven colors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusKind {
+    /// Render the raw string value of `source`.
+    #[default]
+    Text,
+    /// Short text in a colored chip (alias of `Text` with smaller styling).
+    Badge,
+    /// GPS fix type. `0=none, 1=2D, 2=3D, 3=DGPS, 4=RTK_FLOAT,
+    /// 5/6=RTK_FIXED`.
+    FixType,
+    /// `True` → green "ARMED"; `False` → gray "DISARMED".
+    ArmedBool,
+    /// Render the latest N statustext entries from a rolling buffer
+    /// (newest first), colored by severity.
+    TextLog,
 }
 
 fn default_true() -> bool {

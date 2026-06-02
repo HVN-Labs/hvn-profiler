@@ -463,6 +463,15 @@ struct App {
     /// popup, which dismissed the entire popup whenever the operator clicked
     /// the ▶/▼ arrow.
     editor_combo_collapse: profiler_render::ComboCollapseState,
+    /// v0.12.0 — last monotonic seconds at which a non-null value arrived
+    /// for each known key. Drives the editor's freshness coloring (Live /
+    /// Stale / Schema-only / Custom) in the source-key picker dropdown.
+    /// Refreshed on every `drain()` call.
+    last_seen_keys: HashMap<String, f64>,
+    /// v0.12.0 — picker type-filter row state (Status / 2D scalar / 2D
+    /// vector / 3D). Persists across modal opens so the operator keeps
+    /// their preferred filter set.
+    picker_filter: profiler_render::PickerTypeFilter,
     /// v0.11.0 — when the window is too narrow for a 50/50 Split layout
     /// (< RESPONSIVE_3D_COLLAPSE_W), the 3D view is rendered as a floating
     /// overlay instead. This flag tracks whether the overlay is currently
@@ -547,6 +556,8 @@ impl App {
             template_dirty: false,
             history: EditHistory::default(),
             editor_combo_collapse: profiler_render::ComboCollapseState::default(),
+            last_seen_keys: HashMap::new(),
+            picker_filter: profiler_render::PickerTypeFilter::default(),
             split_3d_overlay_open: true,
         }
     }
@@ -584,6 +595,11 @@ impl App {
                         store.note_null_key(&s.key);
                     } else {
                         store.push(s.ts, &s.key, s.value);
+                        // v0.12.0 — record last-seen for the editor's
+                        // picker freshness coloring. Always uses the
+                        // sample's monotonic timestamp so the classifier
+                        // can age it against `now`.
+                        self.last_seen_keys.insert(s.key.clone(), s.ts);
                     }
                     if is_new {
                         self.discovered_drones.push(drone_key.clone());
@@ -1722,14 +1738,36 @@ impl App {
             EditorMode::AddPanel(mut draft) => {
                 let mut commit = false;
                 let mut cancel = false;
+                // v0.12.0 — build the picker context for freshness coloring
+                // + type filter row. `observed_keys` is materialised once
+                // per modal render from the live stores so the classifier
+                // can disambiguate SchemaOnly vs Custom.
+                let observed_keys: std::collections::HashSet<String> = self
+                    .stores
+                    .values()
+                    .flat_map(|s| {
+                        s.keys()
+                            .into_iter()
+                            .chain(s.null_keys().iter().cloned())
+                    })
+                    .collect();
+                let now_s = self.started.elapsed().as_secs_f64();
                 let source_keys = &self.editor_source_keys_cache;
                 let collapse = &mut self.editor_combo_collapse;
+                let last_seen = &self.last_seen_keys;
+                let filter = &mut self.picker_filter;
                 egui::Window::new("+ Add Panel")
                     .collapsible(false)
                     .resizable(true)
                     .default_width(360.0)
                     .show(ctx, |ui| {
-                        panel_form(ui, &mut draft, source_keys, collapse);
+                        let mut pctx = PickerContext {
+                            last_seen,
+                            now_s,
+                            filter,
+                            observed: &observed_keys,
+                        };
+                        panel_form(ui, &mut draft, source_keys, collapse, Some(&mut pctx));
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Add").clicked() {
@@ -1772,14 +1810,32 @@ impl App {
             EditorMode::EditPanel { row, col, mut draft } => {
                 let mut commit = false;
                 let mut cancel = false;
+                let observed_keys: std::collections::HashSet<String> = self
+                    .stores
+                    .values()
+                    .flat_map(|s| {
+                        s.keys()
+                            .into_iter()
+                            .chain(s.null_keys().iter().cloned())
+                    })
+                    .collect();
+                let now_s = self.started.elapsed().as_secs_f64();
                 let source_keys = &self.editor_source_keys_cache;
                 let collapse = &mut self.editor_combo_collapse;
+                let last_seen = &self.last_seen_keys;
+                let filter = &mut self.picker_filter;
                 egui::Window::new(format!("Edit panel ({row}, {col})"))
                     .collapsible(false)
                     .resizable(true)
                     .default_width(360.0)
                     .show(ctx, |ui| {
-                        panel_form(ui, &mut draft, source_keys, collapse);
+                        let mut pctx = PickerContext {
+                            last_seen,
+                            now_s,
+                            filter,
+                            observed: &observed_keys,
+                        };
+                        panel_form(ui, &mut draft, source_keys, collapse, Some(&mut pctx));
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Apply").clicked() {
@@ -1914,11 +1970,18 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
 
 /// Shared form widget for both Add Panel and Edit Panel modals — mutates a
 /// [`PanelDraft`] in place. Renders one labelled row per field.
+///
+/// v0.12.0 — `picker` carries the freshness registry + type filter so the
+/// source-key dropdown can colorize entries and skip filtered classes. When
+/// the operator picks a source key whose [`ValueShape`] is known and the
+/// existing primitive default matches `Scalar`, the form auto-selects the
+/// inferred primitive (the user can still change it via the dropdown).
 fn panel_form(
     ui: &mut egui::Ui,
     draft: &mut PanelDraft,
     source_keys: &[String],
     collapse: &mut profiler_render::ComboCollapseState,
+    picker: Option<&mut PickerContext<'_>>,
 ) {
     use profiler_template::{LabelMode, Primitive};
 
@@ -1949,6 +2012,7 @@ fn panel_form(
                         Primitive::Diff,
                         Primitive::MagInterference,
                         Primitive::AttitudeRpy,
+                        Primitive::Status,
                     ] {
                         ui.selectable_value(&mut draft.primitive, p, format!("{p:?}"));
                     }
@@ -1956,7 +2020,32 @@ fn panel_form(
             ui.end_row();
 
             ui.label("Source key:");
-            source_key_combo(ui, "panel_form_src", &mut draft.source_key, source_keys, collapse);
+            // v0.12.0 — capture the source key BEFORE the combo runs so we
+            // can detect a change and auto-infer the primitive.
+            let prev_key = draft.source_key.clone();
+            source_key_combo(
+                ui,
+                "panel_form_src",
+                &mut draft.source_key,
+                source_keys,
+                collapse,
+                picker,
+            );
+            if draft.source_key != prev_key && !draft.source_key.is_empty() {
+                if let Some(shape) = profiler_render::known_value_shape(&draft.source_key) {
+                    let inferred = profiler_render::infer_primitive(&shape);
+                    // Only auto-overwrite when the current primitive is the
+                    // dropdown default (Scalar) — operator-picked primitives
+                    // are respected.
+                    if draft.primitive == Primitive::Scalar {
+                        draft.primitive = match inferred {
+                            "vector" => Primitive::Vector,
+                            "status" => Primitive::Status,
+                            _ => Primitive::Scalar,
+                        };
+                    }
+                }
+            }
             ui.end_row();
 
             ui.label("Fallback:");
@@ -2037,13 +2126,13 @@ fn trail_form(
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label("Accel base:");
-                source_key_combo(ui, "trail_form_accel", &mut draft.accel_key, source_keys, collapse);
+                source_key_combo(ui, "trail_form_accel", &mut draft.accel_key, source_keys, collapse, None);
                 ui.end_row();
                 ui.label("Quat base:");
-                source_key_combo(ui, "trail_form_quat", &mut draft.quat_key, source_keys, collapse);
+                source_key_combo(ui, "trail_form_quat", &mut draft.quat_key, source_keys, collapse, None);
                 ui.end_row();
                 ui.label("Seed-from base:");
-                source_key_combo(ui, "trail_form_seed", &mut draft.seed_key, source_keys, collapse);
+                source_key_combo(ui, "trail_form_seed", &mut draft.seed_key, source_keys, collapse, None);
                 ui.end_row();
             });
     } else {
@@ -2052,13 +2141,13 @@ fn trail_form(
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label("X (East) key:");
-                source_key_combo(ui, "trail_form_x", &mut draft.x_key, source_keys, collapse);
+                source_key_combo(ui, "trail_form_x", &mut draft.x_key, source_keys, collapse, None);
                 ui.end_row();
                 ui.label("Y (North) key:");
-                source_key_combo(ui, "trail_form_y", &mut draft.y_key, source_keys, collapse);
+                source_key_combo(ui, "trail_form_y", &mut draft.y_key, source_keys, collapse, None);
                 ui.end_row();
                 ui.label("Z (NED-down) key:");
-                source_key_combo(ui, "trail_form_z", &mut draft.z_neg_key, source_keys, collapse);
+                source_key_combo(ui, "trail_form_z", &mut draft.z_neg_key, source_keys, collapse, None);
                 ui.end_row();
             });
     }
@@ -2078,22 +2167,72 @@ fn trail_form(
 /// and the operator can keep browsing. Collapsed state is held by the caller
 /// via [`profiler_render::ComboCollapseState`] so it persists across re-opens
 /// of the SAME modal.
+/// v0.12.0 — optional picker context for [`source_key_combo`].
+///
+/// Carries the freshness registry + type filter + observed-key set so the
+/// dropdown can colorize entries and skip filtered classes. Passed by
+/// reference so each modal opens with the operator's current filter row
+/// state.
+struct PickerContext<'a> {
+    last_seen: &'a HashMap<String, f64>,
+    now_s: f64,
+    filter: &'a mut profiler_render::PickerTypeFilter,
+    /// Set of keys that have ever been observed in any store (includes
+    /// schema-only null keys). Used to disambiguate `SchemaOnly` vs
+    /// `Custom` for the freshness classifier.
+    observed: &'a std::collections::HashSet<String>,
+}
+
 fn source_key_combo(
     ui: &mut egui::Ui,
     salt: &str,
     value: &mut String,
     source_keys: &[String],
     collapse: &mut profiler_render::ComboCollapseState,
+    mut ctx: Option<&mut PickerContext<'_>>,
 ) {
+    use profiler_render::{classify_key, KeyFreshness};
     ui.horizontal(|ui| {
         ui.text_edit_singleline(value);
         egui::ComboBox::from_id_salt(salt)
             .selected_text("▼")
             .width(20.0)
             .show_ui(ui, |ui| {
+                // v0.12.0 — filter row at the top of the popup. Operator can
+                // toggle off classes they don't want to see. The toggles
+                // stay inside the ComboBox popup-rect tracking (plain
+                // checkboxes, same trick as the category headers).
+                if let Some(ref mut pc) = ctx.as_ref() {
+                    // Render once via a re-borrow that doesn't consume ctx.
+                    let _ = pc; // satisfy borrow checker; we use the real one below
+                }
+                if let Some(pc) = ctx.as_deref_mut() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Show:").weak());
+                        ui.checkbox(&mut pc.filter.status, "Status");
+                        ui.checkbox(&mut pc.filter.scalar_2d, "2D scalar");
+                        ui.checkbox(&mut pc.filter.vector_2d, "2D vector");
+                        ui.checkbox(&mut pc.filter.d3, "3D");
+                    });
+                    ui.separator();
+                }
                 // Cap at 256 entries so a noisy run doesn't lock up the UI.
                 // We slice BEFORE grouping so the cap applies uniformly.
-                let limited: Vec<String> = source_keys.iter().take(256).cloned().collect();
+                // v0.12.0 — apply the type filter row BEFORE the cap so the
+                // dropdown can still show 256 of the unfiltered classes
+                // when the operator has narrowed the view.
+                let filtered: Vec<String> = match ctx.as_deref() {
+                    Some(pc) => source_keys
+                        .iter()
+                        .filter(|k| {
+                            let shape = profiler_render::known_value_shape(k);
+                            pc.filter.allows(k, shape)
+                        })
+                        .cloned()
+                        .collect(),
+                    None => source_keys.to_vec(),
+                };
+                let limited: Vec<String> = filtered.into_iter().take(256).collect();
                 let grouped = group_source_keys(&limited);
                 for (group, keys) in grouped {
                     let collapsed = collapse.is_collapsed(group);
@@ -2115,7 +2254,33 @@ fn source_key_combo(
                     if !collapsed {
                         ui.indent(format!("{salt}_{group}_body"), |ui| {
                             for k in &keys {
-                                if ui.selectable_label(value == k, k).clicked() {
+                                // v0.12.0 — colorize by freshness when a
+                                // picker context is supplied.
+                                let label_text = match ctx.as_deref() {
+                                    Some(pc) => {
+                                        let observed = pc.observed.contains(k);
+                                        let fresh = classify_key(k, pc.last_seen, pc.now_s, observed);
+                                        let mut rt = egui::RichText::new(k);
+                                        rt = match fresh {
+                                            KeyFreshness::Live => {
+                                                rt.color(egui::Color32::from_gray(220))
+                                            }
+                                            KeyFreshness::Stale => {
+                                                rt.color(egui::Color32::from_gray(140))
+                                            }
+                                            KeyFreshness::SchemaOnly => rt
+                                                .color(egui::Color32::from_gray(120))
+                                                .italics(),
+                                            KeyFreshness::Custom => rt.color(
+                                                egui::Color32::from_rgb(220, 180, 100),
+                                            ),
+                                        };
+                                        rt
+                                    }
+                                    None => egui::RichText::new(k),
+                                };
+                                let selected = value == k;
+                                if ui.selectable_label(selected, label_text).clicked() {
                                     *value = k.clone();
                                 }
                             }

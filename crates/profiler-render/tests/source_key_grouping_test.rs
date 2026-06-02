@@ -68,10 +68,19 @@ fn categorize_unknown_falls_through_to_other() {
 
 #[test]
 fn key_groups_constant_is_in_render_order() {
-    assert_eq!(
-        KEY_GROUPS,
-        &["DT physics", "AP MAVLink", "Position (NED)", "Timing", "Other"]
-    );
+    // v0.12.0 — expanded KEY_GROUPS with status / EKF / AHRS2 / vibration /
+    // secondary IMUs / pressures / battery / ESC / radio / nav / system.
+    // We assert the Status group comes FIRST and the original v0.10.2 groups
+    // retain their relative order (after Status).
+    assert_eq!(KEY_GROUPS[0], "Status");
+    let original = ["DT physics", "AP MAVLink", "Position (NED)", "Timing", "Other"];
+    let positions: Vec<usize> = original
+        .iter()
+        .map(|g| KEY_GROUPS.iter().position(|x| x == g).expect("group present"))
+        .collect();
+    let mut sorted = positions.clone();
+    sorted.sort();
+    assert_eq!(positions, sorted, "original groups keep their relative order");
 }
 
 /// Feed the categorizer a list of keys; assert correct grouping and that

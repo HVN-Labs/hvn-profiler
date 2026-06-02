@@ -22,7 +22,33 @@ use profiler_template::{Cell, CellSource, LabelMode, Primitive, Template, Trail3
 
 use crate::TraceStore;
 
-/// v0.11.0 — opinionated default schema of source-keys for HVN-SITL fleets.
+/// v0.12.0 — observed/declared shape of a source-key's value. Used by the
+/// editor's primitive-inference helper ([`infer_primitive`]) and the picker
+/// type-filter row to bucket each key into a primitive family.
+///
+/// Variants:
+/// - `Scalar` — a single `f64` per timestamp (most channels).
+/// - `Vector(N)` — `N` scalar components emitted as `base[0..N-1]`. Common
+///   `N`: 2 (lat/lon), 3 (xyz), 4 (quat), 6 (RAW_IMU), 9–10 (SCALED_IMU2/3).
+/// - `String` — a string-typed channel (e.g. `flight_mode`).
+/// - `Bool` — `True` / `False` (e.g. `armed`).
+/// - `TextLog` — rolling list of dicts (`statustexts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueShape {
+    /// Single `f64` scalar.
+    Scalar,
+    /// `N`-component vector (emitted as `base[0..N-1]`).
+    Vector(usize),
+    /// String-typed (e.g. `flight_mode`).
+    String,
+    /// Bool-typed (e.g. `armed`).
+    Bool,
+    /// Rolling list of dicts (e.g. `statustexts`).
+    TextLog,
+}
+
+/// v0.11.0 / v0.12.0 — opinionated default schema of source-keys for HVN-SITL
+/// fleets, each tagged with its [`ValueShape`].
 ///
 /// The picker dropdown shows this list FIRST so users can author panel
 /// templates against AP-fed channels (`ap_attitude`, `ap_raw_imu`, …) BEFORE
@@ -31,33 +57,289 @@ use crate::TraceStore;
 /// keys flow as `None` from `dt_runner` until the autopilot wakes up, and
 /// `TraceStore` only registers a key after a non-`None` value lands.
 ///
-/// The list is project-specific by design: standalone deployments with custom
-/// envelopes still get observed-key discovery merged on top via
+/// v0.12.0 — the list is now `&[(&str, ValueShape)]` so the editor can pick
+/// a sensible default primitive without observing the wire format. Custom
+/// (non-HVN) sources still get observed-key discovery merged on top via
 /// [`collect_source_keys`].
-pub const KNOWN_HVN_SITL_KEYS: &[&str] = &[
+pub const KNOWN_HVN_SITL_KEYS: &[(&str, ValueShape)] = &[
+    // ── Timing ─────────────────────────────────────────────────────────────
+    ("t", ValueShape::Scalar),
     // ── DT physics (truth / raw sensor models) ────────────────────────────
-    "t",
-    "accel[0]", "accel[1]", "accel[2]",
-    "gyro[0]", "gyro[1]", "gyro[2]",
-    "mag_xyz[0]", "mag_xyz[1]", "mag_xyz[2]",
-    "mag_clean_xyz[0]", "mag_clean_xyz[1]", "mag_clean_xyz[2]",
-    "wind_ned[0]", "wind_ned[1]", "wind_ned[2]",
-    "baro_pressure", "baro_temp", "baro_alt", "state_alt",
-    "gps_alt", "gps_vn",
-    "quat_wxyz[0]", "quat_wxyz[1]", "quat_wxyz[2]", "quat_wxyz[3]",
-    "euler[0]", "euler[1]", "euler[2]",
+    ("accel[0]", ValueShape::Scalar), ("accel[1]", ValueShape::Scalar), ("accel[2]", ValueShape::Scalar),
+    ("gyro[0]", ValueShape::Scalar), ("gyro[1]", ValueShape::Scalar), ("gyro[2]", ValueShape::Scalar),
+    ("mag_xyz[0]", ValueShape::Scalar), ("mag_xyz[1]", ValueShape::Scalar), ("mag_xyz[2]", ValueShape::Scalar),
+    ("mag_clean_xyz[0]", ValueShape::Scalar), ("mag_clean_xyz[1]", ValueShape::Scalar), ("mag_clean_xyz[2]", ValueShape::Scalar),
+    ("wind_ned[0]", ValueShape::Scalar), ("wind_ned[1]", ValueShape::Scalar), ("wind_ned[2]", ValueShape::Scalar),
+    ("baro_pressure", ValueShape::Scalar), ("baro_temp", ValueShape::Scalar),
+    ("baro_alt", ValueShape::Scalar), ("state_alt", ValueShape::Scalar),
+    ("gps_alt", ValueShape::Scalar), ("gps_vn", ValueShape::Scalar),
+    ("quat_wxyz[0]", ValueShape::Scalar), ("quat_wxyz[1]", ValueShape::Scalar),
+    ("quat_wxyz[2]", ValueShape::Scalar), ("quat_wxyz[3]", ValueShape::Scalar),
+    ("euler[0]", ValueShape::Scalar), ("euler[1]", ValueShape::Scalar), ("euler[2]", ValueShape::Scalar),
     // ── AP MAVLink mirrors (what the autopilot sees) ──────────────────────
-    "ap_attitude[0]", "ap_attitude[1]", "ap_attitude[2]",
-    "ap_raw_imu[0]", "ap_raw_imu[1]", "ap_raw_imu[2]",
-    "ap_raw_imu[3]", "ap_raw_imu[4]", "ap_raw_imu[5]",
-    "ap_vfr_alt",
-    "ap_vel_ned[0]", "ap_vel_ned[1]", "ap_vel_ned[2]",
+    ("ap_attitude[0]", ValueShape::Scalar), ("ap_attitude[1]", ValueShape::Scalar), ("ap_attitude[2]", ValueShape::Scalar),
+    ("ap_raw_imu[0]", ValueShape::Scalar), ("ap_raw_imu[1]", ValueShape::Scalar), ("ap_raw_imu[2]", ValueShape::Scalar),
+    ("ap_raw_imu[3]", ValueShape::Scalar), ("ap_raw_imu[4]", ValueShape::Scalar), ("ap_raw_imu[5]", ValueShape::Scalar),
+    ("ap_vfr_alt", ValueShape::Scalar),
+    ("ap_vel_ned[0]", ValueShape::Scalar), ("ap_vel_ned[1]", ValueShape::Scalar), ("ap_vel_ned[2]", ValueShape::Scalar),
     // ── Position NED (truth / GPS sensor / EKF / target) ──────────────────
-    "pos_truth_ned[0]", "pos_truth_ned[1]", "pos_truth_ned[2]",
-    "pos_gps_ned[0]", "pos_gps_ned[1]", "pos_gps_ned[2]",
-    "pos_ekf_ned[0]", "pos_ekf_ned[1]", "pos_ekf_ned[2]",
-    "pos_target_ned[0]", "pos_target_ned[1]", "pos_target_ned[2]",
+    ("pos_truth_ned[0]", ValueShape::Scalar), ("pos_truth_ned[1]", ValueShape::Scalar), ("pos_truth_ned[2]", ValueShape::Scalar),
+    ("pos_gps_ned[0]", ValueShape::Scalar), ("pos_gps_ned[1]", ValueShape::Scalar), ("pos_gps_ned[2]", ValueShape::Scalar),
+    ("pos_ekf_ned[0]", ValueShape::Scalar), ("pos_ekf_ned[1]", ValueShape::Scalar), ("pos_ekf_ned[2]", ValueShape::Scalar),
+    ("pos_target_ned[0]", ValueShape::Scalar), ("pos_target_ned[1]", ValueShape::Scalar), ("pos_target_ned[2]", ValueShape::Scalar),
+    // ── EKF status (v0.12.0) ──────────────────────────────────────────────
+    ("ekf_flags", ValueShape::Scalar),
+    ("ekf_velv", ValueShape::Scalar),
+    ("ekf_pos_horiz", ValueShape::Scalar),
+    ("ekf_pos_vert", ValueShape::Scalar),
+    ("ekf_compv", ValueShape::Scalar),
+    ("ekf_terralt", ValueShape::Scalar),
+    // ── AHRS2 (secondary attitude, v0.12.0) ───────────────────────────────
+    ("ahrs2_roll", ValueShape::Scalar),
+    ("ahrs2_pitch", ValueShape::Scalar),
+    ("ahrs2_yaw", ValueShape::Scalar),
+    ("ahrs2_alt", ValueShape::Scalar),
+    ("ahrs2_lat", ValueShape::Scalar),
+    ("ahrs2_lng", ValueShape::Scalar),
+    // ── Vibration (v0.12.0) ───────────────────────────────────────────────
+    ("vibex", ValueShape::Scalar),
+    ("vibey", ValueShape::Scalar),
+    ("vibez", ValueShape::Scalar),
+    ("vibeclip0", ValueShape::Scalar),
+    ("vibeclip1", ValueShape::Scalar),
+    ("vibeclip2", ValueShape::Scalar),
+    // ── Secondary IMUs (v0.12.0) — base + 10-component (ax,ay,az,gx,gy,gz,mx,my,mz,temp)
+    ("scaled_imu2[0]", ValueShape::Scalar), ("scaled_imu2[1]", ValueShape::Scalar),
+    ("scaled_imu2[2]", ValueShape::Scalar), ("scaled_imu2[3]", ValueShape::Scalar),
+    ("scaled_imu2[4]", ValueShape::Scalar), ("scaled_imu2[5]", ValueShape::Scalar),
+    ("scaled_imu2[6]", ValueShape::Scalar), ("scaled_imu2[7]", ValueShape::Scalar),
+    ("scaled_imu2[8]", ValueShape::Scalar), ("scaled_imu2[9]", ValueShape::Scalar),
+    ("scaled_imu3[0]", ValueShape::Scalar), ("scaled_imu3[1]", ValueShape::Scalar),
+    ("scaled_imu3[2]", ValueShape::Scalar), ("scaled_imu3[3]", ValueShape::Scalar),
+    ("scaled_imu3[4]", ValueShape::Scalar), ("scaled_imu3[5]", ValueShape::Scalar),
+    ("scaled_imu3[6]", ValueShape::Scalar), ("scaled_imu3[7]", ValueShape::Scalar),
+    ("scaled_imu3[8]", ValueShape::Scalar), ("scaled_imu3[9]", ValueShape::Scalar),
+    // ── Pressures (v0.12.0) — abs / diff / temp ───────────────────────────
+    ("press_scaled[0]", ValueShape::Scalar), ("press_scaled[1]", ValueShape::Scalar),
+    ("press_scaled[2]", ValueShape::Scalar),
+    ("press_scaled2[0]", ValueShape::Scalar), ("press_scaled2[1]", ValueShape::Scalar),
+    ("press_scaled2[2]", ValueShape::Scalar),
+    // ── Battery (v0.12.0) ─────────────────────────────────────────────────
+    ("battery_voltage", ValueShape::Scalar),
+    ("battery_current", ValueShape::Scalar),
+    ("battery_remaining", ValueShape::Scalar),
+    // ── ESC, first 4 motors (v0.12.0) ─────────────────────────────────────
+    ("esc_rpm[0]", ValueShape::Scalar), ("esc_rpm[1]", ValueShape::Scalar),
+    ("esc_rpm[2]", ValueShape::Scalar), ("esc_rpm[3]", ValueShape::Scalar),
+    ("esc_voltage[0]", ValueShape::Scalar), ("esc_voltage[1]", ValueShape::Scalar),
+    ("esc_voltage[2]", ValueShape::Scalar), ("esc_voltage[3]", ValueShape::Scalar),
+    ("esc_current[0]", ValueShape::Scalar), ("esc_current[1]", ValueShape::Scalar),
+    ("esc_current[2]", ValueShape::Scalar), ("esc_current[3]", ValueShape::Scalar),
+    // ── RC channels + servos (v0.12.0) ────────────────────────────────────
+    ("rc_channels[0]", ValueShape::Scalar), ("rc_channels[1]", ValueShape::Scalar),
+    ("rc_channels[2]", ValueShape::Scalar), ("rc_channels[3]", ValueShape::Scalar),
+    ("rc_channels[4]", ValueShape::Scalar), ("rc_channels[5]", ValueShape::Scalar),
+    ("rc_channels[6]", ValueShape::Scalar), ("rc_channels[7]", ValueShape::Scalar),
+    ("rc_channels[8]", ValueShape::Scalar), ("rc_channels[9]", ValueShape::Scalar),
+    ("rc_channels[10]", ValueShape::Scalar), ("rc_channels[11]", ValueShape::Scalar),
+    ("rc_channels[12]", ValueShape::Scalar), ("rc_channels[13]", ValueShape::Scalar),
+    ("rc_channels[14]", ValueShape::Scalar), ("rc_channels[15]", ValueShape::Scalar),
+    ("rc_rssi", ValueShape::Scalar),
+    ("servo_outputs[0]", ValueShape::Scalar), ("servo_outputs[1]", ValueShape::Scalar),
+    ("servo_outputs[2]", ValueShape::Scalar), ("servo_outputs[3]", ValueShape::Scalar),
+    ("servo_outputs[4]", ValueShape::Scalar), ("servo_outputs[5]", ValueShape::Scalar),
+    ("servo_outputs[6]", ValueShape::Scalar), ("servo_outputs[7]", ValueShape::Scalar),
+    ("servo_outputs[8]", ValueShape::Scalar), ("servo_outputs[9]", ValueShape::Scalar),
+    ("servo_outputs[10]", ValueShape::Scalar), ("servo_outputs[11]", ValueShape::Scalar),
+    ("servo_outputs[12]", ValueShape::Scalar), ("servo_outputs[13]", ValueShape::Scalar),
+    ("servo_outputs[14]", ValueShape::Scalar), ("servo_outputs[15]", ValueShape::Scalar),
+    // ── NAV controller (v0.12.0) ──────────────────────────────────────────
+    ("nav_roll", ValueShape::Scalar),
+    ("nav_pitch", ValueShape::Scalar),
+    ("nav_bearing", ValueShape::Scalar),
+    ("target_bearing", ValueShape::Scalar),
+    ("wp_dist", ValueShape::Scalar),
+    ("alt_error", ValueShape::Scalar),
+    ("aspd_error", ValueShape::Scalar),
+    ("xtrack_error", ValueShape::Scalar),
+    // ── System status (v0.12.0) ───────────────────────────────────────────
+    ("sys_load", ValueShape::Scalar),
+    ("sys_drop_rate_comm", ValueShape::Scalar),
+    ("sys_errors[0]", ValueShape::Scalar), ("sys_errors[1]", ValueShape::Scalar),
+    ("sys_errors[2]", ValueShape::Scalar), ("sys_errors[3]", ValueShape::Scalar),
+    // ── Status (v0.12.0) — special: string / bool / text-log ──────────────
+    ("armed", ValueShape::Bool),
+    ("flight_mode", ValueShape::String),
+    ("fix_type", ValueShape::Scalar),
+    ("statustexts", ValueShape::TextLog),
 ];
+
+/// v0.12.0 — return the [`ValueShape`] for a known key, or `None` if the key
+/// is not in [`KNOWN_HVN_SITL_KEYS`]. Comparison ignores array indexing on
+/// known list entries — `accel[0]` and `accel[1]` both resolve to the entry
+/// with matching base. Custom keys observed at runtime fall back to `None`
+/// and the caller infers from observation.
+pub fn known_value_shape(key: &str) -> Option<ValueShape> {
+    for (k, s) in KNOWN_HVN_SITL_KEYS {
+        if *k == key {
+            return Some(*s);
+        }
+    }
+    None
+}
+
+/// v0.12.0 — infer the default primitive for a given [`ValueShape`].
+///
+/// Used by the editor's Add Panel modal to pre-select a sensible primitive
+/// when the user picks a source key. The user can still change it via the
+/// existing dropdown.
+pub fn infer_primitive(value_shape: &ValueShape) -> &'static str {
+    match value_shape {
+        ValueShape::Scalar => "scalar",
+        ValueShape::Vector(2) => "scalar",
+        ValueShape::Vector(3) => "vector",
+        ValueShape::Vector(6) => "scalar",
+        ValueShape::Vector(_) => "scalar",
+        ValueShape::String => "status",
+        ValueShape::Bool => "status",
+        ValueShape::TextLog => "status",
+    }
+}
+
+/// v0.12.0 — freshness classification of a source key in the editor's picker
+/// dropdown.
+///
+/// Drives the color + style applied to the entry:
+/// - `Live` — observed in the last [`LIVE_THRESHOLD_S`] seconds (bright text).
+/// - `Stale` — observed before that, but not in the last [`STALE_THRESHOLD_S`]
+///   seconds (dim text).
+/// - `SchemaOnly` — in the static [`KNOWN_HVN_SITL_KEYS`] list but never
+///   observed (italic dim text).
+/// - `Custom` — observed but not in the static list (warm-tinted text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFreshness {
+    /// Has fresh, non-null data in the last [`LIVE_THRESHOLD_S`] seconds.
+    Live,
+    /// Was observed but not recently.
+    Stale,
+    /// In the static known-key vocabulary but never observed.
+    SchemaOnly,
+    /// Observed but not in the static known-key vocabulary.
+    Custom,
+}
+
+/// v0.12.0 — a key is "Live" if observed within this many seconds.
+pub const LIVE_THRESHOLD_S: f64 = 3.0;
+
+/// v0.12.0 — a key is "Stale" (not "Live") if last observed before this
+/// many seconds ago; before that we treat it as freshly observed.
+pub const STALE_THRESHOLD_S: f64 = 30.0;
+
+/// v0.12.0 — classify a key's freshness given a last-seen registry and the
+/// current monotonic time.
+///
+/// `last_seen.get(key)` returns the monotonic seconds at which a non-null
+/// value last arrived. Missing entries → either `SchemaOnly` (key is in
+/// [`KNOWN_HVN_SITL_KEYS`]) or `Custom` (key is observed somewhere — caller
+/// passes `observed = true`).
+pub fn classify_key(
+    key: &str,
+    last_seen: &HashMap<String, f64>,
+    now_s: f64,
+    observed: bool,
+) -> KeyFreshness {
+    if let Some(t) = last_seen.get(key) {
+        let age = (now_s - t).max(0.0);
+        if age <= LIVE_THRESHOLD_S {
+            return KeyFreshness::Live;
+        }
+        if age <= STALE_THRESHOLD_S {
+            // Within the stale window but not live.
+            return KeyFreshness::Stale;
+        }
+        // Older than stale threshold — still stale (it WAS observed).
+        return KeyFreshness::Stale;
+    }
+    // Never observed.
+    if known_value_shape(key).is_some() {
+        KeyFreshness::SchemaOnly
+    } else if observed {
+        // Observed in a store but never had a real value (null-key).
+        KeyFreshness::Custom
+    } else {
+        KeyFreshness::SchemaOnly
+    }
+}
+
+/// v0.12.0 — picker type-filter row state (Status / 2D scalar / 2D vector / 3D).
+///
+/// Defaults all-on; the operator toggles classes off to hide them from the
+/// dropdown.
+#[derive(Debug, Clone, Copy)]
+pub struct PickerTypeFilter {
+    /// Show status-typed keys (string / bool / text-log) and keys whose
+    /// names match status-typed patterns (`armed`, `flight_mode`,
+    /// `statustexts`, `ekf_flags`, `fix_type`, `sys_*`).
+    pub status: bool,
+    /// Show scalar / 1-vector keys.
+    pub scalar_2d: bool,
+    /// Show 2..10-vector keys.
+    pub vector_2d: bool,
+    /// Show 3D-position keys (`pos_*_ned`, `*_lat`, `*_lng`, `*_alt`).
+    pub d3: bool,
+}
+
+impl Default for PickerTypeFilter {
+    fn default() -> Self {
+        Self {
+            status: true,
+            scalar_2d: true,
+            vector_2d: true,
+            d3: true,
+        }
+    }
+}
+
+impl PickerTypeFilter {
+    /// `true` when `key` matches any enabled class.
+    ///
+    /// A key passes when at least one of its inferred classifications matches
+    /// an enabled filter slot. Names without an inferred shape fall through
+    /// to the `scalar_2d` slot.
+    pub fn allows(&self, key: &str, shape: Option<ValueShape>) -> bool {
+        let is_status = match shape {
+            Some(ValueShape::String) | Some(ValueShape::Bool) | Some(ValueShape::TextLog) => true,
+            _ => key_is_status_name(key),
+        };
+        let is_3d = key_is_3d_name(key);
+        let is_vec = matches!(shape, Some(ValueShape::Vector(n)) if (2..=10).contains(&n));
+        let is_scalar = matches!(shape, Some(ValueShape::Scalar) | Some(ValueShape::Vector(1)))
+            || (shape.is_none() && !is_status);
+
+        (is_status && self.status)
+            || (is_vec && self.vector_2d)
+            || (is_3d && self.d3)
+            || (is_scalar && self.scalar_2d)
+    }
+}
+
+/// v0.12.0 — name-based check for "looks like a status key".
+fn key_is_status_name(key: &str) -> bool {
+    let base = key.split(['[', '.']).next().unwrap_or(key);
+    matches!(
+        base,
+        "armed" | "flight_mode" | "statustexts" | "ekf_flags" | "fix_type"
+    ) || base.starts_with("sys_")
+}
+
+/// v0.12.0 — name-based check for "looks like a 3D-position key".
+fn key_is_3d_name(key: &str) -> bool {
+    if key.starts_with("pos_") && key.contains("_ned") {
+        return true;
+    }
+    let base = key.split(['[', '.']).next().unwrap_or(key);
+    base.ends_with("_lat") || base.ends_with("_lng") || base.ends_with("_alt")
+}
 
 /// v0.11.0 — per-category collapse state for the grouped source-key dropdown.
 ///
@@ -273,6 +555,41 @@ pub fn compact_cells(tpl: &mut Template) {
 pub fn categorize_key(key: &str) -> &'static str {
     let base = key.split(['[', '.']).next().unwrap_or(key);
     match base {
+        // Status-typed (v0.12.0)
+        "armed" | "flight_mode" | "statustexts" | "fix_type" | "ekf_flags"
+            => "Status",
+        // EKF status (v0.12.0)
+        "ekf_velv" | "ekf_pos_horiz" | "ekf_pos_vert" | "ekf_compv" | "ekf_terralt"
+            => "EKF Status",
+        // AHRS2 secondary attitude (v0.12.0)
+        "ahrs2_roll" | "ahrs2_pitch" | "ahrs2_yaw"
+        | "ahrs2_alt" | "ahrs2_lat" | "ahrs2_lng"
+            => "AHRS2 (secondary)",
+        // Vibration (v0.12.0)
+        "vibex" | "vibey" | "vibez"
+        | "vibeclip0" | "vibeclip1" | "vibeclip2"
+            => "Vibration",
+        // Secondary IMUs (v0.12.0)
+        "scaled_imu2" | "scaled_imu3"
+            => "AP IMU (secondary)",
+        // Pressures (v0.12.0)
+        "press_scaled" | "press_scaled2"
+            => "AP Pressure",
+        // Battery (v0.12.0)
+        "battery_voltage" | "battery_current" | "battery_remaining"
+            => "Battery",
+        // ESC (v0.12.0)
+        "esc_rpm" | "esc_voltage" | "esc_current"
+            => "ESC",
+        // RC + servos (v0.12.0)
+        "rc_channels" | "rc_rssi" | "servo_outputs"
+            => "Radio / Servos",
+        // NAV controller (v0.12.0)
+        "nav_roll" | "nav_pitch" | "nav_bearing" | "target_bearing"
+        | "wp_dist" | "alt_error" | "aspd_error" | "xtrack_error"
+            => "Navigation",
+        // System status (v0.12.0)
+        k if k.starts_with("sys_") => "System",
         // DT physics (truth / raw sensor models)
         "accel" | "gyro" | "mag_xyz" | "mag_clean_xyz" | "wind_ned"
         | "baro_pressure" | "baro_temp" | "baro_alt" | "state_alt"
@@ -294,8 +611,19 @@ pub fn categorize_key(key: &str) -> &'static str {
 /// slice so the rendering side can iterate over groups in this exact order
 /// regardless of whether a given run observed any keys in some group.
 pub const KEY_GROUPS: &[&str] = &[
+    "Status",
     "DT physics",
     "AP MAVLink",
+    "AHRS2 (secondary)",
+    "AP IMU (secondary)",
+    "AP Pressure",
+    "EKF Status",
+    "Vibration",
+    "Battery",
+    "ESC",
+    "Radio / Servos",
+    "Navigation",
+    "System",
     "Position (NED)",
     "Timing",
     "Other",
@@ -597,7 +925,10 @@ where
     // v0.11.0 — opinionated HVN-SITL defaults first so the picker is never
     // empty before the first envelope and AP MAVLink keys are addressable
     // immediately at startup.
-    for k in KNOWN_HVN_SITL_KEYS {
+    //
+    // v0.12.0 — the static list now carries a `ValueShape` per entry; we
+    // only need the key here.
+    for (k, _shape) in KNOWN_HVN_SITL_KEYS {
         all.insert((*k).to_string());
         // Also register the base (`accel` for `accel[0]`) — vector primitives
         // need it.

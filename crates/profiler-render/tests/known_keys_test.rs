@@ -28,7 +28,7 @@ fn empty_stores_yield_known_hvn_sitl_keys() {
     let key_set: std::collections::BTreeSet<String> = keys.into_iter().collect();
 
     // Every static key must be present.
-    for &k in KNOWN_HVN_SITL_KEYS {
+    for &(k, _shape) in KNOWN_HVN_SITL_KEYS {
         assert!(
             key_set.contains(k),
             "picker missing static key {k}; v0.11.0 promised pre-seed",

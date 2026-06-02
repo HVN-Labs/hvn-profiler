@@ -493,7 +493,10 @@ fn render_grid_body(
             for c in 0..cols {
                 let id = r * cols + c;
                 let Some(cell) = at[id] else { continue };
-                if !cell.visible || cell.sources.is_empty() {
+                // v0.12.0 — Status primitive carries its source in
+                // `cell.source` (single string) rather than `cell.sources`,
+                // so accept it even when `cell.sources` is empty.
+                if !cell.visible || (cell.sources.is_empty() && cell.primitive != Primitive::Status) {
                     continue;
                 }
                 let rect = layout.cell_rect(r, c);
@@ -651,7 +654,11 @@ fn render_grid_body(
             ui.scope_builder(UiBuilder::new().max_rect(target_rect), |ui| {
                 ui.set_clip_rect(target_rect);
                 match at[id] {
-                    Some(cell) if cell.visible && runtime_visible && !cell.sources.is_empty() => {
+                    Some(cell)
+                        if cell.visible
+                            && runtime_visible
+                            && (!cell.sources.is_empty()
+                                || cell.primitive == Primitive::Status) => {
                         if is_drag_source {
                             // Draw a dashed outline + dimmed fill where the
                             // panel WAS. The actual content paints on the
@@ -1013,8 +1020,20 @@ fn count_keys_with_data(tpl: &Template, store: &TraceStore) -> usize {
                 }
             }
         }
+        // v0.12.0 — status primitive uses `Cell::source` (single key) instead
+        // of `Cell::sources`. Include it in the data-key tally so the status
+        // log reports the panel as "live".
+        if cell.primitive == Primitive::Status && !cell.source.is_empty() {
+            keys.insert(cell.source.clone());
+        }
     }
-    keys.into_iter().filter(|k| store.len(k) > 0).count()
+    keys.into_iter()
+        .filter(|k| {
+            store.len(k) > 0
+                || store.latest_string(k).is_some()
+                || !store.text_log_owned(k).is_empty()
+        })
+        .count()
 }
 
 /// Render a single panel. Returns `(any_data, plot_response)`.
@@ -1038,6 +1057,12 @@ fn render_cell(
     interactive: bool,
     locked: &mut bool,
 ) -> (bool, egui::Response) {
+    // v0.12.0 — Status primitive bypasses the plot path entirely. The cell
+    // renders as a colored Frame with the value text, sized to fit the
+    // cell_rect (after the title strip).
+    if cell.primitive == Primitive::Status {
+        return render_status_cell(ui, cell, store, cell_rect);
+    }
     let plot_id = format!("cell_{}_{}", cell.row, cell.col);
 
     // Title above the plot — measured so the plot below knows how much height
@@ -1163,6 +1188,301 @@ fn render_cell(
     (any_data, resp.response)
 }
 
+/// v0.12.0 — render the [`Primitive::Status`] cell as a colored chip /
+/// text-log instead of an egui_plot panel.
+///
+/// Layout: a `Frame::default().fill(color).rounding(4).inner_margin(8)` with
+/// the resolved text inside. For `TextLog` kind, the latest entries are
+/// listed newest-first, severity-colored.
+///
+/// Returns `(any_data, response)`. `any_data` is `true` when the source has
+/// any resolvable value; the `response` is the interactive sense rect used
+/// for the right-click context menu.
+pub fn render_status_cell(
+    ui: &mut egui::Ui,
+    cell: &Cell,
+    store: &TraceStore,
+    cell_rect: Rect,
+) -> (bool, egui::Response) {
+    use profiler_template::StatusKind;
+    let title_font_size = (cell_rect.width() * 0.030).clamp(10.0, 14.0);
+    let title_h: f32 = if cell.title.is_empty() {
+        0.0
+    } else {
+        title_font_size + 4.0
+    };
+    if !cell.title.is_empty() {
+        ui.label(
+            RichText::new(&cell.title)
+                .strong()
+                .size(title_font_size),
+        );
+    }
+
+    let body_rect = Rect::from_min_size(
+        Pos2::new(cell_rect.min.x, cell_rect.min.y + title_h),
+        Vec2::new(cell_rect.width(), (cell_rect.height() - title_h).max(20.0)),
+    );
+
+    // Resolve color and content based on kind + source value.
+    let kind = cell.kind.unwrap_or(StatusKind::Text);
+    let default_color = cell
+        .default_color
+        .as_deref()
+        .and_then(parse_color)
+        .unwrap_or(Color32::from_gray(170));
+    let key = cell.source.as_str();
+
+    // Build the body painter inside a scope_builder so we honour body_rect.
+    let resp = ui
+        .scope_builder(UiBuilder::new().max_rect(body_rect).sense(Sense::click()), |ui| {
+            ui.set_clip_rect(body_rect);
+            match kind {
+                StatusKind::Text | StatusKind::Badge => {
+                    let value = store
+                        .latest_string(key)
+                        .map(str::to_string)
+                        .or_else(|| store.latest(key).map(format_scalar_status));
+                    let txt = value.clone().unwrap_or_else(|| "—".to_string());
+                    let bg = cell
+                        .color_map
+                        .get(&txt)
+                        .and_then(|c| parse_color(c))
+                        .unwrap_or(default_color);
+                    paint_status_chip(ui, body_rect, bg, &txt, matches!(kind, StatusKind::Badge));
+                    value.is_some()
+                }
+                StatusKind::FixType => {
+                    let v = store.latest(key);
+                    let n = v.map(|f| f.round() as i64).unwrap_or(-1);
+                    let (label, bg) = fix_type_chip(n);
+                    let bg = if let Some(mapped) = cell.color_map.get(&n.to_string()).and_then(|c| parse_color(c)) {
+                        mapped
+                    } else if n < 0 {
+                        default_color
+                    } else {
+                        bg
+                    };
+                    paint_status_chip(ui, body_rect, bg, label, false);
+                    v.is_some()
+                }
+                StatusKind::ArmedBool => {
+                    // Bool may arrive as a scalar (0.0/1.0) or as a string ("True"/"False").
+                    let armed = if let Some(s) = store.latest_string(key) {
+                        matches!(s, "True" | "true" | "ARMED" | "1")
+                    } else if let Some(v) = store.latest(key) {
+                        v.abs() > 0.5
+                    } else {
+                        false
+                    };
+                    let has_data = store.latest_string(key).is_some() || store.latest(key).is_some();
+                    let (label, bg) = if !has_data {
+                        ("—", default_color)
+                    } else if armed {
+                        ("ARMED", Color32::from_rgb(0x2c, 0xa0, 0x2c))
+                    } else {
+                        ("DISARMED", Color32::from_gray(120))
+                    };
+                    // Honour color_map override on "True" / "False" if user supplied.
+                    let key_lookup = if armed { "True" } else { "False" };
+                    let bg = cell
+                        .color_map
+                        .get(key_lookup)
+                        .and_then(|c| parse_color(c))
+                        .unwrap_or(bg);
+                    paint_status_chip(ui, body_rect, bg, label, false);
+                    has_data
+                }
+                StatusKind::TextLog => {
+                    let entries = store.text_log_owned(key);
+                    paint_text_log(ui, body_rect, &entries, default_color);
+                    !entries.is_empty()
+                }
+            }
+        });
+
+    (resp.inner, resp.response)
+}
+
+/// v0.12.0 — paint a single status chip (filled rounded rect with centered
+/// text). `badge` shrinks the inner padding for a tighter pill look.
+fn paint_status_chip(ui: &egui::Ui, rect: Rect, bg: Color32, text: &str, badge: bool) {
+    let painter = ui.painter_at(rect);
+    let pad = if badge { 4.0 } else { 8.0 };
+    let chip = rect.shrink(pad);
+    painter.rect_filled(chip, 4.0, bg);
+    let font_size = if badge {
+        (chip.height() * 0.55).clamp(11.0, 16.0)
+    } else {
+        (chip.height() * 0.45).clamp(13.0, 22.0)
+    };
+    let text_color = if bg.r() as u32 + bg.g() as u32 + bg.b() as u32 > 380 {
+        // Light backgrounds — paint dark text.
+        Color32::from_gray(20)
+    } else {
+        Color32::WHITE
+    };
+    painter.text(
+        chip.center(),
+        Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(font_size),
+        text_color,
+    );
+}
+
+/// v0.12.0 — paint a rolling text-log inside `rect`. Newest entry first,
+/// severity-colored. Empty buffer → centered "no entries" placeholder.
+fn paint_text_log(ui: &egui::Ui, rect: Rect, entries: &[crate::TextLogEntry], default_color: Color32) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect.shrink(2.0), 4.0, Color32::from_black_alpha(40));
+    if entries.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "— no entries —",
+            egui::FontId::proportional(12.0),
+            default_color,
+        );
+        return;
+    }
+    let line_h = 14.0_f32;
+    let mut y = rect.min.y + 6.0;
+    // Newest first.
+    for entry in entries.iter().rev() {
+        if y + line_h > rect.max.y {
+            break;
+        }
+        let color = severity_color(entry.severity);
+        // Truncate text to fit the cell width (rough: 6 px per char).
+        let max_chars = (rect.width() / 7.0) as usize;
+        let txt: String = if entry.text.chars().count() > max_chars && max_chars > 3 {
+            let mut s: String = entry.text.chars().take(max_chars.saturating_sub(1)).collect();
+            s.push('…');
+            s
+        } else {
+            entry.text.clone()
+        };
+        painter.text(
+            Pos2::new(rect.min.x + 8.0, y),
+            Align2::LEFT_TOP,
+            txt,
+            egui::FontId::proportional(11.0),
+            color,
+        );
+        y += line_h;
+    }
+}
+
+/// v0.12.0 — MAVLink statustext severity → display color. Matches the
+/// emergency/alert/critical/error → red, warning → yellow, notice → blue,
+/// info/debug → gray convention.
+fn severity_color(sev: u8) -> Color32 {
+    match sev {
+        0..=3 => Color32::from_rgb(0xd6, 0x27, 0x28), // red
+        4 => Color32::from_rgb(0xe6, 0xa9, 0x00),     // yellow / amber
+        5 => Color32::from_rgb(0x1f, 0x77, 0xb4),     // blue
+        _ => Color32::from_gray(170),                  // gray (info / debug)
+    }
+}
+
+/// v0.12.0 — GPS fix-type → (label, color) for [`StatusKind::FixType`].
+fn fix_type_chip(n: i64) -> (&'static str, Color32) {
+    match n {
+        0 => ("No fix", Color32::from_rgb(0xd6, 0x27, 0x28)),
+        1 => ("2D", Color32::from_rgb(0xe6, 0xa9, 0x00)),
+        2 => ("3D", Color32::from_rgb(0x2c, 0xa0, 0x2c)),
+        3 => ("DGPS", Color32::from_rgb(0x1f, 0x77, 0xb4)),
+        4 => ("RTK float", Color32::from_rgb(0x94, 0x67, 0xbd)),
+        5 => ("RTK fixed", Color32::from_rgb(0x2c, 0xa0, 0x2c)),
+        6 => ("RTK fixed", Color32::from_rgb(0x2c, 0xa0, 0x2c)),
+        _ => ("—", Color32::from_gray(170)),
+    }
+}
+
+/// v0.12.0 — render a scalar numeric value as the chip text when no string
+/// form is available (e.g. flight_mode came through as a numeric mode id).
+fn format_scalar_status(v: f64) -> String {
+    if v.fract().abs() < 1e-9 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// v0.12.0 — public test helper: resolve the background color a status cell
+/// would paint, given the cell config + a fresh store snapshot. Pure
+/// function — no egui context required.
+#[doc(hidden)]
+pub fn status_cell_color(cell: &Cell, store: &TraceStore) -> Color32 {
+    use profiler_template::StatusKind;
+    let kind = cell.kind.unwrap_or(StatusKind::Text);
+    let default_color = cell
+        .default_color
+        .as_deref()
+        .and_then(parse_color)
+        .unwrap_or(Color32::from_gray(170));
+    let key = cell.source.as_str();
+    match kind {
+        StatusKind::Text | StatusKind::Badge => {
+            let value = store
+                .latest_string(key)
+                .map(str::to_string)
+                .or_else(|| store.latest(key).map(format_scalar_status));
+            match value {
+                Some(v) => cell
+                    .color_map
+                    .get(&v)
+                    .and_then(|c| parse_color(c))
+                    .unwrap_or(default_color),
+                None => default_color,
+            }
+        }
+        StatusKind::FixType => {
+            let v = store.latest(key);
+            let n = v.map(|f| f.round() as i64).unwrap_or(-1);
+            if let Some(c) = cell.color_map.get(&n.to_string()).and_then(|c| parse_color(c)) {
+                c
+            } else if n < 0 {
+                default_color
+            } else {
+                fix_type_chip(n).1
+            }
+        }
+        StatusKind::ArmedBool => {
+            let armed = if let Some(s) = store.latest_string(key) {
+                matches!(s, "True" | "true" | "ARMED" | "1")
+            } else if let Some(v) = store.latest(key) {
+                v.abs() > 0.5
+            } else {
+                return default_color;
+            };
+            let key_lookup = if armed { "True" } else { "False" };
+            if let Some(c) = cell.color_map.get(key_lookup).and_then(|c| parse_color(c)) {
+                return c;
+            }
+            if armed {
+                Color32::from_rgb(0x2c, 0xa0, 0x2c)
+            } else {
+                Color32::from_gray(120)
+            }
+        }
+        StatusKind::TextLog => default_color,
+    }
+}
+
+/// v0.12.0 — public test helper: severity color used by [`StatusKind::TextLog`].
+#[doc(hidden)]
+pub fn status_severity_color(sev: u8) -> Color32 {
+    severity_color(sev)
+}
+
+/// v0.12.0 — public test helper: GPS fix-type chip label + color.
+#[doc(hidden)]
+pub fn status_fix_type_chip(n: i64) -> (&'static str, Color32) {
+    fix_type_chip(n)
+}
+
 /// v0.10.0 — attach the per-cell right-click context menu to a plot response.
 /// Drains user clicks into `sink` for the CLI to apply next frame.
 fn attach_context_menu(resp: &egui::Response, cell: &Cell, sink: &mut Vec<CellMenuAction>) {
@@ -1222,6 +1542,8 @@ fn draw_primitive(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceSto
         Primitive::MagInterference => draw_vector(plot_ui, cell, store, true),
         Primitive::Diff => draw_diff(plot_ui, cell, store),
         Primitive::StatusBadge => false, // reserved — render nothing
+        // Status is handled outside the plot context — never reached here.
+        Primitive::Status => false,
     }
 }
 

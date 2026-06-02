@@ -17,9 +17,11 @@ pub mod generators;
 pub mod panels;
 pub mod view3d;
 pub use editor::{
-    apply_panel_draft, apply_trail_draft, categorize_key, collect_source_keys, compact_cells,
-    group_source_keys, relocate_cell, remove_cell_at, replace_cell_at, swap_cells,
-    ComboCollapseState, EditHistory, PanelDraft, TrailDraft, KEY_GROUPS, KNOWN_HVN_SITL_KEYS,
+    apply_panel_draft, apply_trail_draft, categorize_key, classify_key, collect_source_keys,
+    compact_cells, group_source_keys, infer_primitive, known_value_shape, relocate_cell,
+    remove_cell_at, replace_cell_at, swap_cells, ComboCollapseState, EditHistory, KeyFreshness,
+    PanelDraft, PickerTypeFilter, TrailDraft, ValueShape, KEY_GROUPS, KNOWN_HVN_SITL_KEYS,
+    LIVE_THRESHOLD_S, STALE_THRESHOLD_S,
 };
 pub use faults::{
     default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,
@@ -28,10 +30,11 @@ pub use gen_panel::{render_gen_panel, GeneratorPanelState, SLIDER_TARGETS};
 pub use generators::{Generator, Waveform};
 pub use panels::{
     build_label_text, compute_overlay_pos, format_value_pub, layout_cell_rects,
-    overlay_box_size, render_template_grid, render_template_grid_full,
+    overlay_box_size, render_status_cell, render_template_grid, render_template_grid_full,
     render_template_grid_with_override, responsive_cell_rects, responsive_grid_dims,
-    CellMenuAction, GridRenderOptions, GridStats, LabelOverride, PanelState,
-    RESPONSIVE_3D_COLLAPSE_W, RESPONSIVE_MIN_CELL_W, RESPONSIVE_SINGLE_COL_W,
+    status_cell_color, status_fix_type_chip, status_severity_color, CellMenuAction,
+    GridRenderOptions, GridStats, LabelOverride, PanelState, RESPONSIVE_3D_COLLAPSE_W,
+    RESPONSIVE_MIN_CELL_W, RESPONSIVE_SINGLE_COL_W,
 };
 pub use view3d::{render_view3d, render_view3d_with_override, OrbitCamera, View3dState, View3dStats};
 
@@ -68,6 +71,33 @@ pub struct TraceStore {
     /// surface them. As soon as a non-null value arrives, [`Self::push`]
     /// pulls the key out of this set and into `traces`.
     null_keys: BTreeSet<String>,
+    /// v0.12.0 — latest string value per channel name. Populated by
+    /// [`Self::push_string`] for status-typed sources (e.g. `flight_mode`,
+    /// `armed` rendered as `"True"` / `"False"`). One entry per key — no
+    /// history retained, just the current value.
+    string_traces: HashMap<String, String>,
+    /// v0.12.0 — rolling list of text-log entries per channel name. Newest
+    /// is `back()`; the renderer reverses to show newest-first. Capped at
+    /// [`TEXT_LOG_CAPACITY`] to bound memory on noisy fleets.
+    text_log_traces: HashMap<String, VecDeque<TextLogEntry>>,
+}
+
+/// v0.12.0 — per-channel rolling text-log capacity (newest entries kept).
+pub const TEXT_LOG_CAPACITY: usize = 128;
+
+/// v0.12.0 — one entry in a [`TraceStore`] text-log buffer.
+///
+/// `severity` follows the MAVLink `STATUSTEXT` severity field (0..7); the
+/// status-primitive renderer colors entries by severity (red for 0-3,
+/// yellow for 4, blue for 5, gray for 6-7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextLogEntry {
+    /// Timestamp the entry arrived at (seconds, monotonic).
+    pub ts: f64,
+    /// Plain-text payload.
+    pub text: String,
+    /// MAVLink-style severity, 0 (emergency) → 7 (debug).
+    pub severity: u8,
 }
 
 impl Default for TraceStore {
@@ -84,7 +114,84 @@ impl TraceStore {
             traces: HashMap::new(),
             latest_ts: f64::NEG_INFINITY,
             null_keys: BTreeSet::new(),
+            string_traces: HashMap::new(),
+            text_log_traces: HashMap::new(),
         }
+    }
+
+    /// v0.12.0 — record the latest string value for a status-typed channel.
+    ///
+    /// Pulls the key out of the schema-only null-set (real data trumps the
+    /// "advertised but never set" marker). One entry per key — no history.
+    pub fn push_string(&mut self, t: f64, key: &str, value: impl Into<String>) {
+        if t > self.latest_ts {
+            self.latest_ts = t;
+        }
+        self.null_keys.remove(key);
+        self.string_traces.insert(key.to_string(), value.into());
+    }
+
+    /// v0.12.0 — return the latest string value for a channel, if any.
+    pub fn latest_string(&self, key: &str) -> Option<&str> {
+        self.string_traces.get(key).map(String::as_str)
+    }
+
+    /// v0.12.0 — append a text-log entry to a channel's rolling buffer.
+    ///
+    /// Caps the buffer at [`TEXT_LOG_CAPACITY`] entries; the oldest is
+    /// evicted on overflow.
+    pub fn push_text_log(&mut self, t: f64, key: &str, entry: TextLogEntry) {
+        if t > self.latest_ts {
+            self.latest_ts = t;
+        }
+        self.null_keys.remove(key);
+        let buf = self
+            .text_log_traces
+            .entry(key.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(32));
+        buf.push_back(entry);
+        while buf.len() > TEXT_LOG_CAPACITY {
+            buf.pop_front();
+        }
+    }
+
+    /// v0.12.0 — return the text-log entries for a channel (oldest first),
+    /// or an empty slice if the channel has none.
+    pub fn text_log(&self, key: &str) -> &[TextLogEntry] {
+        // VecDeque's `as_slices` may split, so we lazily materialise. The
+        // renderer only inspects the slice with a small `take(N)` so an
+        // owned copy is cheap. Returning a borrowed slice would require
+        // make_contiguous() — but we already cap at 128 entries.
+        // (Convert to a contiguous &[T] on demand.)
+        static EMPTY: &[TextLogEntry] = &[];
+        match self.text_log_traces.get(key) {
+            Some(q) => {
+                // We need a contiguous view; egui rendering happens at 60 Hz,
+                // and the log is small (≤128 entries), so this is acceptable.
+                // We can't return &[T] from VecDeque without &mut, so this
+                // helper is paired with [`Self::text_log_owned`] below for
+                // callers that want a Vec without &mut access.
+                let (a, b) = q.as_slices();
+                if b.is_empty() {
+                    a
+                } else {
+                    // Falls back to the empty slice; callers should use
+                    // `text_log_owned` to get the full snapshot in that case.
+                    EMPTY
+                }
+            }
+            None => EMPTY,
+        }
+    }
+
+    /// v0.12.0 — clone the text-log entries for a channel into a `Vec`
+    /// (oldest first). Robust against the deque's split layout (unlike
+    /// [`Self::text_log`]) — used by the renderer.
+    pub fn text_log_owned(&self, key: &str) -> Vec<TextLogEntry> {
+        self.text_log_traces
+            .get(key)
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Push one point. `key` is the trace identifier (e.g. `"accel[0]"`).
