@@ -258,6 +258,14 @@ fn main() -> anyhow::Result<()> {
 
     // Load the template if given. A parse failure is fatal (the user asked for
     // a specific layout) — surface it rather than silently falling back.
+    //
+    // v0.14.0 — when no `--template` is provided, fall back to the BUNDLED
+    // default (`tutorial`). This replaces the v0.1.0 single-trace fallback as
+    // the first-run experience: a 3x3 layout mixing a few key live plots with
+    // inline `info_text` instructions. The single-trace path stays reachable
+    // for fully bare-bones runs by passing `--template ""` is not supported;
+    // operators who genuinely want the old behaviour can ship an empty
+    // template file. `hvn-default` remains available in the picker dropdown.
     let template = match &cli.template {
         Some(path) => {
             let tpl = Template::from_path(path)?;
@@ -272,8 +280,36 @@ fn main() -> anyhow::Result<()> {
             Some(tpl)
         }
         None => {
-            log::info!("no --template given → single-trace fallback mode");
-            None
+            // v0.14.0 — implicit-default: parse the bundled `tutorial` JSON.
+            // Parse errors here are programmer errors (the JSON is compiled
+            // into the binary and unit-tested), so surface them rather than
+            // silently swallowing.
+            match profiler_template::bundled::by_name(
+                profiler_template::bundled::DEFAULT_BUNDLED_NAME,
+            ) {
+                Some(b) => match Template::from_str(b.json) {
+                    Ok(tpl) => {
+                        log::info!(
+                            "no --template given → loading bundled default '{}' ({}x{} grid, {} cells)",
+                            tpl.name,
+                            tpl.grid.rows,
+                            tpl.grid.cols,
+                            tpl.cells.len(),
+                        );
+                        Some(tpl)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "bundled default template failed to parse ({e}); falling back to single-trace mode",
+                        );
+                        None
+                    }
+                },
+                None => {
+                    log::info!("no bundled default available → single-trace fallback mode");
+                    None
+                }
+            }
         }
     };
 
@@ -2081,6 +2117,7 @@ fn panel_form(
                         Primitive::MagInterference,
                         Primitive::AttitudeRpy,
                         Primitive::Status,
+                        Primitive::InfoText,
                     ] {
                         ui.selectable_value(&mut draft.primitive, p, format!("{p:?}"));
                     }
@@ -2188,6 +2225,7 @@ fn panel_form(
                             StatusKind::FixType,
                             StatusKind::ArmedBool,
                             StatusKind::TextLog,
+                            StatusKind::EkfFlags,
                         ] {
                             ui.selectable_value(
                                 &mut draft.status_kind,

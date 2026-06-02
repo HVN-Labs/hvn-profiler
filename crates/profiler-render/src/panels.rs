@@ -496,7 +496,13 @@ fn render_grid_body(
                 // v0.12.0 — Status primitive carries its source in
                 // `cell.source` (single string) rather than `cell.sources`,
                 // so accept it even when `cell.sources` is empty.
-                if !cell.visible || (cell.sources.is_empty() && cell.primitive != Primitive::Status) {
+                // v0.14.0 — InfoText primitive has no source at all (static
+                // literal text), so also accept empty `sources` for it.
+                if !cell.visible
+                    || (cell.sources.is_empty()
+                        && cell.primitive != Primitive::Status
+                        && cell.primitive != Primitive::InfoText)
+                {
                     continue;
                 }
                 let rect = layout.cell_rect(r, c);
@@ -658,7 +664,8 @@ fn render_grid_body(
                         if cell.visible
                             && runtime_visible
                             && (!cell.sources.is_empty()
-                                || cell.primitive == Primitive::Status) => {
+                                || cell.primitive == Primitive::Status
+                                || cell.primitive == Primitive::InfoText) => {
                         if is_drag_source {
                             // Draw a dashed outline + dimmed fill where the
                             // panel WAS. The actual content paints on the
@@ -1063,6 +1070,11 @@ fn render_cell(
     if cell.primitive == Primitive::Status {
         return render_status_cell(ui, cell, store, cell_rect);
     }
+    // v0.14.0 — InfoText primitive renders static literal text + an optional
+    // icon and the cell's title. No data source is consulted.
+    if cell.primitive == Primitive::InfoText {
+        return render_info_text_cell(ui, cell, cell_rect);
+    }
     let plot_id = format!("cell_{}_{}", cell.row, cell.col);
 
     // Title above the plot — measured so the plot below knows how much height
@@ -1188,6 +1200,254 @@ fn render_cell(
     (any_data, resp.response)
 }
 
+/// v0.14.0 — render an [`Primitive::InfoText`] cell.
+///
+/// Layout (top → bottom):
+/// 1. Optional `cell.icon` painted as a large emoji glyph, centered.
+/// 2. Cell `title`, centered, bold.
+/// 3. Body — `cell.text` rendered with a tiny Markdown-ish syntax:
+///    - `**span**` → bold span inline,
+///    - line starting with `- ` → bullet (`• `) line,
+///    - `\n` → hard line break,
+///    - long lines wrap to the cell width.
+///
+/// No data source is consulted; `cell.sources` / `cell.source` are ignored.
+/// Returns `(false, response)` — InfoText panels are never counted as
+/// `panels_with_data` since they are static literal content.
+pub fn render_info_text_cell(
+    ui: &mut egui::Ui,
+    cell: &Cell,
+    cell_rect: Rect,
+) -> (bool, egui::Response) {
+    // Outer frame: dark slate panel with rounded corners + inner margin.
+    let frame_color = Color32::from_rgb(40, 44, 56);
+    let title_color = Color32::from_gray(230);
+    let body_color = Color32::from_gray(200);
+
+    let resp = ui
+        .scope_builder(
+            UiBuilder::new().max_rect(cell_rect).sense(Sense::click()),
+            |ui| {
+                ui.set_clip_rect(cell_rect);
+                let painter = ui.painter_at(cell_rect);
+                // Background panel.
+                painter.rect_filled(cell_rect.shrink(2.0), 6.0, frame_color);
+
+                let inner_margin: f32 = 12.0;
+                let inner = cell_rect.shrink(inner_margin);
+                let mut y = inner.min.y;
+
+                // 1. Icon (large emoji glyph at the top).
+                if let Some(icon) = cell.icon.as_deref().filter(|s| !s.is_empty()) {
+                    let icon_size = (inner.height() * 0.20).clamp(20.0, 40.0);
+                    painter.text(
+                        Pos2::new(inner.center().x, y),
+                        Align2::CENTER_TOP,
+                        icon,
+                        egui::FontId::proportional(icon_size),
+                        title_color,
+                    );
+                    y += icon_size + 4.0;
+                }
+
+                // 2. Title (bold, centered).
+                if !cell.title.is_empty() {
+                    let title_size = (inner.width() * 0.045).clamp(12.0, 18.0);
+                    painter.text(
+                        Pos2::new(inner.center().x, y),
+                        Align2::CENTER_TOP,
+                        &cell.title,
+                        egui::FontId {
+                            size: title_size,
+                            family: egui::FontFamily::Proportional,
+                        },
+                        title_color,
+                    );
+                    y += title_size + 8.0;
+                }
+
+                // 3. Body text. Render line-by-line; each line may have bold
+                //    spans split on `**` and may begin with `- ` to indicate a
+                //    bullet. Word-wraps to the cell width.
+                if let Some(text) = cell.text.as_deref() {
+                    let body_size = (inner.width() * 0.035).clamp(10.0, 14.0);
+                    let body_font = egui::FontId {
+                        size: body_size,
+                        family: egui::FontFamily::Proportional,
+                    };
+                    let body_font_bold = egui::FontId {
+                        size: body_size,
+                        family: egui::FontFamily::Proportional,
+                    };
+                    let max_w = inner.width();
+                    for raw_line in text.split('\n') {
+                        // Bullet detection: `- ` prefix → render with `• `
+                        // glyph. The remaining text still goes through the
+                        // bold-span parser.
+                        let (prefix, rest) = if let Some(r) = raw_line.strip_prefix("- ") {
+                            ("• ", r)
+                        } else if raw_line == "-" {
+                            ("• ", "")
+                        } else {
+                            ("", raw_line)
+                        };
+                        if y > inner.max.y {
+                            break;
+                        }
+                        // Build a galley from each span and lay them out
+                        // left-to-right, wrapping when we exceed max_w.
+                        let spans = parse_info_text_spans(rest);
+                        let mut x = inner.min.x;
+                        let baseline_y = y;
+                        let mut line_y = baseline_y;
+                        let mut wrote_prefix = false;
+                        for (text_piece, bold) in spans {
+                            // For bullet lines, paint the prefix once at the
+                            // start of the FIRST span.
+                            let mut piece = text_piece.clone();
+                            if !wrote_prefix {
+                                piece = format!("{prefix}{piece}");
+                                wrote_prefix = true;
+                            }
+                            // Word-wrap this piece by laying out a non-wrap
+                            // galley, then if it overflows breaking it word
+                            // by word.
+                            let font = if bold { &body_font_bold } else { &body_font };
+                            // Simple word-wrap: split on spaces.
+                            for word in split_keeping_spaces(&piece) {
+                                let galley = painter.layout_no_wrap(
+                                    word.clone(),
+                                    font.clone(),
+                                    body_color,
+                                );
+                                let w = galley.size().x;
+                                if x + w > inner.min.x + max_w && x > inner.min.x {
+                                    // Wrap.
+                                    line_y += body_size + 2.0;
+                                    x = inner.min.x;
+                                }
+                                if line_y + body_size > inner.max.y {
+                                    break;
+                                }
+                                // Bold simulated by painting the text twice
+                                // with a 1 px horizontal offset (egui's
+                                // default font lacks a bold weight).
+                                painter.galley(Pos2::new(x, line_y), galley.clone(), body_color);
+                                if bold {
+                                    let galley2 = painter.layout_no_wrap(
+                                        word.clone(),
+                                        font.clone(),
+                                        body_color,
+                                    );
+                                    painter.galley(
+                                        Pos2::new(x + 0.6, line_y),
+                                        galley2,
+                                        body_color,
+                                    );
+                                }
+                                x += w;
+                            }
+                        }
+                        // Advance y for the next line. If no spans were
+                        // emitted (e.g. completely blank line), still advance
+                        // a line height so blank lines act as paragraph
+                        // separators.
+                        y = line_y + body_size + 4.0;
+                    }
+                }
+                // Always return false — InfoText cells don't carry "data"
+                // in the rolling-window sense.
+                false
+            },
+        );
+
+    (resp.inner, resp.response)
+}
+
+/// v0.14.0 — parse a single InfoText line into a sequence of
+/// `(text, bold)` spans. `**…**` toggles bold; everything else is regular
+/// weight. Unbalanced `**` is treated as literal.
+///
+/// Exposed for unit testing.
+#[doc(hidden)]
+pub fn parse_info_text_spans(line: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut bold = false;
+    let mut buf = String::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for a `**` toggle.
+        if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            if !buf.is_empty() {
+                out.push((std::mem::take(&mut buf), bold));
+            }
+            bold = !bold;
+            i += 2;
+            continue;
+        }
+        // Take one char (handle UTF-8).
+        let ch_len = utf8_char_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        buf.push_str(&line[i..end]);
+        i = end;
+    }
+    if !buf.is_empty() {
+        out.push((buf, bold));
+    }
+    // If the line was empty, return a single empty span so the caller still
+    // advances the y baseline (preserving blank-line paragraph separators).
+    if out.is_empty() {
+        out.push((String::new(), false));
+    }
+    out
+}
+
+/// Read the byte-length of a UTF-8 character starting at `first_byte`.
+fn utf8_char_len(first_byte: u8) -> usize {
+    if first_byte < 0x80 {
+        1
+    } else if first_byte < 0xC0 {
+        // Continuation byte (shouldn't appear as first) — treat as 1 to
+        // avoid an infinite loop.
+        1
+    } else if first_byte < 0xE0 {
+        2
+    } else if first_byte < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Split a string into whitespace-preserving tokens for word-wrap:
+/// each run of non-whitespace is one token, each run of whitespace is one
+/// token (so trailing spaces survive the layout).
+fn split_keeping_spaces(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_ws: Option<bool> = None;
+    for ch in s.chars() {
+        let is_ws = ch.is_whitespace();
+        match in_ws {
+            None => {
+                cur.push(ch);
+                in_ws = Some(is_ws);
+            }
+            Some(prev) if prev == is_ws => cur.push(ch),
+            Some(_) => {
+                out.push(std::mem::take(&mut cur));
+                cur.push(ch);
+                in_ws = Some(is_ws);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// v0.12.0 — render the [`Primitive::Status`] cell as a colored chip /
 /// text-log instead of an egui_plot panel.
 ///
@@ -1298,6 +1558,15 @@ pub fn render_status_cell(
                     paint_text_log(ui, body_rect, &entries, default_color);
                     !entries.is_empty()
                 }
+                StatusKind::EkfFlags => {
+                    let v = store.latest(key);
+                    let flags = v
+                        .filter(|f| f.is_finite() && *f >= 0.0)
+                        .map(|f| f as u32)
+                        .unwrap_or(0);
+                    paint_ekf_flags(ui, body_rect, flags);
+                    v.is_some()
+                }
             }
         });
 
@@ -1371,6 +1640,71 @@ fn paint_text_log(ui: &egui::Ui, rect: Rect, entries: &[crate::TextLogEntry], de
             color,
         );
         y += line_h;
+    }
+}
+
+/// v0.14.0 — ArduPilot `EKF_STATUS_REPORT.flags` bitfield labels, ordered by
+/// bit index (bit 0 first).
+///
+/// Matches `mavlink/include/common/common.h` `EKF_*` definitions.
+pub const EKF_FLAG_LABELS: [&str; 12] = [
+    "ATTITUDE",
+    "VELOCITY_HORIZ",
+    "VELOCITY_VERT",
+    "POS_HORIZ_REL",
+    "POS_HORIZ_ABS",
+    "POS_VERT_ABS",
+    "POS_VERT_AGL",
+    "CONST_POS_MODE",
+    "PRED_POS_HORIZ_REL",
+    "PRED_POS_HORIZ_ABS",
+    "GPS_GLITCHING",
+    "GPS_QUALITY_GOOD",
+];
+
+/// v0.14.0 — decode an `ekf_flags` bitfield into a list of
+/// `(label, is_set)` pairs in bit-index order. A negative / non-finite raw
+/// value should be passed in as `0` so every bit reads as unset.
+///
+/// Exposed for unit testing — `paint_ekf_flags` uses the same logic.
+#[doc(hidden)]
+pub fn decode_ekf_flags(flags: u32) -> Vec<(&'static str, bool)> {
+    EKF_FLAG_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| (*label, (flags & (1u32 << i)) != 0))
+        .collect()
+}
+
+/// v0.14.0 — paint the EKF-flags multi-row chip: a grid of `● label` rows,
+/// green dot for set bits, gray dot for unset bits.
+fn paint_ekf_flags(ui: &egui::Ui, rect: Rect, flags: u32) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect.shrink(2.0), 4.0, Color32::from_black_alpha(40));
+    let rows = decode_ekf_flags(flags);
+    // Distribute rows vertically. Cap font size so 12 rows fit comfortably.
+    let row_h = ((rect.height() - 8.0) / rows.len() as f32).clamp(10.0, 18.0);
+    let font_size = (row_h * 0.7).clamp(9.0, 13.0);
+    let set_color = Color32::from_rgb(0x2c, 0xa0, 0x2c);
+    let unset_color = Color32::from_gray(90);
+    let label_color = Color32::from_gray(220);
+    let dot_r = (row_h * 0.25).clamp(2.5, 5.0);
+    let mut y = rect.min.y + 6.0;
+    for (label, is_set) in rows.iter() {
+        if y + row_h > rect.max.y {
+            break;
+        }
+        let dot_center = Pos2::new(rect.min.x + 10.0, y + row_h * 0.5);
+        let dot_color = if *is_set { set_color } else { unset_color };
+        painter.circle_filled(dot_center, dot_r, dot_color);
+        painter.text(
+            Pos2::new(rect.min.x + 18.0, y + row_h * 0.5),
+            Align2::LEFT_CENTER,
+            *label,
+            egui::FontId::proportional(font_size),
+            label_color,
+        );
+        y += row_h;
     }
 }
 
@@ -1468,6 +1802,10 @@ pub fn status_cell_color(cell: &Cell, store: &TraceStore) -> Color32 {
             }
         }
         StatusKind::TextLog => default_color,
+        // v0.14.0 — EkfFlags renders a multi-row grid (no single dominant
+        // color); for the test-helper we return the default color so callers
+        // that probe `status_cell_color` get a sensible answer.
+        StatusKind::EkfFlags => default_color,
     }
 }
 
@@ -1544,6 +1882,10 @@ fn draw_primitive(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceSto
         Primitive::StatusBadge => false, // reserved — render nothing
         // Status is handled outside the plot context — never reached here.
         Primitive::Status => false,
+        // v0.14.0 — InfoText is handled outside the plot context too; never
+        // reached here. Also doesn't count toward "any_data" since the panel
+        // is static literal content.
+        Primitive::InfoText => false,
     }
 }
 

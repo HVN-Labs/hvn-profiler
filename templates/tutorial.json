@@ -1,0 +1,80 @@
+{
+  "name": "tutorial",
+  "description": "Welcome layout for first-time users. Mixes a few key live plots with inline instructions.",
+  "figsize": [16, 10],
+  "grid": {"rows": 3, "cols": 3},
+  "subplots_adjust": {"left": 0.04, "right": 0.96, "top": 0.94, "bottom": 0.06, "hspace": 0.7, "wspace": 0.35},
+  "cells": [
+    {
+      "row": 0, "col": 0,
+      "title": "Welcome",
+      "primitive": "info_text",
+      "icon": "👋",
+      "text": "This is the **hvn-profiler** default layout.\n\n- **+ Add Panel** to add new plots\n- Right-click a panel for edit / hide / delete\n- Drag panels to reorder\n- Ctrl+Z to undo, Ctrl+S to save"
+    },
+    {
+      "row": 0, "col": 1,
+      "title": "Flight mode",
+      "primitive": "status",
+      "source": "flight_mode",
+      "kind": "text",
+      "color_map": {
+        "GUIDED": "#1f77b4", "LOITER": "#2ca02c", "STABILIZE": "#888888",
+        "RTL": "#d62728", "AUTO": "#9467bd", "LAND": "#ff7f0e", "ALT_HOLD": "#17becf"
+      },
+      "default_color": "#aaaaaa"
+    },
+    {
+      "row": 0, "col": 2,
+      "title": "Armed",
+      "primitive": "status",
+      "source": "armed",
+      "kind": "armed_bool",
+      "default_color": "#888888"
+    },
+    {
+      "row": 1, "col": 0,
+      "title": "Altitude [m]",
+      "primitive": "scalar",
+      "sources": [{"key": "ap_vfr_alt", "fallback": "state_alt", "color": "#1f77b4"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 1,
+      "title": "Attitude [deg]",
+      "primitive": "vector",
+      "sources": [{"key": "ap_attitude", "transform": "rad_to_deg"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 2,
+      "title": "GPS fix",
+      "primitive": "status",
+      "source": "fix_type",
+      "kind": "fix_type",
+      "default_color": "#aaaaaa"
+    },
+    {
+      "row": 2, "col": 0,
+      "title": "Battery [V]",
+      "primitive": "scalar",
+      "sources": [{"key": "battery_voltage", "color": "#2ca02c"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 2, "col": 1,
+      "title": "EKF compass variance",
+      "primitive": "scalar",
+      "sources": [{"key": "ekf_compv", "color": "#d62728"}],
+      "label_mode": "off"
+    },
+    {
+      "row": 2, "col": 2,
+      "title": "Status log",
+      "primitive": "status",
+      "source": "statustexts",
+      "kind": "text_log",
+      "default_color": "#444444"
+    }
+  ]
+}

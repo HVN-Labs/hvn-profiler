@@ -230,6 +230,10 @@ pub fn default_status_kind(key: &str, shape: &ValueShape) -> Option<StatusKind> 
     if base == "statustexts" {
         return Some(StatusKind::TextLog);
     }
+    // v0.14.0 — ArduPilot EKF_STATUS_REPORT.flags bitfield.
+    if base == "ekf_flags" {
+        return Some(StatusKind::EkfFlags);
+    }
     match shape {
         ValueShape::String => Some(StatusKind::Text),
         ValueShape::Bool => Some(StatusKind::ArmedBool),

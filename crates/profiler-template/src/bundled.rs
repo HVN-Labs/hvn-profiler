@@ -4,15 +4,19 @@
 //! text is embedded at compile time via `include_str!` so a release tarball
 //! doesn't need to carry the `templates/` directory alongside the binary.
 //!
-//! ## Why these two?
+//! ## Why these three?
 //!
+//! - `tutorial`    — v0.14.0 welcome layout (3x3) for first-time users. Mixes
+//!   live plots (altitude, attitude, battery) with `info_text` instructional
+//!   panels. **Bundled default**: when no `--template` is passed on the CLI,
+//!   this is what loads.
 //! - `hvn-default` — the SITL-default 7x3 grid (truth/gps/ekf/dr trails). Used
-//!   by every SITL smoke test.
+//!   by every SITL smoke test. Still available in the picker for power users.
 //! - `real-drone`  — the same grid with DT-only panels (wind, mag interference,
 //!   truth trails) stripped, for HIL / real-airframe sessions where DT ground
 //!   truth isn't available.
 //!
-//! Both are also present at the repo root in `templates/` for editing /
+//! All three are also present at the repo root in `templates/` for editing /
 //! diffing; the constants below are kept in sync by `include_str!`.
 
 /// One bundled template descriptor: `(name, raw_json)`.
@@ -24,6 +28,10 @@ pub struct BundledTemplate {
     pub json: &'static str,
 }
 
+/// v0.14.0 — Raw JSON for the tutorial template (bundled). First-run default.
+pub const TUTORIAL_JSON: &str =
+    include_str!("../../../templates/tutorial.json");
+
 /// Raw JSON for the SITL-default template (bundled).
 pub const HVN_DEFAULT_JSON: &str =
     include_str!("../../../templates/hvn-default.json");
@@ -32,8 +40,21 @@ pub const HVN_DEFAULT_JSON: &str =
 pub const REAL_DRONE_JSON: &str =
     include_str!("../../../templates/real-drone.json");
 
+/// v0.14.0 — Name of the implicit-default bundled template when no
+/// `--template` is supplied and no recently-used user template exists.
+/// Always present in [`BUNDLED`] and at index 0.
+pub const DEFAULT_BUNDLED_NAME: &str = "tutorial";
+
 /// All bundled templates the picker should surface, in display order.
+///
+/// v0.14.0: `tutorial` is the first entry and the implicit default — the CLI
+/// loads it when no `--template` flag is given. `hvn-default` (full 7x3 +
+/// 3D view) remains available in the picker for power users.
 pub const BUNDLED: &[BundledTemplate] = &[
+    BundledTemplate {
+        name: "tutorial",
+        json: TUTORIAL_JSON,
+    },
     BundledTemplate {
         name: "hvn-default",
         json: HVN_DEFAULT_JSON,
@@ -65,6 +86,7 @@ mod tests {
 
     #[test]
     fn by_name_finds_each_bundled() {
+        assert!(by_name("tutorial").is_some());
         assert!(by_name("hvn-default").is_some());
         assert!(by_name("real-drone").is_some());
         assert!(by_name("does-not-exist").is_none());
@@ -73,5 +95,11 @@ mod tests {
     #[test]
     fn bundled_registry_has_at_least_two_entries() {
         assert!(BUNDLED.len() >= 2);
+    }
+
+    #[test]
+    fn tutorial_is_first_and_is_default() {
+        assert_eq!(BUNDLED[0].name, "tutorial");
+        assert_eq!(DEFAULT_BUNDLED_NAME, "tutorial");
     }
 }

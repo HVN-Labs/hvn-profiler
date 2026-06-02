@@ -5,7 +5,7 @@
 //! - bundled templates always come first in the registry
 //! - looking up a bundled template by name yields the right JSON
 
-use profiler_template::{bundled, scan_user_templates, Template, TemplateOrigin};
+use profiler_template::{bundled, scan_user_templates, Primitive, Template, TemplateOrigin};
 
 #[test]
 fn scan_returns_two_user_templates() {
@@ -51,6 +51,53 @@ fn bundled_json_parses_into_template() {
         });
         assert_eq!(t.name, b.name);
     }
+}
+
+#[test]
+fn tutorial_is_first_bundled_entry() {
+    // v0.14.0: tutorial is the implicit default; it must lead the BUNDLED
+    // registry so the picker shows it first.
+    assert_eq!(
+        bundled::BUNDLED[0].name,
+        "tutorial",
+        "BUNDLED[0] must be the tutorial template (v0.14.0 default)",
+    );
+    assert_eq!(bundled::DEFAULT_BUNDLED_NAME, "tutorial");
+}
+
+#[test]
+fn tutorial_parses_cleanly() {
+    let b = bundled::by_name("tutorial").expect("tutorial in registry");
+    let t = Template::from_str(b.json).expect("tutorial parses");
+    assert_eq!(t.name, "tutorial");
+    assert!(t.grid.rows >= 1);
+    assert!(t.grid.cols >= 1);
+    // Sanity: at least the welcome panel is laid out.
+    assert!(!t.cells.is_empty(), "tutorial has at least one cell");
+}
+
+#[test]
+fn tutorial_has_info_text_and_status_cells() {
+    let b = bundled::by_name("tutorial").expect("tutorial in registry");
+    let t = Template::from_str(b.json).expect("tutorial parses");
+    let info_text_count = t
+        .cells
+        .iter()
+        .filter(|c| c.primitive == Primitive::InfoText)
+        .count();
+    let status_count = t
+        .cells
+        .iter()
+        .filter(|c| c.primitive == Primitive::Status)
+        .count();
+    assert!(
+        info_text_count >= 1,
+        "tutorial must have at least one InfoText cell, found {info_text_count}",
+    );
+    assert!(
+        status_count >= 3,
+        "tutorial must have at least 3 Status cells, found {status_count}",
+    );
 }
 
 #[test]

@@ -156,6 +156,12 @@ pub enum Primitive {
     /// (flight mode string, armed bool, GPS fix type, status-text rolling log).
     /// See [`Cell::status`] for the config.
     Status,
+    /// v0.14.0 — static literal-text panel. Renders [`Cell::text`] (with simple
+    /// Markdown — `**bold**`, `\n` line breaks, `- bullet` lines) under an
+    /// optional [`Cell::icon`] emoji and the cell title. No data source — the
+    /// primitive ignores `sources` / `source` and reads only `text` / `icon`.
+    /// Used to embed instructional / welcome panels in templates.
+    InfoText,
 }
 
 /// Per-panel label overlay mode.
@@ -243,6 +249,17 @@ pub struct Cell {
     /// the value is unknown / unmapped. Defaults to `#aaa` (light gray).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_color: Option<String>,
+    /// v0.14.0 — for [`Primitive::InfoText`] cells: literal Markdown-ish text
+    /// to render. Supports `**bold**`, line breaks (`\n`), and bullet lines
+    /// (a line starting with `- ` becomes `• `). Optional on every other
+    /// primitive; existing templates without this key parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// v0.14.0 — for [`Primitive::InfoText`] cells: optional emoji / glyph
+    /// prefix shown at the top of the panel (e.g. `"👋"`). Optional on every
+    /// other primitive; existing templates without this key parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// v0.12.0 — kind discriminant for the `status` primitive.
@@ -269,6 +286,10 @@ pub enum StatusKind {
     /// Render the latest N statustext entries from a rolling buffer
     /// (newest first), colored by severity.
     TextLog,
+    /// v0.14.0 — render an `EKF_STATUS_REPORT.flags` bitfield as a vertical
+    /// list of `● FLAG_NAME` rows: green dot for set bits, gray dot for
+    /// unset bits. The source is the integer-valued `ekf_flags` key.
+    EkfFlags,
 }
 
 fn default_true() -> bool {

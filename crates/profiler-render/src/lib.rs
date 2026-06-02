@@ -29,12 +29,13 @@ pub use faults::{
 pub use gen_panel::{render_gen_panel, GeneratorPanelState, SLIDER_TARGETS};
 pub use generators::{Generator, Waveform};
 pub use panels::{
-    build_label_text, compute_overlay_pos, format_value_pub, layout_cell_rects,
-    overlay_box_size, render_status_cell, render_template_grid, render_template_grid_full,
+    build_label_text, compute_overlay_pos, decode_ekf_flags, format_value_pub,
+    layout_cell_rects, overlay_box_size, parse_info_text_spans, render_info_text_cell,
+    render_status_cell, render_template_grid, render_template_grid_full,
     render_template_grid_with_override, responsive_cell_rects, responsive_grid_dims,
     status_cell_color, status_fix_type_chip, status_severity_color, CellMenuAction,
-    GridRenderOptions, GridStats, LabelOverride, PanelState, RESPONSIVE_3D_COLLAPSE_W,
-    RESPONSIVE_MIN_CELL_W, RESPONSIVE_SINGLE_COL_W,
+    EKF_FLAG_LABELS, GridRenderOptions, GridStats, LabelOverride, PanelState,
+    RESPONSIVE_3D_COLLAPSE_W, RESPONSIVE_MIN_CELL_W, RESPONSIVE_SINGLE_COL_W,
 };
 pub use view3d::{render_view3d, render_view3d_with_override, OrbitCamera, View3dState, View3dStats};
 
