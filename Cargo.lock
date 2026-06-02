@@ -2996,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-cli"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-render"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "egui",
  "egui_plot",
@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-source"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -3045,7 +3045,7 @@ dependencies = [
 
 [[package]]
 name = "profiler-template"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "anyhow",
  "dirs",

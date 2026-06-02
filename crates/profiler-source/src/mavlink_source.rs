@@ -49,8 +49,9 @@
 //! another GCS that's already issuing the stream requests, or when listening
 //! to a `mavlinkrouter` fan-out that mustn't see profiler traffic.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use std::time::{Duration, Instant};
@@ -65,7 +66,7 @@ use mavlink::dialects::ardupilotmega::{MavAutopilot, MavMessage, MavType, HEARTB
 use mavlink::dialects::ardupilotmega::REQUEST_DATA_STREAM_DATA;
 use mavlink::{MavConnection, MavHeader};
 
-use crate::{Sample, Source};
+use crate::{Sample, TextLogEntry, Value, Source};
 
 /// Channel capacity. A real vehicle streams ~10–50 Hz across a handful of
 /// message types (≈ tens of keys per second), so this is ~hours of headroom —
@@ -85,6 +86,56 @@ const HEARTBEAT_PERIOD: Duration = Duration::from_secs(1);
 /// HEARTBEAT in non-passive mode. Stream id `0` = `MAV_DATA_STREAM_ALL`.
 const REQUEST_STREAM_ALL: u8 = 0;
 const REQUEST_STREAM_RATE_HZ: u16 = 10;
+
+/// v0.16.3 — `STATUSTEXT` rolling-buffer depth. Mission Planner shows the last
+/// ~5 lines in its MAVLink Inspector → MESSAGES tab; 8 gives us a little
+/// headroom and matches the streamer-side `_STATUSTEXT_MAX` in DT-Python's
+/// `hil_bridge.py`.
+const STATUSTEXT_MAX: usize = 8;
+
+/// v0.16.3 — `HEARTBEAT.base_mode` bit that flags vehicle as armed. The
+/// mavlink crate exposes it as [`MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED`]
+/// (`0x80`); we keep the raw constant here for the bit-test fast path.
+const MAV_MODE_FLAG_SAFETY_ARMED: u8 = 0x80;
+
+/// v0.16.3 — ArduCopter `HEARTBEAT.custom_mode` → flight-mode-name lookup.
+///
+/// Copied verbatim from DT-Python's `hil_bridge.py:_COPTER_MODE_NAMES`. The
+/// streamer-side parity matters: when a profiler cell binds `flight_mode` to
+/// a colour map (e.g. `GUIDED → blue`), the same human-readable strings must
+/// arrive whether the data came through ZMQ or direct MAVLink.
+///
+/// Plane / Rover / Sub get a `MODE_<n>` fallback — out of scope for v0.16.3.
+fn copter_mode_name(custom_mode: u32) -> String {
+    match custom_mode {
+        0 => "STABILIZE".into(),
+        1 => "ACRO".into(),
+        2 => "ALT_HOLD".into(),
+        3 => "AUTO".into(),
+        4 => "GUIDED".into(),
+        5 => "LOITER".into(),
+        6 => "RTL".into(),
+        7 => "CIRCLE".into(),
+        9 => "LAND".into(),
+        11 => "DRIFT".into(),
+        13 => "SPORT".into(),
+        14 => "FLIP".into(),
+        15 => "AUTOTUNE".into(),
+        16 => "POSHOLD".into(),
+        17 => "BRAKE".into(),
+        18 => "THROW".into(),
+        19 => "AVOID_ADSB".into(),
+        20 => "GUIDED_NOGPS".into(),
+        21 => "SMART_RTL".into(),
+        22 => "FLOWHOLD".into(),
+        23 => "FOLLOW".into(),
+        24 => "ZIGZAG".into(),
+        25 => "SYSTEMID".into(),
+        26 => "AUTOROTATE".into(),
+        27 => "AUTO_RTL".into(),
+        n => format!("MODE_{n}"),
+    }
+}
 
 /// v0.8.0 — runtime knobs for [`MavlinkSource`]. `passive=true` falls back to
 /// the v0.4.0 listen-only behaviour (no heartbeat sender, no stream request).
@@ -172,12 +223,21 @@ impl MavlinkSource {
         // it (informational) so the log shows the learned peer once.
         let peer = Arc::new(std::sync::Mutex::new(None::<(u8, u8)>));
 
+        // v0.16.3 — STATUSTEXT rolling buffer. Every inbound STATUSTEXT frame
+        // appends to this deque (capacity STATUSTEXT_MAX, oldest dropped on
+        // overflow); each emitted `statustexts` sample carries the full
+        // snapshot so downstream `TextLog` consumers receive the
+        // most-recent N lines on every push, just like the DT-Python bridge.
+        let statustext_buf: Arc<Mutex<VecDeque<TextLogEntry>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(STATUSTEXT_MAX)));
+
         let conn_recv = Arc::clone(&conn);
         let stop_recv = Arc::clone(&stop_flag);
         let peer_recv = Arc::clone(&peer);
+        let statustext_recv = Arc::clone(&statustext_buf);
         let recv_worker = thread::Builder::new()
             .name("profiler-mavlink-rx".into())
-            .spawn(move || recv_worker_main(conn_recv, tx, opts, stop_recv, peer_recv))
+            .spawn(move || recv_worker_main(conn_recv, tx, opts, stop_recv, peer_recv, statustext_recv))
             .context("spawning MAVLink recv worker thread")?;
 
         let hb_worker = if passive {
@@ -229,6 +289,7 @@ fn recv_worker_main(
     opts: MavlinkOptions,
     stop: Arc<AtomicBool>,
     peer: Arc<std::sync::Mutex<Option<(u8, u8)>>>,
+    statustext_buf: Arc<Mutex<VecDeque<TextLogEntry>>>,
 ) {
     // `Instant` captured at thread start gives us a monotonic-ish stream
     // clock: `ts` is seconds since the first byte the worker was ready for.
@@ -301,7 +362,12 @@ fn recv_worker_main(
         };
 
         let ts = started.elapsed().as_secs_f64();
-        for s in decode_to_samples_with_drone(&msg, ts, Some(Arc::clone(&drone_name))) {
+        for s in decode_to_samples_with_state(
+            &msg,
+            ts,
+            Some(Arc::clone(&drone_name)),
+            Some(&statustext_buf),
+        ) {
             match tx.try_send(s) {
                 Ok(()) => decoded += 1,
                 Err(TrySendError::Full(_)) => {
@@ -417,33 +483,66 @@ fn is_fatal(e: &mavlink::error::MessageReadError) -> bool {
 /// Split out from [`worker_main`] so unit tests can construct messages
 /// in-memory and assert the emitted keys/values without any socket.
 ///
-/// Message → key mapping:
-/// - `ATTITUDE` → `ap_attitude[0..2]` = roll, pitch, yaw (radians).
-/// - `LOCAL_POSITION_NED` → `pos_ekf_ned[0..2]` = x, y, z and `ap_vel_ned[0..2]` = vx, vy, vz.
-/// - `RAW_IMU` → `ap_raw_imu[0..5]` = xacc, yacc, zacc, xgyro, ygyro, zgyro. **Raw sensor units** (accel int16 counts, gyro mrad/s) — passed through as-is; the consumer rescales.
-/// - `VFR_HUD` → `ap_vfr_alt` = alt (m, MSL).
-/// - `POSITION_TARGET_LOCAL_NED` → `pos_target_ned[0..2]` = x, y, z.
-/// - `GLOBAL_POSITION_INT` → `gps_alt` (m), `ap_vel_ned[0..2]` (m/s, cm/s → m/s),
-///   plus `gps_lat` / `gps_lon` (degrees) for completeness. **v0.8.0** —
-///   added so a stock-stream vehicle has at least altitude + velocity even
-///   before the rich streams wake.
-/// - `GPS_RAW_INT` → `gps_alt`, `gps_lat`, `gps_lon`, plus `gps_vn` (cm/s →
-///   m/s) when the cog/vel scalars are valid. **v0.8.0** — used as the
-///   altitude source on stock-stream vehicles.
-/// - Everything else (SCALED_IMU2/3, HEARTBEAT, …) is ignored for now.
+/// v0.16.3 — expanded from 4 → 16+ message types to reach parity with
+/// DT-Python's `hil_bridge.py`. The full key set is documented in
+/// [`decode_to_samples_with_state`]; the no-state variant here cannot
+/// surface `statustexts` (it has no rolling buffer to share across frames)
+/// but every other key is produced identically.
 pub fn decode_to_samples(msg: &MavMessage, ts: f64) -> Vec<Sample> {
-    decode_to_samples_with_drone(msg, ts, None)
+    decode_to_samples_with_state(msg, ts, None, None)
 }
 
 /// v0.10.0 — like [`decode_to_samples`] but stamps each emitted [`Sample`]
-/// with the supplied `drone_name`. The recv worker derives the name from each
-/// MAVLink frame's `system_id` (or from `MavlinkOptions::drone_name_override`)
-/// so a single leg carrying multiple vehicles fans out into distinct per-drone
-/// streams downstream.
+/// with the supplied `drone_name`. Retained for backwards compatibility with
+/// pre-v0.16.3 call sites; new code should prefer [`decode_to_samples_with_state`]
+/// which also accepts the shared `STATUSTEXT` rolling buffer.
 pub fn decode_to_samples_with_drone(
     msg: &MavMessage,
     ts: f64,
     drone_name: Option<Arc<str>>,
+) -> Vec<Sample> {
+    decode_to_samples_with_state(msg, ts, drone_name, None)
+}
+
+/// v0.16.3 — full-vocabulary decoder mirroring DT-Python's `hil_bridge.py`.
+///
+/// Key conventions (matching `KNOWN_HVN_SITL_KEYS` in `editor.rs` and the
+/// streamer envelope shape):
+///
+/// | MAVLink | Key(s) |
+/// |---|---|
+/// | `ATTITUDE` | `ap_attitude[0..2]` |
+/// | `RAW_IMU` | `ap_raw_imu[0..5]` (raw counts) |
+/// | `LOCAL_POSITION_NED` | `pos_ekf_ned[0..2]`, `ap_vel_ned[0..2]` |
+/// | `POSITION_TARGET_LOCAL_NED` | `pos_target_ned[0..2]` |
+/// | `VFR_HUD` | `ap_vfr_alt` |
+/// | `GLOBAL_POSITION_INT` | `gps_alt`, `ap_vel_ned[0..2]`, `gps_lat`, `gps_lon` |
+/// | `GPS_RAW_INT` | `gps_alt`, `gps_lat`, `gps_lon`, `gps_vn`, `fix_type` |
+/// | `EKF_STATUS_REPORT` | `ekf_flags`, `ekf_velv`, `ekf_pos_horiz`, `ekf_pos_vert`, `ekf_compv`, `ekf_terralt` |
+/// | `AHRS2` | `ahrs2_roll`, `ahrs2_pitch`, `ahrs2_yaw`, `ahrs2_alt`, `ahrs2_lat`, `ahrs2_lng` |
+/// | `VIBRATION` | `vibex`, `vibey`, `vibez`, `vibeclip0..2` |
+/// | `SCALED_IMU2/3` | `scaled_imu2[0..9]` / `scaled_imu3[0..9]` (Vec[10]) + Vector sample |
+/// | `SCALED_PRESSURE` | `press_scaled[0..2]` (abs / diff / temp) + Vector sample |
+/// | `SCALED_PRESSURE2` | `press_scaled2[0..2]` + Vector sample |
+/// | `BATTERY_STATUS` | `battery_voltage`, `battery_current`, `battery_remaining` |
+/// | `ESC_STATUS` | `esc_rpm[0..3]`, `esc_voltage[0..3]`, `esc_current[0..3]` (first 4 ESCs) + Vector samples |
+/// | `RC_CHANNELS` | `rc_channels[0..15]`, `rc_rssi`, plus IntVector sample |
+/// | `SERVO_OUTPUT_RAW` | `servo_outputs[0..15]` (padded to 16), plus IntVector sample |
+/// | `NAV_CONTROLLER_OUTPUT` | `nav_roll`, `nav_pitch`, `nav_bearing`, `target_bearing`, `wp_dist`, `alt_error`, `aspd_error`, `xtrack_error` |
+/// | `SYS_STATUS` | `sys_load` (load‰), `sys_drop_rate_comm`, `sys_errors[0..3]` + IntVector sample |
+/// | `STATUSTEXT` | `statustexts` `TextLog` (rolling buffer, capacity 8) |
+/// | `HEARTBEAT` | `armed` `Bool`, `flight_mode` `String` (copter mode table) |
+///
+/// Units mirror the streamer-side wire format: floats kept as-is, integer
+/// scaling normalised once (mm→m, cm→A, deg×1e-7→deg). For `BATTERY_STATUS`
+/// the voltage is summed across all valid cell entries in `voltages[]`
+/// (mV per cell, `0xFFFF` = unused), then divided by 1000 — same convention
+/// `hil_bridge.py` uses.
+pub fn decode_to_samples_with_state(
+    msg: &MavMessage,
+    ts: f64,
+    drone_name: Option<Arc<str>>,
+    statustext_buf: Option<&Arc<Mutex<VecDeque<TextLogEntry>>>>,
 ) -> Vec<Sample> {
     // v0.10.1 — one shared `Arc<str>` across every emitted sample; the
     // closure just bumps the refcount instead of allocating a `String`.
@@ -453,6 +552,12 @@ pub fn decode_to_samples_with_drone(
         value,
         drone_name.as_ref().map(Arc::clone),
     );
+    let make = |key: &str, value: Value| Sample {
+        ts,
+        key: key.to_string(),
+        value,
+        drone_name: drone_name.as_ref().map(Arc::clone),
+    };
     match msg {
         MavMessage::ATTITUDE(d) => vec![
             s("ap_attitude[0]", d.roll as f64),
@@ -492,16 +597,301 @@ pub fn decode_to_samples_with_drone(
             s("gps_lat", d.lat as f64 / 1e7),
             s("gps_lon", d.lon as f64 / 1e7),
         ],
-        // GPS_RAW_INT: alt in mm, vel in cm/s, lat/lon * 1e7.
+        // GPS_RAW_INT: alt in mm, vel in cm/s, lat/lon * 1e7. v0.16.3 — also
+        // surface `fix_type` so the status primitive can colour by lock
+        // quality (3=3D, 4=DGPS, 5=RTK float, 6=RTK fixed).
         MavMessage::GPS_RAW_INT(d) => vec![
             s("gps_alt", d.alt as f64 / 1_000.0),
             s("gps_lat", d.lat as f64 / 1e7),
             s("gps_lon", d.lon as f64 / 1e7),
             s("gps_vn", d.vel as f64 / 100.0),
+            // `fix_type` is an enum on the wire; cast through u8 via the
+            // bitflags-style `From` conversion the mavlink crate exposes for
+            // every C-enum (`as u8` works because the discriminants are
+            // defined in spec order — but the safe route is the explicit
+            // primitive cast on the FromPrimitive-derived enum).
+            s("fix_type", d.fix_type as u8 as f64),
         ],
-        // SCALED_IMU2/3, HEARTBEAT, SYS_STATUS, … — not plotted.
+        // v0.16.3 — EKF health (Mission Planner "EKF bars" in the HUD).
+        MavMessage::EKF_STATUS_REPORT(d) => vec![
+            // `flags` is a bitflags `EkfStatusFlags : u16`; bits() yields the
+            // raw u16 so a profiler cell with `key: "ekf_flags"` and a chip
+            // renderer can decompose them downstream.
+            s("ekf_flags", d.flags.bits() as f64),
+            s("ekf_velv", d.velocity_variance as f64),
+            s("ekf_pos_horiz", d.pos_horiz_variance as f64),
+            s("ekf_pos_vert", d.pos_vert_variance as f64),
+            s("ekf_compv", d.compass_variance as f64),
+            s("ekf_terralt", d.terrain_alt_variance as f64),
+        ],
+        // v0.16.3 — Secondary AHRS estimate (DCM-based). Useful for sanity
+        // checking the primary EKF roll/pitch/yaw.
+        MavMessage::AHRS2(d) => vec![
+            s("ahrs2_roll", d.roll as f64),
+            s("ahrs2_pitch", d.pitch as f64),
+            s("ahrs2_yaw", d.yaw as f64),
+            s("ahrs2_alt", d.altitude as f64),
+            s("ahrs2_lat", d.lat as f64 / 1e7),
+            s("ahrs2_lng", d.lng as f64 / 1e7),
+        ],
+        // v0.16.3 — Vibration. `vibration_{x,y,z}` are m/s² standard deviation;
+        // `clipping_{0,1,2}` are uint32 counts of accel saturations on the
+        // first 3 IMUs (cumulative since boot).
+        MavMessage::VIBRATION(d) => vec![
+            s("vibex", d.vibration_x as f64),
+            s("vibey", d.vibration_y as f64),
+            s("vibez", d.vibration_z as f64),
+            s("vibeclip0", d.clipping_0 as f64),
+            s("vibeclip1", d.clipping_1 as f64),
+            s("vibeclip2", d.clipping_2 as f64),
+        ],
+        // v0.16.3 — secondary / tertiary IMUs. Mirror DT-Python's SI
+        // conversion on capture (accel mG→m/s², gyro mrad/s→rad/s, temp
+        // cdegC→degC) so cells reading `scaled_imu2[6]` (mx) see mgauss as
+        // emitted by AP and cells reading `scaled_imu2[9]` (temp) see degC.
+        // The mavlink-0.18 dialect omits the `temperature` extension on
+        // SCALED_IMU2/3 — we pad the 10th component with 0 to keep the Vec[10]
+        // shape DT-Python's bridge ships (consumers index by position).
+        MavMessage::SCALED_IMU2(d) => scaled_imu_samples("scaled_imu2", d.xacc, d.yacc, d.zacc, d.xgyro, d.ygyro, d.zgyro, d.xmag, d.ymag, d.zmag, 0, ts, &drone_name),
+        MavMessage::SCALED_IMU3(d) => scaled_imu_samples("scaled_imu3", d.xacc, d.yacc, d.zacc, d.xgyro, d.ygyro, d.zgyro, d.xmag, d.ymag, d.zmag, 0, ts, &drone_name),
+        // v0.16.3 — barometric pressure sensors. press_abs hPa, press_diff
+        // hPa (pitot), temperature cdegC (passed through as the raw 0.01°C
+        // count — consumers can divide by 100).
+        MavMessage::SCALED_PRESSURE(d) => press_scaled_samples("press_scaled", d.press_abs, d.press_diff, d.temperature, ts, &drone_name),
+        MavMessage::SCALED_PRESSURE2(d) => press_scaled_samples("press_scaled2", d.press_abs, d.press_diff, d.temperature, ts, &drone_name),
+        // v0.16.3 — battery: cell-voltage sum (mV per cell, 0xFFFF=unused),
+        // current_battery in cA → A, battery_remaining in %.
+        MavMessage::BATTERY_STATUS(d) => {
+            let mut v_mv: u32 = 0;
+            for &cell_mv in d.voltages.iter() {
+                if cell_mv != 0 && cell_mv != u16::MAX {
+                    v_mv = v_mv.saturating_add(cell_mv as u32);
+                }
+            }
+            let voltage_v = v_mv as f64 / 1000.0;
+            let current_a = d.current_battery as f64 / 100.0;
+            vec![
+                s("battery_voltage", voltage_v),
+                s("battery_current", current_a),
+                s("battery_remaining", d.battery_remaining as f64),
+            ]
+        }
+        // v0.16.3 — ESC status, first 4 motors only. Emit per-index scalars
+        // + a Vec[4] sample so cells can bind either style.
+        MavMessage::ESC_STATUS(d) => {
+            let rpm: Vec<f64> = d.rpm.iter().map(|&v| v as f64).collect();
+            let voltage: Vec<f64> = d.voltage.iter().map(|&v| v as f64).collect();
+            let current: Vec<f64> = d.current.iter().map(|&v| v as f64).collect();
+            let mut out = Vec::with_capacity(15);
+            for (i, &v) in rpm.iter().enumerate() {
+                out.push(s(&format!("esc_rpm[{i}]"), v));
+            }
+            for (i, &v) in voltage.iter().enumerate() {
+                out.push(s(&format!("esc_voltage[{i}]"), v));
+            }
+            for (i, &v) in current.iter().enumerate() {
+                out.push(s(&format!("esc_current[{i}]"), v));
+            }
+            out.push(make("esc_rpm", Value::Vector(rpm)));
+            out.push(make("esc_voltage", Value::Vector(voltage)));
+            out.push(make("esc_current", Value::Vector(current)));
+            out
+        }
+        // v0.16.3 — RC channels. 16 entries (the mavlink-0.18 dialect exposes
+        // chan1..chan18; we cap at 16 for parity with `KNOWN_HVN_SITL_KEYS`).
+        MavMessage::RC_CHANNELS(d) => {
+            let channels: [u16; 16] = [
+                d.chan1_raw, d.chan2_raw, d.chan3_raw, d.chan4_raw,
+                d.chan5_raw, d.chan6_raw, d.chan7_raw, d.chan8_raw,
+                d.chan9_raw, d.chan10_raw, d.chan11_raw, d.chan12_raw,
+                d.chan13_raw, d.chan14_raw, d.chan15_raw, d.chan16_raw,
+            ];
+            let mut out = Vec::with_capacity(18);
+            for (i, &v) in channels.iter().enumerate() {
+                out.push(s(&format!("rc_channels[{i}]"), v as f64));
+            }
+            out.push(make(
+                "rc_channels",
+                Value::IntVector(channels.iter().map(|&v| v as i64).collect()),
+            ));
+            out.push(s("rc_rssi", d.rssi as f64));
+            out
+        }
+        // v0.16.3 — servo outputs. mavlink-0.18 exposes only servo1..8; pad
+        // to 16 with 0 so the wire shape matches DT-Python's emitter (which
+        // sees 16 from pymavlink's extended dialect).
+        MavMessage::SERVO_OUTPUT_RAW(d) => {
+            let servos: [u16; 16] = [
+                d.servo1_raw, d.servo2_raw, d.servo3_raw, d.servo4_raw,
+                d.servo5_raw, d.servo6_raw, d.servo7_raw, d.servo8_raw,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            let mut out = Vec::with_capacity(17);
+            for (i, &v) in servos.iter().enumerate() {
+                out.push(s(&format!("servo_outputs[{i}]"), v as f64));
+            }
+            out.push(make(
+                "servo_outputs",
+                Value::IntVector(servos.iter().map(|&v| v as i64).collect()),
+            ));
+            out
+        }
+        // v0.16.3 — Position controller targets. nav_roll/pitch deg,
+        // *_bearing deg, wp_dist m, alt_error m, aspd_error m/s, xtrack_error m.
+        MavMessage::NAV_CONTROLLER_OUTPUT(d) => vec![
+            s("nav_roll", d.nav_roll as f64),
+            s("nav_pitch", d.nav_pitch as f64),
+            s("nav_bearing", d.nav_bearing as f64),
+            s("target_bearing", d.target_bearing as f64),
+            s("wp_dist", d.wp_dist as f64),
+            s("alt_error", d.alt_error as f64),
+            s("aspd_error", d.aspd_error as f64),
+            s("xtrack_error", d.xtrack_error as f64),
+        ],
+        // v0.16.3 — System status. load is permille (0–1000); drop_rate_comm
+        // is permille; errors_count* are uint16 per-link error counters.
+        MavMessage::SYS_STATUS(d) => {
+            let errs: [u16; 4] = [d.errors_count1, d.errors_count2, d.errors_count3, d.errors_count4];
+            let mut out = Vec::with_capacity(7);
+            out.push(s("sys_load", d.load as f64));
+            out.push(s("sys_drop_rate_comm", d.drop_rate_comm as f64));
+            for (i, &v) in errs.iter().enumerate() {
+                out.push(s(&format!("sys_errors[{i}]"), v as f64));
+            }
+            out.push(make(
+                "sys_errors",
+                Value::IntVector(errs.iter().map(|&v| v as i64).collect()),
+            ));
+            out
+        }
+        // v0.16.3 — STATUSTEXT rolling buffer. We need a shared
+        // `Arc<Mutex<VecDeque<TextLogEntry>>>` carried by the source so the
+        // most-recent N entries accumulate across frames. Without it the
+        // decoder still extracts the single entry but emits no sample —
+        // the no-state caller has nowhere to keep the history.
+        MavMessage::STATUSTEXT(d) => {
+            let text_str = d.text.to_str().unwrap_or("").trim_end_matches('\0').to_string();
+            // `severity` is an enum (`MavSeverity`) discriminant 0..7; raw cast.
+            let severity = d.severity as u8;
+            let entry = TextLogEntry {
+                severity,
+                text: Arc::from(text_str.as_str()),
+                ts,
+            };
+            match statustext_buf {
+                Some(buf) => {
+                    let snapshot = {
+                        let mut g = match buf.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if g.len() >= STATUSTEXT_MAX {
+                            g.pop_front();
+                        }
+                        g.push_back(entry);
+                        // Snapshot the full deque oldest→newest. Cheap (≤ 8 entries).
+                        g.iter().cloned().collect::<Vec<TextLogEntry>>()
+                    };
+                    vec![make("statustexts", Value::TextLog(snapshot))]
+                }
+                None => Vec::new(),
+            }
+        }
+        // v0.16.3 — HEARTBEAT: surface armed bit + decoded copter mode.
+        // `base_mode` is a `MavModeFlag` bitflags; the SAFETY_ARMED bit is
+        // 0x80. `custom_mode` is a raw u32 the copter mode table decodes.
+        MavMessage::HEARTBEAT(d) => {
+            let armed = (d.base_mode.bits() & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+            let mode_str = copter_mode_name(d.custom_mode);
+            vec![
+                make("armed", Value::Bool(armed)),
+                make("flight_mode", Value::String(Arc::from(mode_str.as_str()))),
+            ]
+        }
+        // Other messages — not (yet) plotted. ACTUATOR_OUTPUT_STATUS,
+        // ESC_INFO (all 12 ESCs), MISSION_CURRENT, … live here.
         _ => Vec::new(),
     }
+}
+
+/// v0.16.3 — helper: build a SCALED_IMU2/3 fan-out + Vec[10] sample.
+///
+/// The 10-component vector layout — `(ax, ay, az, gx, gy, gz, mx, my, mz, temp)`
+/// — matches DT-Python's bridge so cells binding `scaled_imu2[6]` (X mag) or
+/// the whole vector get identical semantics whether the data came through ZMQ
+/// or direct MAVLink. Raw on-wire units are preserved (accel mG, gyro mrad/s,
+/// mag mgauss, temp cdegC) so the same downstream rescaling rules apply.
+#[allow(clippy::too_many_arguments)]
+fn scaled_imu_samples(
+    base: &str,
+    xacc: i16,
+    yacc: i16,
+    zacc: i16,
+    xgyro: i16,
+    ygyro: i16,
+    zgyro: i16,
+    xmag: i16,
+    ymag: i16,
+    zmag: i16,
+    temperature: i16,
+    ts: f64,
+    drone_name: &Option<Arc<str>>,
+) -> Vec<Sample> {
+    let comps: [f64; 10] = [
+        xacc as f64, yacc as f64, zacc as f64,
+        xgyro as f64, ygyro as f64, zgyro as f64,
+        xmag as f64, ymag as f64, zmag as f64,
+        temperature as f64,
+    ];
+    let mut out = Vec::with_capacity(11);
+    for (i, &v) in comps.iter().enumerate() {
+        out.push(Sample::new_scalar(
+            ts,
+            format!("{base}[{i}]"),
+            v,
+            drone_name.as_ref().map(Arc::clone),
+        ));
+    }
+    out.push(Sample {
+        ts,
+        key: base.to_string(),
+        value: Value::Vector(comps.to_vec()),
+        drone_name: drone_name.as_ref().map(Arc::clone),
+    });
+    out
+}
+
+/// v0.16.3 — helper: build a SCALED_PRESSURE / SCALED_PRESSURE2 Vec[3] sample.
+///
+/// Layout: `(press_abs hPa, press_diff hPa, temperature cdegC)`. The
+/// `temperature` field stays in centidegrees on the wire — the consumer
+/// divides by 100 if it wants degC. This matches the streamer-side wire
+/// format (cells bind the same index → same meaning across sources).
+fn press_scaled_samples(
+    base: &str,
+    press_abs: f32,
+    press_diff: f32,
+    temperature: i16,
+    ts: f64,
+    drone_name: &Option<Arc<str>>,
+) -> Vec<Sample> {
+    let comps: [f64; 3] = [press_abs as f64, press_diff as f64, temperature as f64];
+    let mut out = Vec::with_capacity(4);
+    for (i, &v) in comps.iter().enumerate() {
+        out.push(Sample::new_scalar(
+            ts,
+            format!("{base}[{i}]"),
+            v,
+            drone_name.as_ref().map(Arc::clone),
+        ));
+    }
+    out.push(Sample {
+        ts,
+        key: base.to_string(),
+        value: Value::Vector(comps.to_vec()),
+        drone_name: drone_name.as_ref().map(Arc::clone),
+    });
+    out
 }
 
 #[cfg(test)]
@@ -628,9 +1018,17 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_message_yields_no_samples() {
-        // HEARTBEAT is decoded but not plotted → no samples.
-        let msg = MavMessage::HEARTBEAT(Default::default());
-        assert!(decode_to_samples(&msg, 0.0).is_empty());
+    fn truly_unmapped_message_yields_no_samples() {
+        // PING is decoded but not plotted (no panel cell binds it) → no
+        // samples. v0.16.3 expanded HEARTBEAT / STATUSTEXT / EKF_STATUS_REPORT
+        // / VIBRATION / … to be emitted, so this assertion now targets a
+        // genuinely-unmapped message instead. PING is deprecated upstream
+        // but still a valid construction target for this test.
+        #[allow(deprecated)]
+        {
+            use mavlink::dialects::ardupilotmega::PING_DATA;
+            let msg = MavMessage::PING(PING_DATA::default());
+            assert!(decode_to_samples(&msg, 0.0).is_empty());
+        }
     }
 }
