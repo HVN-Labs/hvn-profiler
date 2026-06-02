@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use profiler_render::{
     add_panel_draft, apply_trail_draft, collect_source_keys, compact_cells, first_available_slot,
     group_source_keys, relocate_cell, remove_cell_at, replace_cell_at, render_faults_panel,
-    render_gen_panel, render_template_grid_full, render_view3d_with_override, swap_cells,
+    render_gen_panel, render_view3d_with_override, swap_cells,
     CellMenuAction, EditHistory, FaultsPanelState, GeneratorPanelState, GridRenderOptions,
     LabelOverride, PanelDraft, PanelState, PendingCommand, SeenDrones, TraceStore, TrailDraft,
     View3dState,
@@ -150,6 +150,23 @@ struct Cli {
     /// drives stream requests, or for sniffing via `mavlinkrouter`.
     #[arg(long, value_enum, default_value_t = MavlinkPassiveArg::Off)]
     mavlink_passive: MavlinkPassiveArg,
+
+    /// v0.16.2 — log one line per drained envelope showing how the router
+    /// resolved its `drone_name` → per-drone TraceStore mapping.
+    ///
+    /// Output format (per sample, info level):
+    ///
+    /// ```text
+    /// [routing] sample drone='eric_1' key='ap_attitude[0]' value=Scalar(-0.12) → store='eric_1'
+    /// ```
+    ///
+    /// Used to confirm whether the bug "panel shows wrong drone" lives in
+    /// the routing layer (this trace will show samples landing in the wrong
+    /// bucket) or in the renderer (routing is right, but the renderer reads
+    /// from the wrong store). Off by default — the trace is firehose-level
+    /// on a 10 Hz multi-drone fleet.
+    #[arg(long, default_value_t = false)]
+    debug_routing: bool,
 }
 
 /// CLI on/off for `--mavlink-passive`. (v0.8.0)
@@ -478,6 +495,7 @@ fn main() -> anyhow::Result<()> {
                 current_template_idx,
                 runtime,
                 autodiscovered_for_app,
+                cli.debug_routing,
             )))
         }),
     )
@@ -633,6 +651,10 @@ struct App {
     /// first narrow-window launch; the operator can close it to reclaim
     /// pixels for the 2D grid.
     split_3d_overlay_open: bool,
+    /// v0.16.2 — when `true`, log one line per drained envelope showing
+    /// the routing decision (drone_name → store key). Set from
+    /// `--debug-routing` and consulted by [`Self::drain`].
+    debug_routing: bool,
 }
 
 /// v0.10.0 — what the modal editor is currently doing.
@@ -662,6 +684,7 @@ impl App {
         current_template: Option<usize>,
         discovery_runtime: std::sync::Arc<tokio::runtime::Runtime>,
         autodiscovered: Vec<String>,
+        debug_routing: bool,
     ) -> Self {
         let now = Instant::now();
         // Default mode: Split when the template ships a 3D view, else Grid.
@@ -734,6 +757,7 @@ impl App {
             last_seen_keys: HashMap::new(),
             picker_filter: profiler_render::PickerTypeFilter::default(),
             split_3d_overlay_open: true,
+            debug_routing,
         }
     }
 
@@ -755,6 +779,20 @@ impl App {
                         .as_deref()
                         .map(str::to_string)
                         .unwrap_or_else(|| UNNAMED_DRONE.to_string());
+                    // v0.16.2 — `--debug-routing`: one log line per drained
+                    // envelope so the operator can audit the drone_name →
+                    // store mapping when a panel renders the wrong drone's
+                    // data. Off in production (firehose-level at 10 Hz × N
+                    // drones).
+                    if self.debug_routing {
+                        log::info!(
+                            "[routing] sample drone={:?} key={:?} value={:?} -> store={:?}",
+                            s.drone_name.as_deref().unwrap_or("<none>"),
+                            s.key,
+                            s.value,
+                            drone_key,
+                        );
+                    }
                     let is_new = !self.stores.contains_key(&drone_key);
                     let store = self
                         .stores
@@ -1345,24 +1383,56 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Render the 2D grid against the currently-selected drone's store.
+    /// v0.16.2 — build the URI→drone-name map the renderer uses to resolve
+    /// per-cell `source_uri` pins each frame. Reads the live source registry
+    /// (which knows each connected URI's most-recently-observed drone name)
+    /// and falls back to the URI-derived synthetic name when no envelope has
+    /// arrived yet for a source.
+    fn build_uri_to_drone(&self) -> HashMap<String, String> {
+        // 3.0s freshness cutoff is the same threshold the Sources toolbar
+        // uses; we don't actually care about live-ness here, just the
+        // currently-known name. Pass it through so `list()` returns the
+        // metadata in the same call.
+        let entries = self.registry.list(3.0);
+        let mut map: HashMap<String, String> = HashMap::with_capacity(entries.len());
+        for e in entries {
+            // Prefer the envelope-discovered name; fall back to the synthetic
+            // URI-derived name when no envelope has arrived yet. This matches
+            // the `MultiSource`/`SourceRegistry` fallback path used by the
+            // drain loop, so the resolution map agrees with the drone-name
+            // bucket the samples actually landed in.
+            let drone_name = e
+                .drone_name
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| e.fallback_name.to_string());
+            map.insert(e.uri, drone_name);
+        }
+        map
+    }
+
+    /// Render the 2D grid against the multi-drone [`StoresView`]. Each cell-
+    /// source resolves its own [`TraceStore`] via its `source_uri` pin, falling
+    /// back to the view-drone when unpinned.
     /// Returns the grid stats tuple `(panels, panels_with_data, keys_with_data)`
     /// for the status log.
     fn render_grid(&mut self, ui: &mut egui::Ui) -> (usize, usize, usize) {
         let tpl = self.template.take().expect("render_grid called with template");
-        // Take store / state-maps via raw references to satisfy the
-        // split-borrow rules: `render_template_grid_full` takes
-        // `GridRenderOptions { panel_states: &mut HashMap, … }` and the
-        // store is `&TraceStore`, so we resolve the store via the same
-        // OnceLock empty trick `render_3d` uses.
-        let store = match self.view_drone.as_deref().and_then(|d| self.stores.get(d)) {
-            Some(s) => s,
-            None => {
-                use std::sync::OnceLock;
-                static EMPTY: OnceLock<TraceStore> = OnceLock::new();
-                EMPTY.get_or_init(TraceStore::default)
-            }
-        };
+        // Empty fallback store used when the view-drone has no `TraceStore`
+        // yet (first frame, before any sample arrives).
+        let empty_store: TraceStore = TraceStore::default();
+        let uri_to_drone = self.build_uri_to_drone();
+        let view_drone: String = self
+            .view_drone
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_default();
+        let view = profiler_render::StoresView::multi(
+            &self.stores,
+            &uri_to_drone,
+            &view_drone,
+            &empty_store,
+        );
         // v0.11.0 — stable_dt is the egui-smoothed frame delta; clamped
         // by the renderer to skip stale frames after a window-minimise pause.
         let frame_dt = ui.ctx().input(|i| i.stable_dt);
@@ -1379,10 +1449,10 @@ impl App {
             animate_reflow: true,
             frame_dt,
         };
-        let stats = render_template_grid_full(
+        let stats = profiler_render::render_template_grid_multi(
             ui,
             &tpl,
-            store,
+            &view,
             self.label_arg.to_override(),
             opts,
         );

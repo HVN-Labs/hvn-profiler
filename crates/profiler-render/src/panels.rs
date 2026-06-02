@@ -146,6 +146,169 @@ impl LabelOverride {
 
 use crate::TraceStore;
 
+// ─── v0.16.2 — Per-cell store routing (cross-drone overlays) ────────────────
+//
+// v0.15.0 saved `CellSource::source_uri` so the editor could pin a cell to a
+// specific source, but the render loop ignored it: `render_template_grid_*`
+// took a single `&TraceStore` (the view-drone's store) and every cell read
+// from that store. Plotting drone-A's `pos_truth_ned` alongside drone-B's
+// `pos_ekf_ned` on one panel silently showed both as the active drone's data.
+//
+// `StoresView` carries the full per-drone store map plus the URI→drone
+// resolution table so each cell can pick the right `TraceStore`:
+//
+//   1. Cell-source has `source_uri = Some(uri)` AND `uri_to_drone` knows that
+//      URI → use that drone's `TraceStore`.
+//   2. Otherwise → fall through to the view-drone's `TraceStore`.
+//   3. If even the view-drone has no store yet → empty fallback.
+//
+// The legacy single-store entry points (`render_template_grid`,
+// `render_template_grid_with_override`, `render_template_grid_full`,
+// `render_status_cell`, `render_info_text_cell`) still exist and wrap a
+// `StoresView::from_single` so old callers (tests, embedders) don't break.
+
+/// v0.16.2 — multi-drone view over a set of per-drone [`TraceStore`]s plus the
+/// URI→drone lookup the renderer uses to honour `CellSource::source_uri`.
+///
+/// Holds borrowed references; cheap to construct each frame. The CLI builds
+/// one per frame from `App::stores` + a snapshot of `SourceRegistry::list()`.
+/// Single-store callers (tests, legacy embedders) use [`StoresView::single`]
+/// which wraps a borrowed `&TraceStore` into an effectively-one-drone view.
+pub struct StoresView<'a> {
+    /// Multi-drone backing: per-drone stores keyed by `Sample.drone_name`.
+    /// When `single` is `Some`, this slot is ignored (legacy single-store
+    /// path doesn't allocate a HashMap).
+    stores: Option<&'a HashMap<String, TraceStore>>,
+    /// URI→drone-name snapshot taken at the start of this frame from
+    /// `SourceRegistry::list()`. Empty when running in single-store mode.
+    uri_to_drone: &'a HashMap<String, String>,
+    /// Operator's currently-selected drone (toolbar dropdown). Cells WITHOUT
+    /// a `source_uri` pin read from this drone's store. Ignored when
+    /// `single` is `Some`.
+    view_drone: &'a str,
+    /// Empty fallback store, returned when no store resolves and the caller
+    /// needs a non-null `&TraceStore` to feed into egui_plot.
+    empty: &'a TraceStore,
+    /// Single-store fast path: when `Some`, every store lookup returns this
+    /// one store (preserves the v0.16.1 behaviour bit-for-bit for callers
+    /// that haven't migrated). When `None`, the view operates in multi-store
+    /// mode using `stores` + `uri_to_drone`.
+    single: Option<&'a TraceStore>,
+}
+
+impl<'a> StoresView<'a> {
+    /// v0.16.2 — multi-drone view backed by an external `HashMap<drone, TraceStore>`.
+    ///
+    /// `uri_to_drone` should map every currently-connected source URI to the
+    /// drone-name on its envelopes (or the URI-derived fallback). `view_drone`
+    /// is the operator's toolbar selection.
+    pub fn multi(
+        stores: &'a HashMap<String, TraceStore>,
+        uri_to_drone: &'a HashMap<String, String>,
+        view_drone: &'a str,
+        empty: &'a TraceStore,
+    ) -> Self {
+        Self {
+            stores: Some(stores),
+            uri_to_drone,
+            view_drone,
+            empty,
+            single: None,
+        }
+    }
+
+    /// v0.16.2 — single-store view (legacy single-drone callers). Every cell
+    /// reads from `store` regardless of its `source_uri` pin — matches the
+    /// v0.16.1 behaviour exactly.
+    pub fn single(store: &'a TraceStore, empty_placeholder: &'a HashMap<String, String>) -> Self {
+        Self {
+            stores: None,
+            uri_to_drone: empty_placeholder,
+            view_drone: "",
+            empty: store,
+            single: Some(store),
+        }
+    }
+
+    /// Resolve the [`TraceStore`] to read this cell-source from.
+    ///
+    /// Rules (in order):
+    /// 1. Single-store mode → that one store, every time.
+    /// 2. `src.source_uri = Some(uri)` AND `uri_to_drone[uri]` is in `stores`
+    ///    → that drone's store. **This is the v0.15.0 cross-drone pin.**
+    /// 3. Otherwise → `view_drone`'s store, if known.
+    /// 4. Otherwise → the shared empty store (renderer treats it as
+    ///    "no data").
+    pub fn for_source(&self, src: &CellSource) -> &TraceStore {
+        if let Some(s) = self.single {
+            return s;
+        }
+        if let Some(uri) = src.source_uri.as_deref().filter(|u| !u.is_empty()) {
+            if let Some(drone) = self.uri_to_drone.get(uri) {
+                if let Some(map) = self.stores {
+                    if let Some(store) = map.get(drone) {
+                        return store;
+                    }
+                }
+            }
+        }
+        self.view_store()
+    }
+
+    /// Resolve a store from a bare cell-level URI pin (used by primitives like
+    /// `Status` whose source carries no `CellSource`). Same fallback ladder as
+    /// [`Self::for_source`].
+    pub fn for_uri(&self, uri: Option<&str>) -> &TraceStore {
+        if let Some(s) = self.single {
+            return s;
+        }
+        if let Some(uri) = uri.filter(|u| !u.is_empty()) {
+            if let Some(drone) = self.uri_to_drone.get(uri) {
+                if let Some(map) = self.stores {
+                    if let Some(store) = map.get(drone) {
+                        return store;
+                    }
+                }
+            }
+        }
+        self.view_store()
+    }
+
+    /// The currently-active drone's store, or the empty fallback when no
+    /// samples have arrived yet for that drone. In single-store mode this
+    /// returns the wrapped store.
+    pub fn view_store(&self) -> &TraceStore {
+        if let Some(s) = self.single {
+            return s;
+        }
+        self.stores
+            .and_then(|m| m.get(self.view_drone))
+            .unwrap_or(self.empty)
+    }
+
+    /// Iterate over every drone's store (multi-store mode) or the single
+    /// wrapped store (single-store mode). Used by `count_keys_with_data` so
+    /// a cross-drone overlay still reports a non-zero `keys_with_data`.
+    pub fn iter_all_stores(&self) -> Box<dyn Iterator<Item = &TraceStore> + '_> {
+        if let Some(s) = self.single {
+            Box::new(std::iter::once(s))
+        } else if let Some(map) = self.stores {
+            Box::new(map.values())
+        } else {
+            Box::new(std::iter::empty())
+        }
+    }
+}
+
+/// v0.16.2 — process-static empty `HashMap<String, String>` used as the
+/// placeholder for [`StoresView::single`]'s `uri_to_drone` slot. Cheap: one
+/// allocation amortised over the process lifetime.
+fn empty_uri_map() -> &'static HashMap<String, String> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<HashMap<String, String>> = OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
+}
+
 // ─── v0.11.0 — Responsive grid sizing ───────────────────────────────────────
 //
 // The 2D grid reflows when the available width gets cramped so titles, plot
@@ -231,6 +394,20 @@ pub struct GridStats {
 /// the template's row/column alignment.
 pub fn render_template_grid(ui: &mut egui::Ui, tpl: &Template, store: &TraceStore) -> GridStats {
     render_template_grid_with_override(ui, tpl, store, LabelOverride::default())
+}
+
+/// v0.16.2 — multi-store entry point. Each cell-source resolves its own
+/// [`TraceStore`] through [`StoresView::for_source`], so cells pinned to
+/// drone-A read from drone-A's store and unpinned cells fall back to the
+/// view-drone. Used by the CLI for the cross-drone overlay flow.
+pub fn render_template_grid_multi(
+    ui: &mut egui::Ui,
+    tpl: &Template,
+    view: &StoresView<'_>,
+    label_override: LabelOverride,
+    opts: GridRenderOptions<'_>,
+) -> GridStats {
+    render_template_grid_multi_impl(ui, tpl, view, label_override, opts)
 }
 
 /// v0.10.0 — knobs that change how the 2D grid renders without changing the
@@ -319,10 +496,30 @@ pub fn render_template_grid_with_override(
 /// v0.10.0 — render the grid with full options: interactivity, context menus,
 /// runtime visibility overrides. Default-equivalent for callers that only pass
 /// a [`LabelOverride`] is [`render_template_grid_with_override`].
+///
+/// v0.16.2 — this single-store entry point now wraps a [`StoresView::single`]
+/// and delegates to the multi-store impl. Bit-for-bit identical behaviour for
+/// callers that haven't migrated: every cell still reads from `store`
+/// regardless of its `source_uri` pin.
 pub fn render_template_grid_full(
     ui: &mut egui::Ui,
     tpl: &Template,
     store: &TraceStore,
+    label_override: LabelOverride,
+    opts: GridRenderOptions<'_>,
+) -> GridStats {
+    let view = StoresView::single(store, empty_uri_map());
+    render_template_grid_multi_impl(ui, tpl, &view, label_override, opts)
+}
+
+/// v0.16.2 — internal multi-store implementation (formerly the body of
+/// [`render_template_grid_full`]). Threads a [`StoresView`] through the
+/// responsive-layout dispatcher so the inner cell renderers can resolve
+/// per-source stores at draw time.
+fn render_template_grid_multi_impl(
+    ui: &mut egui::Ui,
+    tpl: &Template,
+    view: &StoresView<'_>,
     label_override: LabelOverride,
     opts: GridRenderOptions<'_>,
 ) -> GridStats {
@@ -396,7 +593,7 @@ pub fn render_template_grid_full(
                 at[c.row * declared_cols + c.col] = Some(*c);
             }
             return finish_render_full(
-                ui, tpl, store, label_override, opts, declared_rows, declared_cols, at, avail,
+                ui, tpl, view, label_override, opts, declared_rows, declared_cols, at, avail,
             );
         } else {
             // Cramped → re-pack into responsive dims.
@@ -409,7 +606,7 @@ pub fn render_template_grid_full(
         (rows, cols, at)
     };
 
-    finish_render_full(ui, tpl, store, label_override, opts, rows, cols, at, avail)
+    finish_render_full(ui, tpl, view, label_override, opts, rows, cols, at, avail)
 }
 
 /// v0.11.0 — extracted body of `render_template_grid_full` once the responsive
@@ -420,7 +617,7 @@ pub fn render_template_grid_full(
 fn finish_render_full(
     ui: &mut egui::Ui,
     tpl: &Template,
-    store: &TraceStore,
+    view: &StoresView<'_>,
     label_override: LabelOverride,
     mut opts: GridRenderOptions<'_>,
     rows: usize,
@@ -441,13 +638,13 @@ fn finish_render_full(
                 // Re-fetch the rect inside the scroll viewport.
                 let avail = ui.available_rect_before_wrap();
                 stats_out = render_grid_body(
-                    ui, tpl, store, label_override, &mut opts, rows, cols, &at, avail,
+                    ui, tpl, view, label_override, &mut opts, rows, cols, &at, avail,
                 );
             });
         return stats_out;
     }
     render_grid_body(
-        ui, tpl, store, label_override, &mut opts, rows, cols, &at, avail,
+        ui, tpl, view, label_override, &mut opts, rows, cols, &at, avail,
     )
 }
 
@@ -457,7 +654,7 @@ fn finish_render_full(
 fn render_grid_body(
     ui: &mut egui::Ui,
     tpl: &Template,
-    store: &TraceStore,
+    view: &StoresView<'_>,
     label_override: LabelOverride,
     opts: &mut GridRenderOptions<'_>,
     rows: usize,
@@ -727,6 +924,12 @@ fn render_grid_body(
                         // to catch right-click regardless of what the inner
                         // code drew (egui_plot widget, painter-only frame,
                         // status chip, info-text spans).
+                        // v0.16.2 — `window_s` is uniform across drones (every
+                        // `TraceStore` is created via `TraceStore::default()`
+                        // with `DEFAULT_WINDOW_S`), so we read it from the
+                        // view-drone's store. Pre-multi this was just
+                        // `store.window_s`.
+                        let window_s = view.view_store().window_s;
                         let (had_data, _plot_resp) = if let Some(sink) =
                             opts.menu_sink.as_deref_mut()
                         {
@@ -734,8 +937,8 @@ fn render_grid_body(
                                 render_cell(
                                     ui,
                                     cell,
-                                    store,
-                                    store.window_s,
+                                    view,
+                                    window_s,
                                     label_override,
                                     render_rect,
                                     interactive,
@@ -746,8 +949,8 @@ fn render_grid_body(
                             render_cell(
                                 ui,
                                 cell,
-                                store,
-                                store.window_s,
+                                view,
+                                window_s,
                                 label_override,
                                 render_rect,
                                 interactive,
@@ -860,7 +1063,7 @@ fn render_grid_body(
     // log, etc.) advance past the grid.
     ui.allocate_space(layout.total_used.size());
 
-    stats.keys_with_data = count_keys_with_data(tpl, store);
+    stats.keys_with_data = count_keys_with_data(tpl, view);
     stats
 }
 
@@ -1019,7 +1222,13 @@ fn draw_section_banner(ui: &mut egui::Ui, sec: &Section, rect: Rect) {
 }
 
 /// How many distinct store keys referenced by the template currently have data.
-fn count_keys_with_data(tpl: &Template, store: &TraceStore) -> usize {
+///
+/// v0.16.2 — takes a [`StoresView`] so cross-drone overlays still count toward
+/// `keys_with_data`. We tally a key as live when ANY of the connected drones'
+/// stores hold it (per-source pin resolution would tie us to a specific drone,
+/// but cells pinned to drone-A with data-on-drone-A should count even if
+/// view-drone is drone-B).
+fn count_keys_with_data(tpl: &Template, view: &StoresView<'_>) -> usize {
     use std::collections::BTreeSet;
     let mut keys: BTreeSet<String> = BTreeSet::new();
     for cell in tpl.visible_cells() {
@@ -1057,9 +1266,11 @@ fn count_keys_with_data(tpl: &Template, store: &TraceStore) -> usize {
     }
     keys.into_iter()
         .filter(|k| {
-            store.len(k) > 0
-                || store.latest_string(k).is_some()
-                || !store.text_log_owned(k).is_empty()
+            view.iter_all_stores().any(|store| {
+                store.len(k) > 0
+                    || store.latest_string(k).is_some()
+                    || !store.text_log_owned(k).is_empty()
+            })
         })
         .count()
 }
@@ -1078,7 +1289,7 @@ fn count_keys_with_data(tpl: &Template, store: &TraceStore) -> usize {
 fn render_cell(
     ui: &mut egui::Ui,
     cell: &Cell,
-    store: &TraceStore,
+    view: &StoresView<'_>,
     window_s: f64,
     label_override: LabelOverride,
     cell_rect: Rect,
@@ -1088,7 +1299,16 @@ fn render_cell(
     // v0.12.0 — Status primitive bypasses the plot path entirely. The cell
     // renders as a colored Frame with the value text, sized to fit the
     // cell_rect (after the title strip).
+    //
+    // v0.16.2 — Status reads the first cell-source's `source_uri` pin to
+    // pick which drone's store to read `cell.source` from. When no pin is
+    // set (the common case), falls back to view-drone.
     if cell.primitive == Primitive::Status {
+        let status_uri = cell
+            .sources
+            .first()
+            .and_then(|s| s.source_uri.as_deref());
+        let store = view.for_uri(status_uri);
         return render_status_cell(ui, cell, store, cell_rect);
     }
     // v0.14.0 — InfoText primitive renders static literal text + an optional
@@ -1124,7 +1344,12 @@ fn render_cell(
         );
     }
 
-    let latest_ts = store.latest_ts();
+    // v0.16.2 — use the MAX `latest_ts` across every store this cell will
+    // read from so cross-drone overlays don't clip to a single drone's clock.
+    // For unpinned cells this is just the view-drone's latest_ts (matches
+    // pre-multi behaviour). For pinned cells it's the pinned drone's clock.
+    // When the cell has mixed sources, the window covers all of them.
+    let latest_ts = cell_latest_ts(cell, view);
     let x_lo = if latest_ts.is_finite() {
         latest_ts - window_s
     } else {
@@ -1185,7 +1410,7 @@ fn render_cell(
                 plot_ui.set_auto_bounds([false, true]);
             }
 
-            any_data = draw_primitive(plot_ui, cell, store);
+            any_data = draw_primitive(plot_ui, cell, view);
 
             if cell.zero_reference_line {
                 plot_ui.hline(
@@ -1216,9 +1441,42 @@ fn render_cell(
     // plot's screen-space response rect as its anchor and the parent ui's
     // painter (NOT plot_ui's coordinate system), so the position is in
     // pixels regardless of what the data is doing.
-    draw_label_overlay(ui, resp.response.rect, cell, store, label_override);
+    // v0.16.2 — label overlay reads the FIRST source's resolved store so the
+    // numeric data displayed on the overlay matches the trace plotted at the
+    // top of the legend (typical convention for the `data` label mode).
+    let overlay_store = cell
+        .sources
+        .first()
+        .map(|src| view.for_source(src))
+        .unwrap_or_else(|| view.view_store());
+    draw_label_overlay(ui, resp.response.rect, cell, overlay_store, label_override);
 
     (any_data, resp.response)
+}
+
+/// v0.16.2 — return the latest timestamp this cell will actually read across
+/// all of its (potentially per-source-pinned) [`TraceStore`]s. For unpinned
+/// cells this is the view-drone's `latest_ts`; for pinned cells it's the
+/// max over every pinned drone's `latest_ts` so the rolling-X window covers
+/// every overlay trace.
+fn cell_latest_ts(cell: &Cell, view: &StoresView<'_>) -> f64 {
+    let mut latest = f64::NEG_INFINITY;
+    let mut saw_any = false;
+    for src in &cell.sources {
+        let s = view.for_source(src);
+        let ts = s.latest_ts();
+        if ts.is_finite() {
+            saw_any = true;
+            if ts > latest {
+                latest = ts;
+            }
+        }
+    }
+    if !saw_any {
+        view.view_store().latest_ts()
+    } else {
+        latest
+    }
 }
 
 /// v0.14.0 — render an [`Primitive::InfoText`] cell.
@@ -1962,22 +2220,28 @@ fn wrap_cell_with_context_menu<R>(
 
 /// Dispatch on the cell's primitive and draw the appropriate lines.
 /// Returns `true` if any line produced ≥1 point.
-fn draw_primitive(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceStore) -> bool {
+///
+/// v0.16.2 — each source resolves its own [`TraceStore`] via
+/// [`StoresView::for_source`], so cells whose sources are pinned to different
+/// drones plot their lines from the correct store each. Unpinned sources fall
+/// back to the view-drone, matching v0.16.1 behaviour exactly.
+fn draw_primitive(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, view: &StoresView<'_>) -> bool {
     match cell.primitive {
         Primitive::Scalar | Primitive::Overlay => {
             // Both render every source as its own line; scalar usually has 1,
             // overlay has many. fallback + transform + scale honoured.
             let mut any = false;
             for (i, src) in cell.sources.iter().enumerate() {
+                let store = view.for_source(src);
                 any |= draw_scalar_source(plot_ui, src, store, i);
             }
             any
         }
-        Primitive::Vector => draw_vector(plot_ui, cell, store, false),
-        Primitive::AttitudeRpy => draw_attitude_rpy(plot_ui, cell, store),
-        Primitive::Magnitude => draw_magnitude(plot_ui, cell, store),
-        Primitive::MagInterference => draw_vector(plot_ui, cell, store, true),
-        Primitive::Diff => draw_diff(plot_ui, cell, store),
+        Primitive::Vector => draw_vector(plot_ui, cell, view, false),
+        Primitive::AttitudeRpy => draw_attitude_rpy(plot_ui, cell, view),
+        Primitive::Magnitude => draw_magnitude(plot_ui, cell, view),
+        Primitive::MagInterference => draw_vector(plot_ui, cell, view, true),
+        Primitive::Diff => draw_diff(plot_ui, cell, view),
         Primitive::StatusBadge => false, // reserved — render nothing
         // Status is handled outside the plot context — never reached here.
         Primitive::Status => false,
@@ -2043,12 +2307,13 @@ fn draw_scalar_source(
 fn draw_vector(
     plot_ui: &mut egui_plot::PlotUi,
     cell: &Cell,
-    store: &TraceStore,
+    view: &StoresView<'_>,
     with_mag: bool,
 ) -> bool {
     let Some(src) = cell.sources.first() else {
         return false;
     };
+    let store = view.for_source(src);
     let comps = component_points(src, store);
     let mut any = false;
     let axis_labels = ["x", "y", "z"];
@@ -2075,10 +2340,15 @@ fn draw_vector(
 }
 
 /// `attitude_rpy`: 3 component lines, each converted to degrees.
-fn draw_attitude_rpy(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceStore) -> bool {
+fn draw_attitude_rpy(
+    plot_ui: &mut egui_plot::PlotUi,
+    cell: &Cell,
+    view: &StoresView<'_>,
+) -> bool {
     let Some(src) = cell.sources.first() else {
         return false;
     };
+    let store = view.for_source(src);
     let mut comps = component_points(src, store);
     // Convert rad → deg for each component.
     for pts in comps.iter_mut() {
@@ -2101,10 +2371,15 @@ fn draw_attitude_rpy(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &Trace
 }
 
 /// `magnitude`: single line = L2 norm of the vector source's components.
-fn draw_magnitude(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceStore) -> bool {
+fn draw_magnitude(
+    plot_ui: &mut egui_plot::PlotUi,
+    cell: &Cell,
+    view: &StoresView<'_>,
+) -> bool {
     let Some(src) = cell.sources.first() else {
         return false;
     };
+    let store = view.for_source(src);
     let comps = component_points(src, store);
     let mag = magnitude_points(&comps);
     if mag.is_empty() {
@@ -2120,10 +2395,17 @@ fn draw_magnitude(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceSto
 }
 
 /// `diff`: one line = `key - minus`, index-aligned in the ring buffers.
-fn draw_diff(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, store: &TraceStore) -> bool {
+///
+/// v0.16.2 — both `key` and `minus` resolve through the SAME source's store
+/// (the cell-source's `source_uri` pin). The diff primitive doesn't support
+/// cross-drone subtraction by design — drone-A's `pos_truth_ned[0]` minus
+/// drone-B's `pos_ekf_ned[0]` would mix clocks. Use Overlay with two pinned
+/// sources for that.
+fn draw_diff(plot_ui: &mut egui_plot::PlotUi, cell: &Cell, view: &StoresView<'_>) -> bool {
     let Some(src) = cell.sources.first() else {
         return false;
     };
+    let store = view.for_source(src);
     let Some(minus_key) = &src.minus else {
         // No subtrahend → fall back to plotting the key directly.
         return draw_scalar_source(plot_ui, src, store, 0);
