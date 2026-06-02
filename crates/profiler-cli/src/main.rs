@@ -37,6 +37,7 @@ use profiler_render::{
 };
 use profiler_source::{
     multi_from_uris_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
+    Value as SampleValue,
 };
 use profiler_template::{
     discover as discover_templates, ensure_user_templates_dir, load_entry_json, LabelMode,
@@ -585,21 +586,67 @@ impl App {
                         .stores
                         .entry(drone_key.clone())
                         .or_default();
-                    // v0.11.0 — a schema-only sample (sentinel NaN value)
-                    // registers the channel name in the store's null-key
-                    // set without polluting the trace buffer. Lets the
-                    // editor's source-key picker show e.g. `ap_attitude`
-                    // before ArduPilot starts streaming, even though the
-                    // envelope carries `null` for that channel.
-                    if s.is_schema_only() {
-                        store.note_null_key(&s.key);
-                    } else {
-                        store.push(s.ts, &s.key, s.value);
-                        // v0.12.0 — record last-seen for the editor's
-                        // picker freshness coloring. Always uses the
-                        // sample's monotonic timestamp so the classifier
-                        // can age it against `now`.
-                        self.last_seen_keys.insert(s.key.clone(), s.ts);
+                    // v0.11.0 / v0.13.0 — route by payload variant. Schema-
+                    // only registrations land in the editor's null-key set;
+                    // everything else routes to the matching `TraceStore`
+                    // helper (numeric / string / bool / text-log / vector).
+                    match &s.value {
+                        SampleValue::Null => {
+                            store.note_null_key(&s.key);
+                        }
+                        SampleValue::Scalar(v) => {
+                            // NaN sentinel from older paths still triggers
+                            // the schema-only registration (legacy v0.11.0
+                            // contract — keeps SCHEMA_ONLY_SENTINEL alive).
+                            if v.is_nan() {
+                                store.note_null_key(&s.key);
+                            } else {
+                                store.push(s.ts, &s.key, *v);
+                                self.last_seen_keys.insert(s.key.clone(), s.ts);
+                            }
+                        }
+                        SampleValue::Bool(b) => {
+                            store.push_bool(s.ts, &s.key, *b);
+                            self.last_seen_keys.insert(s.key.clone(), s.ts);
+                        }
+                        SampleValue::String(text) => {
+                            store.push_string(s.ts, &s.key, text.as_ref());
+                            self.last_seen_keys.insert(s.key.clone(), s.ts);
+                        }
+                        SampleValue::IntVector(values) => {
+                            // The msgpack decoder ALSO emits per-component
+                            // scalars for legacy template wiring, but the
+                            // base key itself (`rc_channels`) deserves the
+                            // typed view too — `push_vec_int` is a no-op
+                            // for the per-index keys already pushed.
+                            store.push_vec_int(s.ts, &s.key, values);
+                            self.last_seen_keys.insert(s.key.clone(), s.ts);
+                        }
+                        SampleValue::Vector(values) => {
+                            // Same rationale as IntVector — the per-index
+                            // scalars are emitted by the decoder; we
+                            // mirror once into the numeric channel for the
+                            // base key so naive scalar plots still work.
+                            for (i, v) in values.iter().enumerate() {
+                                let key = format!("{}[{}]", s.key, i);
+                                store.push(s.ts, &key, *v);
+                            }
+                            self.last_seen_keys.insert(s.key.clone(), s.ts);
+                        }
+                        SampleValue::TextLog(entries) => {
+                            for entry in entries {
+                                store.push_text_log(
+                                    s.ts,
+                                    &s.key,
+                                    profiler_render::TextLogEntry {
+                                        ts: entry.ts,
+                                        text: entry.text.to_string(),
+                                        severity: entry.severity,
+                                    },
+                                );
+                            }
+                            self.last_seen_keys.insert(s.key.clone(), s.ts);
+                        }
                     }
                     if is_new {
                         self.discovered_drones.push(drone_key.clone());
@@ -1954,6 +2001,21 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
             Vec::new(),
         ),
     };
+    // v0.13.0 — for Status cells the canonical source key lives in
+    // `cell.source`, not the first `cell.sources` entry; mirror it back
+    // into the draft so the editor opens pre-filled with the right key.
+    let source_key = if cell.primitive == profiler_template::Primitive::Status
+        && !cell.source.is_empty()
+    {
+        cell.source.clone()
+    } else {
+        source_key
+    };
+    let status_color_map: Vec<(String, String)> = cell
+        .color_map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     PanelDraft {
         row: cell.row,
         col: cell.col,
@@ -1965,6 +2027,12 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
         color,
         label_mode: cell.label_mode,
         overlay_extra_keys: overlay_extra,
+        status_kind: cell.kind.unwrap_or_default(),
+        status_color_map,
+        status_default_color: cell
+            .default_color
+            .clone()
+            .unwrap_or_else(|| "#aaaaaa".to_string()),
     }
 }
 
@@ -2044,6 +2112,17 @@ fn panel_form(
                             _ => Primitive::Scalar,
                         };
                     }
+                    // v0.13.0 — when we just landed on Status (either by
+                    // auto-inference or because the operator pre-selected
+                    // it), pick a sensible kind from the key name + shape.
+                    if draft.primitive == Primitive::Status {
+                        if let Some(kind) = profiler_render::default_status_kind(
+                            &draft.source_key,
+                            &shape,
+                        ) {
+                            draft.status_kind = kind;
+                        }
+                    }
                 }
             }
             ui.end_row();
@@ -2087,6 +2166,88 @@ fn panel_form(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        }
+    }
+
+    // v0.13.0 — Status-only: kind selector, default color, and the
+    // `color_map` row editor.
+    if draft.primitive == Primitive::Status {
+        use profiler_template::StatusKind;
+        ui.separator();
+        egui::Grid::new("panel_form_status_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Kind:");
+                egui::ComboBox::from_id_salt("panel_form_status_kind")
+                    .selected_text(format!("{:?}", draft.status_kind))
+                    .show_ui(ui, |ui| {
+                        for k in [
+                            StatusKind::Text,
+                            StatusKind::Badge,
+                            StatusKind::FixType,
+                            StatusKind::ArmedBool,
+                            StatusKind::TextLog,
+                        ] {
+                            ui.selectable_value(
+                                &mut draft.status_kind,
+                                k,
+                                format!("{k:?}"),
+                            );
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Default col:");
+                ui.text_edit_singleline(&mut draft.status_default_color);
+                ui.end_row();
+            });
+
+        // `armed_bool` and `fix_type` are preset; collapse the editor to
+        // a read-only hint so the operator isn't tempted to author a
+        // custom map (which would silently override the renderer's
+        // built-in semantics).
+        let preset = matches!(
+            draft.status_kind,
+            StatusKind::ArmedBool | StatusKind::FixType
+        );
+        ui.separator();
+        if preset {
+            ui.label(format!(
+                "Color map: (preset — `{:?}` uses fixed colors)",
+                draft.status_kind,
+            ));
+        } else {
+            ui.label("Color map:");
+            let mut remove_idx: Option<usize> = None;
+            // Render rows. Each is `[text edit | text edit | × button]`.
+            for (i, (k, v)) in draft.status_color_map.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [120.0, 20.0],
+                        egui::TextEdit::singleline(k).hint_text("value"),
+                    );
+                    ui.add_sized(
+                        [90.0, 20.0],
+                        egui::TextEdit::singleline(v).hint_text("#rrggbb"),
+                    );
+                    if ui
+                        .button("×")
+                        .on_hover_text("Remove this row")
+                        .clicked()
+                    {
+                        remove_idx = Some(i);
+                    }
+                });
+            }
+            if let Some(idx) = remove_idx {
+                draft.status_color_map.remove(idx);
+            }
+            if ui.button("+ Add row").clicked() {
+                draft
+                    .status_color_map
+                    .push((String::new(), "#1f77b4".to_string()));
+            }
         }
     }
 }

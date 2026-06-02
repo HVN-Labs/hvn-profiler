@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use profiler_template::{Cell, CellSource, LabelMode, Primitive, Template, Trail3d, Trail3dSources, View3d};
+use profiler_template::{Cell, CellSource, LabelMode, Primitive, StatusKind, Template, Trail3d, Trail3dSources, View3d};
 
 use crate::TraceStore;
 
@@ -203,6 +203,38 @@ pub fn infer_primitive(value_shape: &ValueShape) -> &'static str {
         ValueShape::String => "status",
         ValueShape::Bool => "status",
         ValueShape::TextLog => "status",
+    }
+}
+
+/// v0.13.0 — pick a sensible [`StatusKind`] default for a source key
+/// when the editor switches the cell into [`Primitive::Status`].
+///
+/// Name-based heuristic with [`ValueShape`] fallback:
+/// - `armed` / `armed_bool` / any `Bool`-shaped key → `ArmedBool`.
+/// - `fix_type` → `FixType`.
+/// - `statustexts` / `TextLog`-shaped → `TextLog`.
+/// - String-shaped (`flight_mode`, etc.) → `Text`.
+/// - Otherwise returns `None` — the modal keeps the cell's current kind.
+///
+/// The form picks this up when the operator chooses a Status-typed source
+/// key from the dropdown; manual edits via the kind selector are
+/// respected (this helper only fires when the source key changes).
+pub fn default_status_kind(key: &str, shape: &ValueShape) -> Option<StatusKind> {
+    let base = key.split(['[', '.']).next().unwrap_or(key);
+    if base == "armed" || base == "armed_bool" {
+        return Some(StatusKind::ArmedBool);
+    }
+    if base == "fix_type" {
+        return Some(StatusKind::FixType);
+    }
+    if base == "statustexts" {
+        return Some(StatusKind::TextLog);
+    }
+    match shape {
+        ValueShape::String => Some(StatusKind::Text),
+        ValueShape::Bool => Some(StatusKind::ArmedBool),
+        ValueShape::TextLog => Some(StatusKind::TextLog),
+        _ => None,
     }
 }
 
@@ -395,6 +427,17 @@ pub struct PanelDraft {
     pub label_mode: LabelMode,
     /// Extra source keys, used by `Overlay`. Each entry becomes its own line.
     pub overlay_extra_keys: Vec<String>,
+    /// v0.13.0 — `Status` primitive: kind discriminant (text / armed_bool /
+    /// fix_type / text_log). Defaults to `Text` when the modal switches into
+    /// Status mode. Ignored for non-Status primitives.
+    pub status_kind: StatusKind,
+    /// v0.13.0 — `Status` primitive: list of `(string, color)` rows. The
+    /// editor renders one row per entry with an `×` removal button and a
+    /// `+ Add row` button to append a new blank entry.
+    pub status_color_map: Vec<(String, String)>,
+    /// v0.13.0 — `Status` primitive: fallback color used when the source
+    /// value doesn't match any `status_color_map` row. Defaults to `#aaa`.
+    pub status_default_color: String,
 }
 
 impl Default for PanelDraft {
@@ -410,6 +453,9 @@ impl Default for PanelDraft {
             color: "#1f77b4".to_string(),
             label_mode: LabelMode::Off,
             overlay_extra_keys: Vec::new(),
+            status_kind: StatusKind::Text,
+            status_color_map: Vec::new(),
+            status_default_color: "#aaaaaa".to_string(),
         }
     }
 }
@@ -481,6 +527,34 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
         }
     }
 
+    // v0.13.0 — Status-specific fields: only populated when the primitive
+    // is `Primitive::Status`. Keeps the JSON small for the common scalar /
+    // vector / overlay / diff cases (the fields all carry
+    // `skip_serializing_if`).
+    let (source, kind, color_map, default_color) = if draft.primitive == Primitive::Status {
+        let mut cm = std::collections::BTreeMap::new();
+        for (k, v) in &draft.status_color_map {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                cm.insert(k.to_string(), v.to_string());
+            }
+        }
+        (
+            draft.source_key.trim().to_string(),
+            Some(draft.status_kind),
+            cm,
+            non_empty(&draft.status_default_color),
+        )
+    } else {
+        (
+            String::new(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+    };
+
     let cell = Cell {
         row: draft.row,
         col: draft.col,
@@ -490,6 +564,10 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
         color: non_empty(&draft.color),
         visible: true,
         label_mode: draft.label_mode,
+        source,
+        kind,
+        color_map,
+        default_color,
         ..Default::default()
     };
     tpl.cells.push(cell);

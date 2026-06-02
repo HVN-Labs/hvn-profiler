@@ -33,12 +33,7 @@ impl Source for QueuedSource {
 
 /// Build a sample tagged for drone `name`.
 fn sample(ts: f64, key: &str, value: f64, name: Option<&str>) -> Sample {
-    Sample {
-        ts,
-        key: key.into(),
-        value,
-        drone_name: name.map(std::sync::Arc::from),
-    }
+    Sample::new_scalar(ts, key, value, name.map(std::sync::Arc::from))
 }
 
 /// Drive a MultiSource via the public URI path: every leg is `mock://`, but
@@ -192,7 +187,7 @@ fn queued_source_yields_in_order() {
             sample(0.1, "a", 2.0, Some("alpha")),
         ]),
     };
-    assert_eq!(q.try_recv().map(|s| s.value), Some(1.0));
-    assert_eq!(q.try_recv().map(|s| s.value), Some(2.0));
+    assert_eq!(q.try_recv().map(|s| s.scalar()), Some(1.0));
+    assert_eq!(q.try_recv().map(|s| s.scalar()), Some(2.0));
     assert!(q.try_recv().is_none());
 }

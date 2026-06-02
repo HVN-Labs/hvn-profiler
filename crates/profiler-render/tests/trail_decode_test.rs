@@ -49,7 +49,12 @@ fn round_trip_envelope_into_trail() {
         let i = i as f64;
         let bytes = envelope_with_pos(i, 1.0 + i, 2.0 + 2.0 * i, -(3.0 + i));
         for s in flatten_msgpack(&bytes).expect("flatten") {
-            store.push(s.ts, &s.key, s.value);
+            // v0.13.0 — only forward scalar leaves into the legacy
+            // numeric ring buffer; the new Vector sample is informational
+            // here.
+            if let Some(v) = s.value.as_scalar() {
+                store.push(s.ts, &s.key, v);
+            }
         }
     }
 

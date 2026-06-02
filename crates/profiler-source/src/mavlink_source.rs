@@ -447,12 +447,12 @@ pub fn decode_to_samples_with_drone(
 ) -> Vec<Sample> {
     // v0.10.1 — one shared `Arc<str>` across every emitted sample; the
     // closure just bumps the refcount instead of allocating a `String`.
-    let s = |key: &str, value: f64| Sample {
+    let s = |key: &str, value: f64| Sample::new_scalar(
         ts,
-        key: key.to_string(),
+        key,
         value,
-        drone_name: drone_name.as_ref().map(Arc::clone),
-    };
+        drone_name.as_ref().map(Arc::clone),
+    );
     match msg {
         MavMessage::ATTITUDE(d) => vec![
             s("ap_attitude[0]", d.roll as f64),
@@ -518,7 +518,8 @@ mod tests {
             .into_iter()
             .map(|s| {
                 assert_eq!(s.ts, ts);
-                (s.key, s.value)
+                let value = s.scalar();
+                (s.key, value)
             })
             .collect()
     }

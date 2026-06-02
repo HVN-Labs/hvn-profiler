@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
-use crate::{flatten_msgpack_with_nulls, Sample, Source, SCHEMA_ONLY_SENTINEL};
+use crate::{flatten_msgpack_with_nulls, Sample, Source, Value};
 
 /// Shared set of drone names this source has seen on the wire so far. Cloned
 /// into the Faults panel state so the Target dropdown can populate from real
@@ -165,7 +165,7 @@ async fn run_loop(endpoint: &str, tx: &Sender<Sample>, seen: &SeenDrones) -> Res
             .map(|key| Sample {
                 ts: samples.first().map(|s| s.ts).unwrap_or(0.0),
                 key,
-                value: SCHEMA_ONLY_SENTINEL,
+                value: Value::Null,
                 drone_name: drone_name_hint.clone(),
             })
             .collect();

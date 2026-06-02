@@ -36,13 +36,90 @@ pub use fault_publisher::{encode_command, FaultCommand, FaultPublisher};
 
 // ─── Sample / trait ────────────────────────────────────────────────────────
 
-/// v0.11.0 — sentinel value carried in `Sample.value` for schema-only
+/// v0.11.0 — sentinel value carried in legacy scalar samples for schema-only
 /// channels: ones the envelope advertised with a `null` payload (e.g. AP
 /// MAVLink mirrors before ArduPilot streams). The render loop's drain path
 /// recognises this sentinel (via [`Sample::is_schema_only`]) and routes the
 /// key to `TraceStore::note_null_key` instead of `push`. NaN was chosen so
 /// older consumers that ignore it simply drop the sample (NaN can't plot).
+///
+/// v0.13.0 — schema-only registrations are now first-class via
+/// [`Value::Null`]; this constant is retained for backwards compatibility
+/// with the older [`Value::Scalar`] form.
 pub const SCHEMA_ONLY_SENTINEL: f64 = f64::NAN;
+
+/// v0.13.0 — one entry in a [`Value::TextLog`] payload. Mirrors the
+/// `statustexts` envelope entries from SITL v0.9.0+: a severity, payload
+/// text and the timestamp the streamer assigned.
+///
+/// Decoupled from `profiler_render::TextLogEntry` so the source crate has
+/// no render dependency. The CLI's drain loop converts between the two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextLogEntry {
+    /// MAVLink-style severity, 0 (emergency) → 7 (debug).
+    pub severity: u8,
+    /// Plain-text payload, refcounted so a single allocation is shared
+    /// across the fanned-out copies of the rolling buffer.
+    pub text: Arc<str>,
+    /// Producer timestamp (seconds, monotonic).
+    pub ts: f64,
+}
+
+/// v0.13.0 — rich payload type for a [`Sample`].
+///
+/// SITL v0.9.0 started shipping non-numeric values (string flight mode,
+/// bool armed, list-of-dicts statustexts, integer-vector RC channels) in
+/// the streamer envelope. The render layer (`Status` primitive,
+/// `TraceStore::push_string` / `push_text_log`) was ready in v0.12.0 but
+/// the data path was lossy — every non-scalar collapsed to a numeric
+/// `Sample` or got dropped. v0.13.0 makes the wire→`TraceStore` path
+/// preserve these types end to end.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// `f64` per timestamp — the common case (most channels are scalar).
+    Scalar(f64),
+    /// `Vec<f64>` — emitted by the decoder when the envelope's value is
+    /// an array of numerics. Each element is fanned out as `<base>[i]`
+    /// downstream OR routed to a single multi-line plot if the consumer
+    /// prefers.
+    Vector(Vec<f64>),
+    /// `Vec<i64>` — emitted when EVERY element of an envelope array is
+    /// an integer (`rc_channels`, `servo_outputs`, `sys_errors`). The
+    /// `TraceStore` widens to `f64` for plotting; preserved as integers
+    /// here so the editor can flag them as int-typed for chart-type
+    /// inference.
+    IntVector(Vec<i64>),
+    /// String — refcounted so a single allocation services every clone
+    /// of the sample (the `flight_mode` key fires every ~100 ms).
+    String(Arc<str>),
+    /// `True` / `False` — `armed`, future bool channels.
+    Bool(bool),
+    /// Rolling list of dicts (e.g. `statustexts`).
+    TextLog(Vec<TextLogEntry>),
+    /// Schema-only: the envelope advertised the channel name but supplied
+    /// `null`. The render layer registers the key in its null-set so the
+    /// editor's source-key picker can surface it, without polluting any
+    /// trace buffer.
+    Null,
+}
+
+impl Value {
+    /// Convenience: read the inner scalar if this is a [`Value::Scalar`],
+    /// or 0/1 if a [`Value::Bool`]. Useful for the few legacy call sites
+    /// that still treat samples as opaque `f64`.
+    pub fn as_scalar(&self) -> Option<f64> {
+        match self {
+            Value::Scalar(v) => Some(*v),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            _ => None,
+        }
+    }
+
+    /// `true` when this value is the [`Value::Null`] schema-only marker.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+}
 
 impl Sample {
     /// `true` when this sample is a schema-only registration (the envelope
@@ -51,20 +128,47 @@ impl Sample {
     /// path calls `TraceStore::note_null_key` for them so the editor can
     /// surface the key without plotting noise.
     pub fn is_schema_only(&self) -> bool {
-        self.value.is_nan()
+        match &self.value {
+            Value::Null => true,
+            Value::Scalar(v) => v.is_nan(),
+            _ => false,
+        }
+    }
+
+    /// v0.13.0 — read the underlying scalar (`f64`) for legacy call sites.
+    /// Returns `NaN` for non-numeric payloads so consumers that haven't
+    /// migrated still get a "drop me" sentinel.
+    pub fn scalar(&self) -> f64 {
+        self.value.as_scalar().unwrap_or(f64::NAN)
+    }
+
+    /// v0.13.0 — convenience constructor for a scalar sample.
+    pub fn new_scalar(ts: f64, key: impl Into<String>, value: f64, drone_name: Option<Arc<str>>) -> Self {
+        Self {
+            ts,
+            key: key.into(),
+            value: Value::Scalar(value),
+            drone_name,
+        }
     }
 }
 
 /// A single flattened telemetry sample. One envelope from the streamer
-/// fans out into many `Sample`s (one per scalar leaf of `values`).
+/// fans out into many `Sample`s (one per leaf of `values`).
+///
+/// v0.13.0 — `value` is now a [`Value`] enum: it can carry scalar,
+/// vector, integer-vector, string, bool, text-log or null payloads. The
+/// pre-v0.13.0 `Sample.value: f64` field migrates to `Value::Scalar(_)`;
+/// the [`Sample::scalar`] / [`Sample::new_scalar`] helpers keep migration
+/// of legacy call sites cheap.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
     /// Monotonic seconds since stream start (forwarded from the envelope).
     pub ts: f64,
     /// Trace identifier — e.g. `"accel[0]"`, `"ap_vfr_alt"`.
     pub key: String,
-    /// Scalar value.
-    pub value: f64,
+    /// v0.13.0 — typed payload. See [`Value`].
+    pub value: Value,
     /// Drone name from the envelope (e.g. `"eric_1"`). `None` when the
     /// streamer didn't supply one (older streamer, MAVLink CLI without
     /// `--drone-name`, etc.). The profiler treats missing names as
@@ -399,12 +503,12 @@ impl Source for MockSource {
         }
         self.last_emit = Some(now);
         let t = now.duration_since(self.started).as_secs_f64();
-        Some(Sample {
-            ts: t,
-            key: "mock.sine".to_string(),
-            value: (t * std::f64::consts::TAU * 0.5).sin(),
-            drone_name: None,
-        })
+        Some(Sample::new_scalar(
+            t,
+            "mock.sine",
+            (t * std::f64::consts::TAU * 0.5).sin(),
+            None,
+        ))
     }
 
     fn describe(&self) -> String {
@@ -474,6 +578,20 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
 
 /// v0.11.0 — like [`flatten_envelope`] but ALSO returns the names of channels
 /// whose top-level value was `null`. See [`flatten_msgpack_with_nulls`].
+///
+/// v0.13.0 — non-numeric leaves (string / bool / list-of-dicts) are now
+/// preserved through the decoder via the new [`Value`] variants instead of
+/// being silently dropped:
+/// - `Boolean` → `Value::Bool`
+/// - `String` → `Value::String`
+/// - Array of integers → `Value::IntVector` (one sample, not N fanned out)
+/// - Array of mixed numerics → `Value::Vector` (one sample, not N fanned out)
+/// - Array of dicts shaped like statustext entries → `Value::TextLog`
+///
+/// Numeric scalars and "legacy" fanned-out `base[i]` arrays still emit
+/// per-component scalar samples to preserve the v0.12.0 plot wiring;
+/// non-numeric vectors emit a single sample whose `value` is the whole
+/// vector so downstream consumers can decide how to render it.
 pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>) {
     let mut out = Vec::new();
     let mut nulls = Vec::new();
@@ -499,49 +617,186 @@ pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>)
             rmpv::Value::Boolean(b) => out.push(Sample {
                 ts,
                 key: key.to_string(),
-                value: if *b { 1.0 } else { 0.0 },
+                value: Value::Bool(*b),
                 drone_name: drone_name.clone(),
             }),
             rmpv::Value::Integer(i) => {
                 if let Some(f) = i.as_f64() {
+                    out.push(Sample::new_scalar(ts, key, f, drone_name.clone()));
+                }
+            }
+            rmpv::Value::F32(f) => {
+                out.push(Sample::new_scalar(ts, key, *f as f64, drone_name.clone()));
+            }
+            rmpv::Value::F64(f) => {
+                out.push(Sample::new_scalar(ts, key, *f, drone_name.clone()));
+            }
+            rmpv::Value::String(s) => {
+                // v0.13.0 — preserve the string instead of dropping. The
+                // streamer's `String` form is always UTF-8; we still call
+                // `as_str()` and skip on the (unreachable) failure rather
+                // than panic.
+                if let Some(text) = s.as_str() {
                     out.push(Sample {
                         ts,
                         key: key.to_string(),
-                        value: f,
+                        value: Value::String(Arc::from(text)),
                         drone_name: drone_name.clone(),
                     });
                 }
             }
-            rmpv::Value::F32(f) => out.push(Sample {
-                ts,
-                key: key.to_string(),
-                value: *f as f64,
-                drone_name: drone_name.clone(),
-            }),
-            rmpv::Value::F64(f) => out.push(Sample {
-                ts,
-                key: key.to_string(),
-                value: *f,
-                drone_name: drone_name.clone(),
-            }),
             rmpv::Value::Array(arr) => {
+                // v0.13.0 — classify the array's shape before fanning out:
+                // 1. List-of-dicts shaped like statustext entries → TextLog.
+                // 2. All elements integer → IntVector (single sample).
+                // 3. All elements numeric, at least one float → Vector (single sample).
+                // 4. Mixed / contains non-numeric → fall back to legacy
+                //    per-component scalar fan-out (preserves the v0.12.0
+                //    `base[i]` plot wiring for `accel`, `ap_attitude`, …).
+                if let Some(entries) = try_decode_text_log(arr) {
+                    out.push(Sample {
+                        ts,
+                        key: key.to_string(),
+                        value: Value::TextLog(entries),
+                        drone_name: drone_name.clone(),
+                    });
+                    continue;
+                }
+                if is_int_only_array(arr) {
+                    let ints: Vec<i64> = arr
+                        .iter()
+                        .filter_map(|e| match e {
+                            rmpv::Value::Integer(i) => i.as_i64(),
+                            _ => None,
+                        })
+                        .collect();
+                    // v0.13.0 — single sample carrying the integer vector,
+                    // PLUS the legacy per-index scalar fan-out so existing
+                    // templates that bind to `rc_channels[0..15]` etc. keep
+                    // plotting without a schema migration.
+                    out.push(Sample {
+                        ts,
+                        key: key.to_string(),
+                        value: Value::IntVector(ints.clone()),
+                        drone_name: drone_name.clone(),
+                    });
+                    for (i, v) in ints.iter().enumerate() {
+                        out.push(Sample::new_scalar(
+                            ts,
+                            format!("{key}[{i}]"),
+                            *v as f64,
+                            drone_name.clone(),
+                        ));
+                    }
+                    continue;
+                }
+                if is_numeric_array(arr) {
+                    let floats: Vec<f64> = arr.iter().filter_map(scalar_to_f64).collect();
+                    out.push(Sample {
+                        ts,
+                        key: key.to_string(),
+                        value: Value::Vector(floats),
+                        drone_name: drone_name.clone(),
+                    });
+                    // Legacy per-component scalar fan-out (unchanged).
+                    for (i, elt) in arr.iter().enumerate() {
+                        if let Some(v) = scalar_to_f64(elt) {
+                            out.push(Sample::new_scalar(
+                                ts,
+                                format!("{key}[{i}]"),
+                                v,
+                                drone_name.clone(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                // Mixed / partly-non-numeric: emit only the salvageable
+                // numeric components, preserving prior v0.11.0 behaviour.
                 for (i, elt) in arr.iter().enumerate() {
                     if let Some(v) = scalar_to_f64(elt) {
-                        out.push(Sample {
+                        out.push(Sample::new_scalar(
                             ts,
-                            key: format!("{key}[{i}]"),
-                            value: v,
-                            drone_name: drone_name.clone(),
-                        });
+                            format!("{key}[{i}]"),
+                            v,
+                            drone_name.clone(),
+                        ));
                     }
                     // non-scalar / null elements drop silently
                 }
             }
-            // Strings, nested maps, binary blobs etc. aren't plottable.
+            // Nested maps, binary blobs etc. aren't plottable.
             _ => continue,
         }
     }
     (out, nulls)
+}
+
+/// v0.13.0 — heuristic: `true` when every element of `arr` is an integer.
+fn is_int_only_array(arr: &[rmpv::Value]) -> bool {
+    !arr.is_empty()
+        && arr
+            .iter()
+            .all(|e| matches!(e, rmpv::Value::Integer(_)))
+}
+
+/// v0.13.0 — heuristic: `true` when every element of `arr` is numeric
+/// (`Integer` | `F32` | `F64` | `Boolean`).
+fn is_numeric_array(arr: &[rmpv::Value]) -> bool {
+    !arr.is_empty()
+        && arr.iter().all(|e| {
+            matches!(
+                e,
+                rmpv::Value::Integer(_)
+                    | rmpv::Value::F32(_)
+                    | rmpv::Value::F64(_)
+                    | rmpv::Value::Boolean(_)
+            )
+        })
+}
+
+/// v0.13.0 — try to decode `arr` as a list of `{severity, text, ts}` dicts.
+///
+/// Returns `Some(entries)` when EVERY element is a map containing all three
+/// expected keys; otherwise `None` (the array is treated as a numeric or
+/// mixed list by the caller). Matches the wire form of SITL v0.9.0's
+/// `statustexts` envelope key.
+fn try_decode_text_log(arr: &[rmpv::Value]) -> Option<Vec<TextLogEntry>> {
+    if arr.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for elt in arr {
+        let map = elt.as_map()?;
+        let mut severity: Option<u8> = None;
+        let mut text: Option<Arc<str>> = None;
+        let mut ts: Option<f64> = None;
+        for (k, v) in map {
+            match k.as_str()? {
+                "severity" => {
+                    severity = match v {
+                        rmpv::Value::Integer(i) => i.as_u64().map(|n| n as u8),
+                        _ => None,
+                    };
+                }
+                "text" => {
+                    text = match v {
+                        rmpv::Value::String(s) => s.as_str().map(Arc::from),
+                        _ => None,
+                    };
+                }
+                "ts" => {
+                    ts = scalar_to_f64(v);
+                }
+                _ => {}
+            }
+        }
+        let severity = severity?;
+        let text = text?;
+        let ts = ts?;
+        out.push(TextLogEntry { severity, text, ts });
+    }
+    Some(out)
 }
 
 fn scalar_to_f64(v: &rmpv::Value) -> Option<f64> {
@@ -608,11 +863,15 @@ mod tests {
         // Sort so the assertion doesn't depend on map iteration order.
         samples.sort_by(|a, b| a.key.cmp(&b.key));
 
+        // v0.13.0 — array values now emit BOTH a single vector sample
+        // (`Value::Vector([1.0, 2.0, 3.0])` for `accel`) AND the legacy
+        // per-index scalar fan-out (`accel[0..2]`). The test pins the
+        // latter contract since downstream templates rely on it.
         let got: Vec<(String, f64)> = samples
             .into_iter()
-            .map(|s| {
+            .filter_map(|s| {
                 assert_eq!(s.ts, 12.5);
-                (s.key, s.value)
+                s.value.as_scalar().map(|v| (s.key, v))
             })
             .collect();
         assert_eq!(
@@ -641,7 +900,13 @@ mod tests {
         );
         let env = Env { ts: 0.0, values };
         let bytes = rmp_serde::to_vec_named(&env).unwrap();
-        let mut s = flatten_msgpack(&bytes).unwrap();
+        // v0.13.0 — only keep scalar samples (the array also produces a
+        // vector sample, but we only assert on the per-component contract).
+        let mut s: Vec<_> = flatten_msgpack(&bytes)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.value.as_scalar().is_some())
+            .collect();
         s.sort_by(|a, b| a.key.cmp(&b.key));
         assert_eq!(
             s.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),

@@ -18,10 +18,10 @@ pub mod panels;
 pub mod view3d;
 pub use editor::{
     apply_panel_draft, apply_trail_draft, categorize_key, classify_key, collect_source_keys,
-    compact_cells, group_source_keys, infer_primitive, known_value_shape, relocate_cell,
-    remove_cell_at, replace_cell_at, swap_cells, ComboCollapseState, EditHistory, KeyFreshness,
-    PanelDraft, PickerTypeFilter, TrailDraft, ValueShape, KEY_GROUPS, KNOWN_HVN_SITL_KEYS,
-    LIVE_THRESHOLD_S, STALE_THRESHOLD_S,
+    compact_cells, default_status_kind, group_source_keys, infer_primitive, known_value_shape,
+    relocate_cell, remove_cell_at, replace_cell_at, swap_cells, ComboCollapseState, EditHistory,
+    KeyFreshness, PanelDraft, PickerTypeFilter, TrailDraft, ValueShape, KEY_GROUPS,
+    KNOWN_HVN_SITL_KEYS, LIVE_THRESHOLD_S, STALE_THRESHOLD_S,
 };
 pub use faults::{
     default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,
@@ -116,6 +116,32 @@ impl TraceStore {
             null_keys: BTreeSet::new(),
             string_traces: HashMap::new(),
             text_log_traces: HashMap::new(),
+        }
+    }
+
+    /// v0.13.0 — push a bool value. Normalised to a scalar `0.0` / `1.0`
+    /// on the numeric channel AND mirrored into the string-trace map as
+    /// `"True"` / `"False"` so the `Status` primitive's `armed_bool` kind
+    /// (which reads either form) renders correctly.
+    pub fn push_bool(&mut self, t: f64, key: &str, value: bool) {
+        let as_str: &'static str = if value { "True" } else { "False" };
+        // Record both numeric (for legacy plot wiring) AND string (for the
+        // Status primitive's `armed_bool` kind which prefers the string).
+        self.push_string(t, key, as_str);
+        self.push(t, key, if value { 1.0 } else { 0.0 });
+    }
+
+    /// v0.13.0 — push an integer-vector value. Each component is fanned out
+    /// into the numeric ring buffer as `<key>[i]` so existing plot bindings
+    /// (`rc_channels[0..15]`, `servo_outputs[0..15]`, `sys_errors[0..3]`)
+    /// keep rendering. The caller is responsible for the per-index keys
+    /// emitted by the envelope decoder — `push_vec_int` here is the
+    /// out-of-band variant used when the source carries a typed vector
+    /// payload but no per-component fan-out.
+    pub fn push_vec_int(&mut self, t: f64, key: &str, values: &[i64]) {
+        for (i, v) in values.iter().enumerate() {
+            let component_key = format!("{key}[{i}]");
+            self.push(t, &component_key, *v as f64);
         }
     }
 
