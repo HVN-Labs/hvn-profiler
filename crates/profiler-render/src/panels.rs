@@ -718,23 +718,44 @@ fn render_grid_body(
                             }
                             None => &mut local_locked,
                         };
-                        let (had_data, plot_resp) = render_cell(
-                            ui,
-                            cell,
-                            store,
-                            store.window_s,
-                            label_override,
-                            render_rect,
-                            interactive,
-                            panel_locked,
-                        );
+                        // v0.16.1 — wrap every cell render in the unified
+                        // right-click context-menu overlay so Status (v0.12.0)
+                        // and InfoText (v0.14.0) primitives surface the same
+                        // menu as 2D plot cells. The wrapper allocates a
+                        // transparent `Sense::click()` interaction over the
+                        // full cell rect AFTER the inner render — guaranteed
+                        // to catch right-click regardless of what the inner
+                        // code drew (egui_plot widget, painter-only frame,
+                        // status chip, info-text spans).
+                        let (had_data, _plot_resp) = if let Some(sink) =
+                            opts.menu_sink.as_deref_mut()
+                        {
+                            wrap_cell_with_context_menu(ui, cell, render_rect, sink, |ui| {
+                                render_cell(
+                                    ui,
+                                    cell,
+                                    store,
+                                    store.window_s,
+                                    label_override,
+                                    render_rect,
+                                    interactive,
+                                    panel_locked,
+                                )
+                            })
+                        } else {
+                            render_cell(
+                                ui,
+                                cell,
+                                store,
+                                store.window_s,
+                                label_override,
+                                render_rect,
+                                interactive,
+                                panel_locked,
+                            )
+                        };
                         if had_data {
                             stats.panels_with_data += 1;
-                        }
-                        // Right-click context menu (v0.10.0). Only attached
-                        // when the CLI supplied a menu sink.
-                        if let Some(sink) = opts.menu_sink.as_deref_mut() {
-                            attach_context_menu(&plot_resp, cell, sink);
                         }
                         // Snapshot for next frame's animation detection. Use
                         // the TARGET (logical) rect so the animation chases
@@ -1821,11 +1842,47 @@ pub fn status_fix_type_chip(n: i64) -> (&'static str, Color32) {
     fix_type_chip(n)
 }
 
-/// v0.10.0 — attach the per-cell right-click context menu to a plot response.
+/// v0.16.1 — primitives that participate in the egui_plot interactivity
+/// suite (drag / zoom / box-zoom / double-click reset). Used to gate the
+/// "Reset zoom" and "Label" entries in the per-cell context menu — those
+/// items make no sense for non-plot primitives like Status / InfoText.
+///
+/// Exposed (doc-hidden) for the v0.16.1 context-menu tests.
+#[doc(hidden)]
+pub fn primitive_supports_zoom(p: Primitive) -> bool {
+    matches!(
+        p,
+        Primitive::Scalar
+            | Primitive::Vector
+            | Primitive::Overlay
+            | Primitive::Magnitude
+            | Primitive::MagInterference
+            | Primitive::Diff
+            | Primitive::AttitudeRpy
+    )
+}
+
+/// v0.16.1 — primitives that respond to the `Label` overlay (data / metadata).
+/// InfoText is itself literal content; Status renders its own chip — neither
+/// participates in the label-overlay system, so the menu hides that submenu
+/// for those primitives.
+///
+/// Exposed (doc-hidden) for the v0.16.1 context-menu tests.
+#[doc(hidden)]
+pub fn primitive_supports_label_mode(p: Primitive) -> bool {
+    // Same set as zoom for now — both submenus are 2D-plot-only.
+    primitive_supports_zoom(p)
+}
+
+/// v0.10.0 — build the per-cell right-click context menu on `resp`. v0.16.1
+/// gates "Reset zoom" and the "Label" submenu on plot-typed primitives so
+/// Status / InfoText cells get a sensible menu (Edit / Hide / Delete only).
 /// Drains user clicks into `sink` for the CLI to apply next frame.
 fn attach_context_menu(resp: &egui::Response, cell: &Cell, sink: &mut Vec<CellMenuAction>) {
     let row = cell.row;
     let col = cell.col;
+    let supports_zoom = primitive_supports_zoom(cell.primitive);
+    let supports_label_mode = primitive_supports_label_mode(cell.primitive);
     resp.clone().context_menu(|ui| {
         if ui.button("Edit panel...").clicked() {
             sink.push(CellMenuAction::Edit { row, col });
@@ -1835,23 +1892,25 @@ fn attach_context_menu(resp: &egui::Response, cell: &Cell, sink: &mut Vec<CellMe
             sink.push(CellMenuAction::HideToggle { row, col });
             ui.close();
         }
-        if ui.button("Reset zoom").clicked() {
+        if supports_zoom && ui.button("Reset zoom").clicked() {
             sink.push(CellMenuAction::ResetZoom { row, col });
             ui.close();
         }
-        ui.separator();
-        ui.label("Label:");
-        if ui.button("off").clicked() {
-            sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Off });
-            ui.close();
-        }
-        if ui.button("data").clicked() {
-            sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Data });
-            ui.close();
-        }
-        if ui.button("metadata").clicked() {
-            sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Metadata });
-            ui.close();
+        if supports_label_mode {
+            ui.separator();
+            ui.label("Label:");
+            if ui.button("off").clicked() {
+                sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Off });
+                ui.close();
+            }
+            if ui.button("data").clicked() {
+                sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Data });
+                ui.close();
+            }
+            if ui.button("metadata").clicked() {
+                sink.push(CellMenuAction::SetLabelMode { row, col, mode: LabelMode::Metadata });
+                ui.close();
+            }
         }
         ui.separator();
         if ui.button("Delete panel").clicked() {
@@ -1859,6 +1918,46 @@ fn attach_context_menu(resp: &egui::Response, cell: &Cell, sink: &mut Vec<CellMe
             ui.close();
         }
     });
+}
+
+/// v0.16.1 — wrap an arbitrary cell-render closure with a transparent
+/// right-click interactive overlay so the per-cell context menu reaches
+/// EVERY primitive — including [`Primitive::Status`] (v0.12.0) and
+/// [`Primitive::InfoText`] (v0.14.0) which draw their own `Frame`-based
+/// content via `painter` calls instead of the `egui_plot` widget tree.
+///
+/// Pre-v0.16.1 only the plot path attached `context_menu` to `plot_resp`;
+/// the Status/InfoText scope-builder responses technically sensed clicks but
+/// their inner UIs allocated no widgets so the response never registered
+/// secondary clicks. Allocating a dedicated `Sense::click()` interaction
+/// over the full `cell_rect` AFTER the inner render guarantees right-click
+/// is captured regardless of what the inner code drew. The overlay only
+/// uses `Sense::click()`, which does NOT swallow primary clicks aimed at
+/// the inner content (status chips, info-text spans — none of which are
+/// click-interactive today, but the contract is preserved for future work).
+///
+/// `cell_rect` is the rect the inner render drew into; we use it (plus a
+/// stable id derived from `(row, col)`) to allocate the overlay interaction.
+fn wrap_cell_with_context_menu<R>(
+    ui: &mut egui::Ui,
+    cell: &Cell,
+    cell_rect: Rect,
+    sink: &mut Vec<CellMenuAction>,
+    render_inner: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let result = render_inner(ui);
+    // Lay a transparent click-sensitive interaction over the entire cell
+    // rect so right-click reaches us even when the inner render only did
+    // painter calls. `Sense::click()` covers BOTH primary and secondary
+    // clicks but `context_menu` only fires on secondary, so primary clicks
+    // remain available to any future inner buttons.
+    let overlay = ui.interact(
+        cell_rect,
+        ui.id().with(("hvn-profiler-cell-ctx", cell.row, cell.col)),
+        egui::Sense::click(),
+    );
+    attach_context_menu(&overlay, cell, sink);
+    result
 }
 
 /// Dispatch on the cell's primitive and draw the appropriate lines.

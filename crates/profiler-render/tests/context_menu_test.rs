@@ -252,6 +252,167 @@ fn delete_action_shrinks_cells_and_dirties_template_v010_1() {
     assert!(!dirtied_again, "no dirty flip when nothing was deleted");
 }
 
+// ─── v0.16.1 — right-click menu reaches Status + InfoText cells ─────────────
+//
+// Pre-v0.16.1 the per-cell context menu was attached only to the egui_plot
+// response for 2D primitives (Scalar / Vector / Overlay / Magnitude / Diff /
+// MagInterference / AttitudeRpy). The Status (v0.12.0) and InfoText (v0.14.0)
+// primitives render their own Frame-based widgets via `painter` calls; their
+// scope_builder responses did not pick up secondary clicks because no inner
+// widgets were allocated. v0.16.1 wraps EVERY cell render in a transparent
+// `Sense::click()` overlay over the full cell rect — the overlay's response
+// carries `context_menu(...)` so right-click works regardless of what the
+// inner code drew.
+//
+// These data-layer tests pin the predicates that gate menu items per
+// primitive (Reset zoom + Label submenu are 2D-plot-only). Full UI-driven
+// secondary-click tests would need an egui test harness; the renderer's
+// invariant is captured at the data layer instead.
+
+use profiler_render::{primitive_supports_label_mode, primitive_supports_zoom};
+use profiler_template::Primitive;
+
+#[test]
+fn v0_16_1_reset_zoom_hidden_on_non_plot_primitives() {
+    // Status + InfoText render their own non-plot widgets — Reset zoom is
+    // meaningless for them. The context-menu builder gates the entry on
+    // `primitive_supports_zoom`.
+    assert!(!primitive_supports_zoom(Primitive::Status), "Status has no zoom");
+    assert!(!primitive_supports_zoom(Primitive::InfoText), "InfoText has no zoom");
+    // StatusBadge is reserved (renders nothing today) — also non-zoomable.
+    assert!(!primitive_supports_zoom(Primitive::StatusBadge), "StatusBadge has no zoom");
+}
+
+#[test]
+fn v0_16_1_reset_zoom_visible_on_every_2d_plot_primitive() {
+    // All primitives that flow through `egui_plot` must keep the Reset zoom
+    // entry — gating accidentally to `false` would regress v0.10.0's UX.
+    for p in [
+        Primitive::Scalar,
+        Primitive::Vector,
+        Primitive::Overlay,
+        Primitive::Magnitude,
+        Primitive::MagInterference,
+        Primitive::Diff,
+        Primitive::AttitudeRpy,
+    ] {
+        assert!(
+            primitive_supports_zoom(p),
+            "{p:?} renders through egui_plot — must show Reset zoom"
+        );
+    }
+}
+
+#[test]
+fn v0_16_1_label_submenu_hidden_on_status_and_info_text() {
+    // Label overlays (data / metadata) apply only to plot cells; Status and
+    // InfoText carry their own content semantics. The menu hides the Label
+    // submenu entirely for those primitives.
+    assert!(!primitive_supports_label_mode(Primitive::Status));
+    assert!(!primitive_supports_label_mode(Primitive::InfoText));
+}
+
+#[test]
+fn v0_16_1_label_submenu_visible_on_2d_plot_primitives() {
+    for p in [
+        Primitive::Scalar,
+        Primitive::Vector,
+        Primitive::Overlay,
+        Primitive::Magnitude,
+        Primitive::Diff,
+        Primitive::AttitudeRpy,
+    ] {
+        assert!(
+            primitive_supports_label_mode(p),
+            "{p:?} should expose the Label submenu"
+        );
+    }
+}
+
+#[test]
+fn v0_16_1_status_cell_emits_full_action_set_minus_zoom() {
+    // Data-layer simulation: a right-click on a Status cell emits Edit /
+    // Hide / Delete (and the Label submenu would be hidden by the
+    // predicate). The CLI consumes the actions identically — no per-cell
+    // routing differs for Status vs. plot primitives.
+    use std::collections::HashMap;
+    let mut tpl = empty_template();
+    apply_panel_draft(
+        &mut tpl,
+        &PanelDraft {
+            row: 0,
+            col: 0,
+            source_key: "flight_mode".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut visibility = HashMap::new();
+    let mut states: HashMap<(usize, usize), PanelState> = HashMap::new();
+    let mut labels = HashMap::new();
+
+    // Hide works on Status cells.
+    apply_action(
+        &CellMenuAction::HideToggle { row: 0, col: 0 },
+        &mut tpl,
+        &mut visibility,
+        &mut states,
+        &mut labels,
+    );
+    assert_eq!(visibility.get(&(0, 0)).copied(), Some(false));
+
+    // Delete works on Status cells.
+    apply_action(
+        &CellMenuAction::Delete { row: 0, col: 0 },
+        &mut tpl,
+        &mut visibility,
+        &mut states,
+        &mut labels,
+    );
+    assert!(tpl.cells.is_empty(), "Right-click Delete on a Status cell removes it");
+}
+
+#[test]
+fn v0_16_1_info_text_cell_emits_full_action_set_minus_zoom() {
+    // Same contract for InfoText: Edit / Hide / Delete reach the CLI, the
+    // gated "Reset zoom" / "Label" entries do not even appear in the menu.
+    use std::collections::HashMap;
+    let mut tpl = empty_template();
+    apply_panel_draft(
+        &mut tpl,
+        &PanelDraft {
+            row: 1,
+            col: 0,
+            source_key: "_info".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut visibility = HashMap::new();
+    let mut states: HashMap<(usize, usize), PanelState> = HashMap::new();
+    let mut labels = HashMap::new();
+
+    apply_action(
+        &CellMenuAction::HideToggle { row: 1, col: 0 },
+        &mut tpl,
+        &mut visibility,
+        &mut states,
+        &mut labels,
+    );
+    assert_eq!(visibility.get(&(1, 0)).copied(), Some(false));
+
+    apply_action(
+        &CellMenuAction::Delete { row: 1, col: 0 },
+        &mut tpl,
+        &mut visibility,
+        &mut states,
+        &mut labels,
+    );
+    assert!(tpl.cells.is_empty(), "Right-click Delete on an InfoText cell removes it");
+}
+
 #[test]
 fn all_action_variants_round_trip_through_clone_and_eq() {
     // The CLI buffers actions in a Vec between frames; pin the trait bounds.
