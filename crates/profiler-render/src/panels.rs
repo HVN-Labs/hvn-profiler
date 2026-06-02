@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use egui::{Align2, Color32, Rect, RichText, TextStyle, UiBuilder, Vec2};
+use egui::{Align2, Color32, CursorIcon, Id, LayerId, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextStyle, UiBuilder, Vec2};
 use egui_plot::{Corner, HLine, Legend, Line, Plot, PlotPoints};
 
 use profiler_template::{Cell, CellSource, LabelMode, Primitive, Section, Template};
@@ -46,6 +46,47 @@ pub struct PanelState {
     /// `egui_plot` is showing and never reapplies its rolling X-window or
     /// auto-bounds-Y reset.
     pub locked: bool,
+    /// v0.11.0 — last rendered top-left of the cell rect, in screen pixels.
+    /// Snapshotted at the END of each frame so the next frame can detect a
+    /// position change (cell moved due to drag-reorder, delete-then-compact,
+    /// or hide-then-compact) and animate the transition. `None` until the
+    /// cell paints for the first time.
+    pub anim_last_rect_min: Option<(f32, f32)>,
+    /// v0.11.0 — origin point for the active reflow animation (start of the
+    /// lerp). `None` when no animation is in flight.
+    pub anim_origin: Option<(f32, f32)>,
+    /// v0.11.0 — animation progress, `0.0` (just started) → `1.0` (done).
+    /// `None` when no animation is in flight. Driven by frame `dt`.
+    pub anim_t: Option<f32>,
+}
+
+/// v0.11.0 — in-flight drag-to-reorder state captured during the first pass of
+/// the grid renderer. Used by the second pass (cell drawing) to short-circuit
+/// the dragged cell's normal paint and substitute a "moving from here" outline,
+/// and by the post-loop overlay pass to render the floating cursor copy.
+struct DragSession {
+    /// Cell's persisted `(row, col)` (used for the emitted action).
+    from: (usize, usize),
+    /// Layout-grid `(r, c)` the cell was occupying — may differ from `from`
+    /// under `compact_hidden = true`.
+    layout_rc: (usize, usize),
+    /// Original rect of the cell at the start of the frame (before any drag
+    /// offset is applied).
+    rect_origin: Rect,
+    /// Cumulative drag offset (sum of `drag_delta` since drag started).
+    offset: Vec2,
+    /// Last known pointer position (for hit-testing into snap targets).
+    pointer: Pos2,
+    /// `true` on the frame where the drag was released (drop event).
+    released: bool,
+}
+
+/// v0.11.0 — stable egui interaction id for a cell's drag handle. Keying by
+/// `(row, col)` keeps the id consistent across frames when the cell doesn't
+/// move; on relocation a fresh id is allocated which restarts the per-cell
+/// offset memory.
+fn drag_id_for_cell(cell: &Cell) -> Id {
+    Id::new(("hvn-profiler-cell-drag", cell.row, cell.col))
 }
 
 /// v0.10.0 — per-cell context-menu action emitted by the renderer for the CLI
@@ -63,6 +104,19 @@ pub enum CellMenuAction {
     SetLabelMode { row: usize, col: usize, mode: LabelMode },
     /// "Delete panel" — drop the cell from the template (with confirm).
     Delete { row: usize, col: usize },
+    /// v0.11.0 — drag-to-reorder dropped a panel from `from` onto another
+    /// occupied slot at `to`. The CLI swaps the two cells' `(row, col)` and
+    /// runs `compact_cells` to tidy.
+    SwapTo {
+        from: (usize, usize),
+        to: (usize, usize),
+    },
+    /// v0.11.0 — drag-to-reorder dropped a panel from `from` onto an empty
+    /// grid slot at `to`. The CLI relocates the cell, then compacts.
+    MoveTo {
+        from: (usize, usize),
+        to: (usize, usize),
+    },
 }
 
 /// Global label-mode override applied to every cell at render time.
@@ -91,6 +145,72 @@ impl LabelOverride {
 }
 
 use crate::TraceStore;
+
+// ─── v0.11.0 — Responsive grid sizing ───────────────────────────────────────
+//
+// The 2D grid reflows when the available width gets cramped so titles, plot
+// data, and label overlays don't overlap. Two break-points:
+//
+//   width / declared_cols < MIN_CELL_W      → halve the column count
+//   width / 1            < SINGLE_COL_W     → fall through to single column
+//                                              (one column, N rows)
+//
+// The fall-through is independent of the declared template grid; once we hit
+// single-column mode each visible cell gets its own row. The renderer still
+// produces the same `at[]` ordering (top-to-bottom, left-to-right of the
+// ORIGINAL grid) so drag-to-reorder's `from`/`to` action coordinates remain
+// stable — only the visual layout slot a cell occupies changes.
+
+/// Minimum cell width (in pixels) before the renderer halves the column count.
+/// Below this, titles + plot grid + legend collide.
+pub const RESPONSIVE_MIN_CELL_W: f32 = 240.0;
+
+/// Below this total available width (in pixels), regardless of cell count, the
+/// renderer reflows to a single column. Matches the user's "very narrow window"
+/// case where 2-up is still too cramped.
+pub const RESPONSIVE_SINGLE_COL_W: f32 = 480.0;
+
+/// Pixel threshold for the 3D side panel collapse: below this WINDOW width,
+/// the Split view hides the 3D pane (the user can re-open it via the toolbar
+/// toggle / "view: 3D view" radio).
+pub const RESPONSIVE_3D_COLLAPSE_W: f32 = 1100.0;
+
+/// Compute the effective `(rows, cols)` for a responsive grid.
+///
+/// `visible_count` is the number of cells we need to lay out; `declared_cols`
+/// is the template's declared column count (used as the upper bound at wide
+/// widths). The result is the `(rows, cols)` pair the renderer should pack
+/// the visible cells into.
+///
+/// Behaviour:
+/// - width / declared_cols >= MIN_CELL_W      → keep declared_cols
+/// - width / (declared_cols/2) >= MIN_CELL_W  → halve, recompute rows
+/// - width >= SINGLE_COL_W                    → halve again until each cell ≥ MIN_CELL_W
+/// - otherwise                                → single column, one cell per row
+///
+/// `visible_count == 0` returns `(1, declared_cols.max(1))` so an empty grid
+/// still has a valid rect to draw into.
+pub fn responsive_grid_dims(
+    available_width: f32,
+    visible_count: usize,
+    declared_cols: usize,
+) -> (usize, usize) {
+    let declared = declared_cols.max(1);
+    let count = visible_count.max(1);
+
+    // Very narrow: fall through to single column regardless of declared.
+    if available_width < RESPONSIVE_SINGLE_COL_W {
+        return (count, 1);
+    }
+
+    // Try the declared column count, then halve until each cell is ≥ MIN_CELL_W.
+    let mut cols = declared;
+    while cols > 1 && (available_width / cols as f32) < RESPONSIVE_MIN_CELL_W {
+        cols = (cols / 2).max(1);
+    }
+    let rows = count.div_ceil(cols).max(1);
+    (rows, cols)
+}
 
 /// Per-frame render stats, surfaced to the CLI for the 1 Hz status log.
 #[derive(Debug, Clone, Copy, Default)]
@@ -141,6 +261,23 @@ pub struct GridRenderOptions<'a> {
     /// them back. Defaults to `true` (the v0.10.2 behaviour); set to `false`
     /// to get the v0.10.1 behaviour where hidden cells leave blank slots.
     pub compact_hidden: bool,
+    /// v0.11.0 — enable drag-to-reorder: each cell rect becomes a drag handle
+    /// that, on drop, emits `CellMenuAction::SwapTo` (onto an occupied slot)
+    /// or `CellMenuAction::MoveTo` (onto an empty slot). No-op if `menu_sink`
+    /// is `None` (the renderer needs a sink to surface the action). Defaults
+    /// to `true`.
+    pub drag_to_reorder: bool,
+    /// v0.11.0 — enable reflow animation: when a cell's last-rendered top-left
+    /// differs from this frame's target, the renderer lerps from the previous
+    /// position to the new one over ~150 ms. Pure visual — the underlying
+    /// `(row, col)` logic uses the target position immediately. Defaults
+    /// to `true`.
+    pub animate_reflow: bool,
+    /// v0.11.0 — wall-clock delta for the current frame (in seconds). Used to
+    /// advance the per-cell animation progress. The CLI passes
+    /// `ctx.input(|i| i.stable_dt as f32)`. Defaults to `0.0` (animation
+    /// effectively pauses).
+    pub frame_dt: f32,
 }
 
 impl<'a> Default for GridRenderOptions<'a> {
@@ -150,6 +287,9 @@ impl<'a> Default for GridRenderOptions<'a> {
             menu_sink: None,
             visibility_override: None,
             compact_hidden: true,
+            drag_to_reorder: true,
+            animate_reflow: true,
+            frame_dt: 0.0,
         }
     }
 }
@@ -184,9 +324,13 @@ pub fn render_template_grid_full(
     tpl: &Template,
     store: &TraceStore,
     label_override: LabelOverride,
-    mut opts: GridRenderOptions<'_>,
+    opts: GridRenderOptions<'_>,
 ) -> GridStats {
-    let cols = tpl.grid.cols.max(1);
+    let declared_cols = tpl.grid.cols.max(1);
+
+    // Compute the absolute rect we get to draw inside FIRST so the responsive
+    // breakpoints can drive the column count.
+    let avail = ui.available_rect_before_wrap();
 
     // v0.10.2 — when `compact_hidden` is set, hidden cells (either
     // `cell.visible == false` or flipped off in `visibility_override`) skip
@@ -197,7 +341,15 @@ pub fn render_template_grid_full(
     //
     // When `compact_hidden` is false (v0.10.1 behaviour), each cell stays at
     // its declared `(row, col)` and hidden slots render as gaps.
-    let (rows, at) = if opts.compact_hidden {
+    //
+    // v0.11.0 — responsive reflow: when the available width / declared_cols
+    // drops below `RESPONSIVE_MIN_CELL_W`, halve `cols`. Below
+    // `RESPONSIVE_SINGLE_COL_W` total width, fall through to a single column
+    // regardless of the declared layout. Hidden cells are still elided; the
+    // visible-cell order (top-to-bottom, left-to-right of the ORIGINAL grid)
+    // is preserved so drag actions stay anchored to the cell's persisted
+    // (row, col) — only the visual slot the cell occupies changes.
+    let (rows, cols, at) = if opts.compact_hidden {
         let mut visible_cells: Vec<&Cell> = tpl
             .cells
             .iter()
@@ -215,30 +367,104 @@ pub fn render_template_grid_full(
         // `compact_cells` so the on-disk save and the in-memory layout agree
         // after a "Save".
         visible_cells.sort_by_key(|c| (c.row, c.col));
-        let rows = visible_cells
-            .len()
-            .div_ceil(cols)
-            .max(1);
+        let (rows, cols) =
+            responsive_grid_dims(avail.width(), visible_cells.len(), declared_cols);
         let mut at: Vec<Option<&Cell>> = vec![None; rows * cols];
         for (i, c) in visible_cells.iter().enumerate() {
             at[i] = Some(*c);
         }
-        (rows, at)
+        (rows, cols, at)
     } else {
-        let rows = tpl.grid.rows.max(1);
-        let mut at: Vec<Option<&Cell>> = vec![None; rows * cols];
-        for c in &tpl.cells {
-            if c.row < rows && c.col < cols {
-                at[c.row * cols + c.col] = Some(c);
+        // Non-compact mode honours the template's declared grid coordinates,
+        // but we still down-shift `cols` when the window is cramped. Cells
+        // whose declared `col` no longer fits the responsive `cols` are
+        // re-packed into row-major order so they don't get clipped.
+        let declared_rows = tpl.grid.rows.max(1);
+        let mut placed: Vec<&Cell> = tpl
+            .cells
+            .iter()
+            .filter(|c| c.row < declared_rows && c.col < declared_cols)
+            .collect();
+        placed.sort_by_key(|c| (c.row, c.col));
+        let (rows, cols) = if (avail.width() / declared_cols as f32) >= RESPONSIVE_MIN_CELL_W
+            && avail.width() >= RESPONSIVE_SINGLE_COL_W
+        {
+            // Wide enough → original behaviour: keep declared grid intact.
+            let mut at: Vec<Option<&Cell>> =
+                vec![None; declared_rows * declared_cols];
+            for c in &placed {
+                at[c.row * declared_cols + c.col] = Some(*c);
             }
+            return finish_render_full(
+                ui, tpl, store, label_override, opts, declared_rows, declared_cols, at, avail,
+            );
+        } else {
+            // Cramped → re-pack into responsive dims.
+            responsive_grid_dims(avail.width(), placed.len(), declared_cols)
+        };
+        let mut at: Vec<Option<&Cell>> = vec![None; rows * cols];
+        for (i, c) in placed.iter().enumerate() {
+            at[i] = Some(*c);
         }
-        (rows, at)
+        (rows, cols, at)
     };
 
-    // Compute the absolute rect we get to draw inside. `available_rect_before_wrap`
-    // returns true pixel coords on the parent ui, so child cells can be placed
-    // by `scope_builder` with `max_rect`.
-    let avail = ui.available_rect_before_wrap();
+    finish_render_full(ui, tpl, store, label_override, opts, rows, cols, at, avail)
+}
+
+/// v0.11.0 — extracted body of `render_template_grid_full` once the responsive
+/// `(rows, cols)` and packed `at[]` have been decided. Keeps the two branches
+/// of the responsive dispatcher (compact-hidden vs. honour-declared) from
+/// duplicating the post-layout drag/animate/render pipeline.
+#[allow(clippy::too_many_arguments)]
+fn finish_render_full(
+    ui: &mut egui::Ui,
+    tpl: &Template,
+    store: &TraceStore,
+    label_override: LabelOverride,
+    mut opts: GridRenderOptions<'_>,
+    rows: usize,
+    cols: usize,
+    at: Vec<Option<&Cell>>,
+    avail: Rect,
+) -> GridStats {
+    // v0.11.0 — when the responsive layout has collapsed the grid to a single
+    // column AND the cell count exceeds what fits vertically, wrap the whole
+    // grid in a vertical ScrollArea so the operator can scroll instead of
+    // squishing cells below their minimum height.
+    let single_col = cols == 1 && rows > 2;
+    if single_col {
+        let mut stats_out = GridStats::default();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                // Re-fetch the rect inside the scroll viewport.
+                let avail = ui.available_rect_before_wrap();
+                stats_out = render_grid_body(
+                    ui, tpl, store, label_override, &mut opts, rows, cols, &at, avail,
+                );
+            });
+        return stats_out;
+    }
+    render_grid_body(
+        ui, tpl, store, label_override, &mut opts, rows, cols, &at, avail,
+    )
+}
+
+/// v0.11.0 — pure layout + paint, no responsive-mode decisions. Split out so
+/// the single-column path can wrap it in a `ScrollArea`.
+#[allow(clippy::too_many_arguments)]
+fn render_grid_body(
+    ui: &mut egui::Ui,
+    tpl: &Template,
+    store: &TraceStore,
+    label_override: LabelOverride,
+    opts: &mut GridRenderOptions<'_>,
+    rows: usize,
+    cols: usize,
+    at: &[Option<&Cell>],
+    avail: Rect,
+) -> GridStats {
     let layout = compute_layout(avail, rows, cols, &tpl.sections);
 
     let mut stats = GridStats::default();
@@ -250,10 +476,115 @@ pub fn render_template_grid_full(
 
     // ── Cells ───────────────────────────────────────────────────────────────
     let interactive = opts.panel_states.is_some();
+    let drag_enabled = opts.drag_to_reorder && opts.menu_sink.is_some() && interactive;
+    let animate = opts.animate_reflow && interactive;
+    // v0.11.0 — clamp frame_dt so animations don't snap to the end when the
+    // app un-minimizes / the window regains focus after a long pause.
+    let frame_dt = opts.frame_dt;
+    let anim_active = animate && frame_dt > 0.0 && frame_dt < 0.5;
+
+    // v0.11.0 — first pass: discover the cell currently being dragged (so we
+    // can render it at its drag-offset position instead of its grid slot).
+    // We also collect the per-slot target rects so the drop hit-test in the
+    // second pass can detect snap zones.
+    let mut dragging: Option<DragSession> = None;
+    if drag_enabled {
+        for r in 0..rows {
+            for c in 0..cols {
+                let id = r * cols + c;
+                let Some(cell) = at[id] else { continue };
+                if !cell.visible || cell.sources.is_empty() {
+                    continue;
+                }
+                let rect = layout.cell_rect(r, c);
+                // v0.11.0 — drag handle is the cell's title strip (top
+                // ~18 px), so the inner plot keeps its own drag/zoom for
+                // pan and box-zoom interactions. The strip spans the full
+                // cell width and is tall enough to grab comfortably.
+                let handle_rect = Rect::from_min_size(
+                    rect.min,
+                    Vec2::new(rect.width(), 18.0_f32.min(rect.height())),
+                );
+                let interact_id = drag_id_for_cell(cell);
+                let resp = ui.interact(handle_rect, interact_id, Sense::drag());
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                }
+                if resp.dragged() || resp.drag_started() {
+                    let delta = resp.drag_delta();
+                    // Cumulative offset persisted in a memory id so each
+                    // frame of the drag keeps moving relative to the rect.
+                    let prev_off: Vec2 = ui
+                        .ctx()
+                        .memory(|m| m.data.get_temp(interact_id))
+                        .unwrap_or_default();
+                    let off = if resp.drag_started() {
+                        Vec2::ZERO
+                    } else {
+                        prev_off + delta
+                    };
+                    ui.ctx()
+                        .memory_mut(|m| m.data.insert_temp(interact_id, off));
+                    dragging = Some(DragSession {
+                        from: (cell.row, cell.col),
+                        layout_rc: (r, c),
+                        rect_origin: rect,
+                        offset: off,
+                        pointer: resp.interact_pointer_pos().unwrap_or(rect.center()),
+                        released: false,
+                    });
+                } else if resp.drag_stopped() {
+                    let prev_off: Vec2 = ui
+                        .ctx()
+                        .memory(|m| m.data.get_temp(interact_id))
+                        .unwrap_or_default();
+                    ui.ctx()
+                        .memory_mut(|m| m.data.remove_temp::<Vec2>(interact_id));
+                    dragging = Some(DragSession {
+                        from: (cell.row, cell.col),
+                        layout_rc: (r, c),
+                        rect_origin: rect,
+                        offset: prev_off,
+                        pointer: resp.interact_pointer_pos().unwrap_or(rect.center()),
+                        released: true,
+                    });
+                }
+            }
+        }
+        if dragging.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
+    }
+
+    // v0.11.0 — second pass: figure out the snap target (slot whose center
+    // the dragged panel's center is closest to, within the grid). Used to
+    // highlight + to compute the drop action on `released`.
+    let snap_target: Option<(usize, usize)> = dragging.as_ref().and_then(|ds| {
+        let dragged_center = ds.rect_origin.center() + ds.offset;
+        // Only snap when the pointer is inside the grid bounds.
+        if !layout.total_used.expand(8.0).contains(ds.pointer) {
+            return None;
+        }
+        let mut best: Option<((usize, usize), f32)> = None;
+        for r in 0..rows {
+            for c in 0..cols {
+                if (r, c) == ds.layout_rc {
+                    continue;
+                }
+                let target_rect = layout.cell_rect(r, c);
+                let d = (target_rect.center() - dragged_center).length();
+                if best.is_none_or(|b| d < b.1) {
+                    best = Some(((r, c), d));
+                }
+            }
+        }
+        best.map(|b| b.0)
+    });
+
     for r in 0..rows {
         for c in 0..cols {
             let id = r * cols + c;
-            let rect = layout.cell_rect(r, c);
+            let target_rect = layout.cell_rect(r, c);
             // When `compact_hidden` is true the at-grid only contains visible
             // cells (we filtered above), so the runtime override check is
             // redundant. When false, honour the per-slot override at the
@@ -266,14 +597,98 @@ pub fn render_template_grid_full(
                     .and_then(|m| m.get(&(r, c)).copied())
                     .unwrap_or(true)
             };
+
+            // v0.11.0 — if a drag is in flight and this slot owns the dragged
+            // cell, paint a dashed "moving from here" outline at the original
+            // slot. The dragged cell itself is rendered later as a top-layer
+            // overlay (so cancel/no-op snaps it back here automatically).
+            let is_drag_source = dragging
+                .as_ref()
+                .is_some_and(|d| d.layout_rc == (r, c));
+
+            // v0.11.0 — animated reflow: interpolate the rect's top-left from
+            // the previously-rendered position toward the target.
+            let mut render_rect = target_rect;
+            if anim_active {
+                if let Some(map) = opts.panel_states.as_deref_mut() {
+                    if let Some(cell) = at[id] {
+                        let state_key = (cell.row, cell.col);
+                        let st = map.entry(state_key).or_default();
+                        // Detect a position change vs. the previous frame.
+                        if let Some(prev) = st.anim_last_rect_min {
+                            let prev_pos = Pos2::new(prev.0, prev.1);
+                            if (prev_pos - target_rect.min).length() > 0.5
+                                && st.anim_t.is_none()
+                            {
+                                st.anim_origin = Some(prev);
+                                st.anim_t = Some(0.0);
+                            }
+                        }
+                        // Advance + apply animation if in flight.
+                        if let (Some(origin), Some(t)) = (st.anim_origin, st.anim_t) {
+                            let new_t = (t + frame_dt / 0.150).clamp(0.0, 1.0);
+                            let eased = 1.0 - (1.0 - new_t).powi(3);
+                            let origin_pos = Pos2::new(origin.0, origin.1);
+                            let lerped = origin_pos.lerp(target_rect.min, eased);
+                            render_rect = Rect::from_min_size(lerped, target_rect.size());
+                            if new_t >= 1.0 {
+                                st.anim_origin = None;
+                                st.anim_t = None;
+                            } else {
+                                st.anim_t = Some(new_t);
+                                // Request a repaint so the animation keeps
+                                // advancing even if nothing else is dirty.
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                }
+            }
+
             // Always claim the rect so the next row's `available_rect`
             // computation downstream of the grid is correct, even when a
             // slot is empty.
-            ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                ui.set_clip_rect(rect);
+            ui.scope_builder(UiBuilder::new().max_rect(target_rect), |ui| {
+                ui.set_clip_rect(target_rect);
                 match at[id] {
                     Some(cell) if cell.visible && runtime_visible && !cell.sources.is_empty() => {
+                        if is_drag_source {
+                            // Draw a dashed outline + dimmed fill where the
+                            // panel WAS. The actual content paints on the
+                            // top layer below.
+                            let painter = ui.painter_at(target_rect);
+                            painter.rect_filled(
+                                target_rect,
+                                4.0,
+                                Color32::from_black_alpha(40),
+                            );
+                            painter.rect_stroke(
+                                target_rect,
+                                4.0,
+                                Stroke::new(1.0, Color32::from_white_alpha(80)),
+                                StrokeKind::Inside,
+                            );
+                            // Still count this panel toward stats so logs
+                            // don't blink during a drag.
+                            stats.panels += 1;
+                            // Snapshot last-rect for animation on next frame.
+                            if let Some(map) = opts.panel_states.as_deref_mut() {
+                                let st = map.entry((cell.row, cell.col)).or_default();
+                                st.anim_last_rect_min =
+                                    Some((target_rect.min.x, target_rect.min.y));
+                            }
+                            return;
+                        }
                         stats.panels += 1;
+                        // Snap-zone highlight on the target.
+                        if snap_target == Some((r, c)) {
+                            let painter = ui.painter_at(target_rect);
+                            painter.rect_filled(
+                                target_rect,
+                                4.0,
+                                Color32::from_white_alpha(40),
+                            );
+                        }
                         // Pull the lock state for this cell. Under
                         // `compact_hidden` mode the (r, c) we draw at is a
                         // layout slot, not the cell's persisted coordinates;
@@ -295,7 +710,7 @@ pub fn render_template_grid_full(
                             store,
                             store.window_s,
                             label_override,
-                            rect,
+                            render_rect,
                             interactive,
                             panel_locked,
                         );
@@ -307,10 +722,102 @@ pub fn render_template_grid_full(
                         if let Some(sink) = opts.menu_sink.as_deref_mut() {
                             attach_context_menu(&plot_resp, cell, sink);
                         }
+                        // Snapshot for next frame's animation detection. Use
+                        // the TARGET (logical) rect so the animation chases
+                        // the new layout slot, not the lerped intermediate.
+                        if let Some(map) = opts.panel_states.as_deref_mut() {
+                            let st = map.entry((cell.row, cell.col)).or_default();
+                            st.anim_last_rect_min =
+                                Some((target_rect.min.x, target_rect.min.y));
+                        }
                     }
-                    _ => {} // empty slot — rect is reserved, nothing drawn.
+                    _ => {
+                        // Empty slot — paint a snap highlight if a drag is
+                        // hovering over it, so the operator sees where it'd
+                        // land.
+                        if snap_target == Some((r, c)) {
+                            let painter = ui.painter_at(target_rect);
+                            painter.rect_filled(
+                                target_rect,
+                                4.0,
+                                Color32::from_white_alpha(40),
+                            );
+                        }
+                    }
                 }
             });
+        }
+    }
+
+    // v0.11.0 — drag overlay: render a semi-transparent copy of the dragged
+    // panel at the pointer offset, on a top layer so it floats above the
+    // grid. Use the cell's content but with reduced opacity via a tint.
+    if let Some(ds) = &dragging {
+        let cell = at[ds.layout_rc.0 * cols + ds.layout_rc.1];
+        if let Some(cell) = cell {
+            let overlay_rect = ds.rect_origin.translate(ds.offset);
+            let layer = LayerId::new(Order::Tooltip, Id::new(("hvn-profiler-drag", cell.row, cell.col)));
+            let painter = ui.ctx().layer_painter(layer);
+            painter.rect_filled(overlay_rect, 4.0, Color32::from_rgba_unmultiplied(40, 80, 140, 180));
+            painter.rect_stroke(
+                overlay_rect,
+                4.0,
+                Stroke::new(1.5, Color32::from_white_alpha(180)),
+                StrokeKind::Inside,
+            );
+            if !cell.title.is_empty() {
+                painter.text(
+                    overlay_rect.left_top() + Vec2::new(8.0, 6.0),
+                    Align2::LEFT_TOP,
+                    &cell.title,
+                    egui::FontId::proportional(13.0),
+                    Color32::from_gray(240),
+                );
+            }
+            painter.text(
+                overlay_rect.center(),
+                Align2::CENTER_CENTER,
+                cell.sources
+                    .first()
+                    .map(|s| s.key.as_str())
+                    .unwrap_or(""),
+                egui::FontId::proportional(12.0),
+                Color32::from_white_alpha(200),
+            );
+        }
+    }
+
+    // v0.11.0 — drop resolution: on release, emit SwapTo / MoveTo (or no-op
+    // when the snap target is the source / outside the grid).
+    if let Some(ds) = &dragging {
+        if ds.released {
+            if let Some(sink) = opts.menu_sink.as_deref_mut() {
+                if let Some(to_rc) = snap_target {
+                    // Translate layout (r, c) → cell's persisted coords by
+                    // looking at `at[]`. For an occupied target → SwapTo
+                    // against that cell's own (row, col). For an empty slot
+                    // → MoveTo to the layout slot (which is also the persisted
+                    // slot when compact_hidden is false; in compact-hidden
+                    // mode dropping onto an empty layout slot is the same as
+                    // appending, so we use the layout coords directly).
+                    let to_idx = to_rc.0 * cols + to_rc.1;
+                    match at[to_idx] {
+                        Some(target_cell) => {
+                            sink.push(CellMenuAction::SwapTo {
+                                from: ds.from,
+                                to: (target_cell.row, target_cell.col),
+                            });
+                        }
+                        None => {
+                            sink.push(CellMenuAction::MoveTo {
+                                from: ds.from,
+                                to: to_rc,
+                            });
+                        }
+                    }
+                }
+                // No snap target → drop in the gutter → no-op (snap back).
+            }
         }
     }
 
@@ -340,6 +847,32 @@ pub fn layout_cell_rects(tpl: &Template, window: Rect) -> Vec<Rect> {
         }
     }
     out
+}
+
+/// v0.11.0 — test helper: emit the cell rects the RESPONSIVE renderer would
+/// actually use for a given window. Honours the same compact-hidden + cell-count
+/// reflow as `render_template_grid_full`. Returned in row-major order of the
+/// EFFECTIVE grid (not the declared template grid) — index `i` is the cell at
+/// position `(i / cols, i % cols)` of the rendered layout.
+///
+/// Returns `(rows, cols, rects)` so tests can assert the grid dims directly.
+#[doc(hidden)]
+pub fn responsive_cell_rects(tpl: &Template, window: Rect) -> (usize, usize, Vec<Rect>) {
+    let declared_cols = tpl.grid.cols.max(1);
+    let visible_count = tpl
+        .cells
+        .iter()
+        .filter(|c| c.visible)
+        .count();
+    let (rows, cols) = responsive_grid_dims(window.width(), visible_count, declared_cols);
+    let lay = compute_layout(window, rows, cols, &tpl.sections);
+    let mut rects = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            rects.push(lay.cell_rect(r, c));
+        }
+    }
+    (rows, cols, rects)
 }
 
 /// Precomputed pixel rectangles for every grid cell + section banner.
@@ -508,11 +1041,29 @@ fn render_cell(
     let plot_id = format!("cell_{}_{}", cell.row, cell.col);
 
     // Title above the plot — measured so the plot below knows how much height
-    // it has left. We use a fixed font size to keep the title row predictable
-    // (16 px including baseline).
-    const TITLE_H: f32 = 16.0;
+    // it has left.
+    //
+    // v0.11.0 — title font size scales with cell width so narrow cells stay
+    // legible without overflowing. Clamped to `[10, 14]` px so we don't go
+    // illegible at extreme narrow widths or balloon on a 4K monitor.
+    let title_font_size = (cell_rect.width() * 0.030).clamp(10.0, 14.0);
+    let title_h: f32 = if cell.title.is_empty() { 0.0 } else { title_font_size + 4.0 };
     if !cell.title.is_empty() {
-        ui.label(RichText::new(&cell.title).small().strong());
+        // v0.11.0 — ellipsis-truncate when the title would overflow the cell
+        // width. We approximate: each char ≈ `title_font_size * 0.55` px.
+        let avail_chars = ((cell_rect.width() - 12.0) / (title_font_size * 0.55)) as usize;
+        let title_text: String = if cell.title.chars().count() > avail_chars && avail_chars > 3 {
+            let mut s: String = cell.title.chars().take(avail_chars.saturating_sub(1)).collect();
+            s.push('…');
+            s
+        } else {
+            cell.title.clone()
+        };
+        ui.label(
+            RichText::new(title_text)
+                .strong()
+                .size(title_font_size),
+        );
     }
 
     let latest_ts = store.latest_ts();
@@ -529,20 +1080,29 @@ fn render_cell(
 
     let mut any_data = false;
 
-    let title_h = if cell.title.is_empty() { 0.0 } else { TITLE_H };
     let plot_h = (cell_rect.height() - title_h).max(40.0);
     let plot_w = cell_rect.width();
+
+    // v0.11.0 — hide the legend entirely when the cell is narrower than the
+    // legend would occupy any usable plot area. Below ~160 px the legend
+    // covers the whole left half of the plot and the user can identify
+    // traces via the title instead.
+    const LEGEND_HIDE_W: f32 = 160.0;
+    let show_legend = plot_w >= LEGEND_HIDE_W;
 
     // v0.10.0 — when interactive, enable the egui_plot zoom/pan/box-zoom
     // suite + double-click reset. The auto-scale-Y default holds UNTIL the
     // user interacts; after that, the per-cell `locked` flag stays `true`
     // until the right-click "Reset zoom" or a double-click flips it off.
-    let resp = Plot::new(plot_id)
+    let mut plot = Plot::new(plot_id);
+    if show_legend {
         // v0.10.1 — pin the legend to the top-left so it stays clear of the
         // most-recent samples on a rolling X window (which always end at the
         // RIGHT edge of the plot). With the default `RightTop` position the
         // legend overlapped the live trace tip every frame.
-        .legend(Legend::default().position(Corner::LeftTop))
+        plot = plot.legend(Legend::default().position(Corner::LeftTop));
+    }
+    let resp = plot
         .show_axes([true, true])
         .show_grid([true, true])
         // Force the plot footprint to the cell rect minus the title strip.

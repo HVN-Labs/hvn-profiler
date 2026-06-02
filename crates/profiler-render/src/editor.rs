@@ -16,11 +16,78 @@
 //!   `collect_source_keys` against the live multi-drone store map — exposed
 //!   here so a future per-key autocomplete can swap in without API churn.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use profiler_template::{Cell, CellSource, LabelMode, Primitive, Template, Trail3d, Trail3dSources, View3d};
 
 use crate::TraceStore;
+
+/// v0.11.0 — opinionated default schema of source-keys for HVN-SITL fleets.
+///
+/// The picker dropdown shows this list FIRST so users can author panel
+/// templates against AP-fed channels (`ap_attitude`, `ap_raw_imu`, …) BEFORE
+/// ArduPilot starts streaming. Without this seed the picker is empty / missing
+/// AP entries for the first ~5–20 s after fleet startup because AP-emitted
+/// keys flow as `None` from `dt_runner` until the autopilot wakes up, and
+/// `TraceStore` only registers a key after a non-`None` value lands.
+///
+/// The list is project-specific by design: standalone deployments with custom
+/// envelopes still get observed-key discovery merged on top via
+/// [`collect_source_keys`].
+pub const KNOWN_HVN_SITL_KEYS: &[&str] = &[
+    // ── DT physics (truth / raw sensor models) ────────────────────────────
+    "t",
+    "accel[0]", "accel[1]", "accel[2]",
+    "gyro[0]", "gyro[1]", "gyro[2]",
+    "mag_xyz[0]", "mag_xyz[1]", "mag_xyz[2]",
+    "mag_clean_xyz[0]", "mag_clean_xyz[1]", "mag_clean_xyz[2]",
+    "wind_ned[0]", "wind_ned[1]", "wind_ned[2]",
+    "baro_pressure", "baro_temp", "baro_alt", "state_alt",
+    "gps_alt", "gps_vn",
+    "quat_wxyz[0]", "quat_wxyz[1]", "quat_wxyz[2]", "quat_wxyz[3]",
+    "euler[0]", "euler[1]", "euler[2]",
+    // ── AP MAVLink mirrors (what the autopilot sees) ──────────────────────
+    "ap_attitude[0]", "ap_attitude[1]", "ap_attitude[2]",
+    "ap_raw_imu[0]", "ap_raw_imu[1]", "ap_raw_imu[2]",
+    "ap_raw_imu[3]", "ap_raw_imu[4]", "ap_raw_imu[5]",
+    "ap_vfr_alt",
+    "ap_vel_ned[0]", "ap_vel_ned[1]", "ap_vel_ned[2]",
+    // ── Position NED (truth / GPS sensor / EKF / target) ──────────────────
+    "pos_truth_ned[0]", "pos_truth_ned[1]", "pos_truth_ned[2]",
+    "pos_gps_ned[0]", "pos_gps_ned[1]", "pos_gps_ned[2]",
+    "pos_ekf_ned[0]", "pos_ekf_ned[1]", "pos_ekf_ned[2]",
+    "pos_target_ned[0]", "pos_target_ned[1]", "pos_target_ned[2]",
+];
+
+/// v0.11.0 — per-category collapse state for the grouped source-key dropdown.
+///
+/// Kept alongside the editor draft (one instance per modal) so each category
+/// remembers whether the operator collapsed it independently of any other
+/// editor. The default state is "all expanded" — first opens of the picker
+/// look exactly like the v0.10.2 behaviour.
+///
+/// Used by the `source_key_combo` widget to drive a manual ▶/▼ toggle that
+/// does NOT close the surrounding `ComboBox` popup (the v0.10.2 bug, where
+/// clicking `CollapsingHeader`'s arrow propagated as an "outside" click and
+/// dismissed the popup before the operator could pick a key).
+#[derive(Debug, Clone, Default)]
+pub struct ComboCollapseState {
+    collapsed: HashMap<&'static str, bool>,
+}
+
+impl ComboCollapseState {
+    /// `true` when the category is currently collapsed (hidden).
+    pub fn is_collapsed(&self, category: &'static str) -> bool {
+        self.collapsed.get(category).copied().unwrap_or(false)
+    }
+
+    /// Flip a category's collapsed state. Returns the new state.
+    pub fn toggle(&mut self, category: &'static str) -> bool {
+        let entry = self.collapsed.entry(category).or_insert(false);
+        *entry = !*entry;
+        *entry
+    }
+}
 
 /// Draft state for the "+ Add Panel" modal.
 ///
@@ -289,6 +356,149 @@ pub fn replace_cell_at(tpl: &mut Template, row: usize, col: usize, draft: &Panel
     apply_panel_draft(tpl, draft)
 }
 
+/// v0.11.0 — swap two cells in the template by their `(row, col)` coordinates.
+///
+/// Both endpoints must currently host a cell; the two cells exchange their
+/// `(row, col)` fields in place. Used by drag-to-reorder when the operator
+/// drops a panel onto another occupied slot.
+///
+/// Returns `Err` if either endpoint is empty. Same-slot swap is a no-op and
+/// returns `Ok(())`.
+pub fn swap_cells(tpl: &mut Template, a: (usize, usize), b: (usize, usize)) -> Result<(), String> {
+    if a == b {
+        return Ok(());
+    }
+    let ai = tpl
+        .cells
+        .iter()
+        .position(|c| (c.row, c.col) == a)
+        .ok_or_else(|| format!("no cell at ({}, {})", a.0, a.1))?;
+    let bi = tpl
+        .cells
+        .iter()
+        .position(|c| (c.row, c.col) == b)
+        .ok_or_else(|| format!("no cell at ({}, {})", b.0, b.1))?;
+    tpl.cells[ai].row = b.0;
+    tpl.cells[ai].col = b.1;
+    tpl.cells[bi].row = a.0;
+    tpl.cells[bi].col = a.1;
+    Ok(())
+}
+
+/// v0.11.0 — relocate the cell at `from` to the empty slot `to`. The destination
+/// must be empty (use [`swap_cells`] if it isn't). Used by drag-to-reorder when
+/// the operator drops a panel onto an empty grid cell.
+pub fn relocate_cell(tpl: &mut Template, from: (usize, usize), to: (usize, usize)) -> Result<(), String> {
+    if from == to {
+        return Ok(());
+    }
+    if tpl.cells.iter().any(|c| (c.row, c.col) == to) {
+        return Err(format!("destination ({}, {}) is occupied", to.0, to.1));
+    }
+    let idx = tpl
+        .cells
+        .iter()
+        .position(|c| (c.row, c.col) == from)
+        .ok_or_else(|| format!("no cell at ({}, {})", from.0, from.1))?;
+    tpl.cells[idx].row = to.0;
+    tpl.cells[idx].col = to.1;
+    if to.0 >= tpl.grid.rows {
+        tpl.grid.rows = to.0 + 1;
+    }
+    if to.1 >= tpl.grid.cols {
+        tpl.grid.cols = to.1 + 1;
+    }
+    Ok(())
+}
+
+/// v0.11.0 — undo/redo history of template snapshots.
+///
+/// Each editor mutation records the template's PRE-change state via
+/// [`EditHistory::record`]; Ctrl+Z swaps in the previous snapshot, pushing the
+/// current state onto the redo stack. Capacity-bounded (default 64) so the
+/// memory footprint stays predictable on long editing sessions; the oldest
+/// snapshot is evicted when the past stack fills.
+///
+/// Redo is consumed (cleared) on the next `record` — i.e. branching from an
+/// undone state discards the previously-undone future, matching the standard
+/// linear-history model most editors use.
+#[derive(Debug, Clone)]
+pub struct EditHistory {
+    past: Vec<Template>,
+    future: Vec<Template>,
+    capacity: usize,
+}
+
+impl Default for EditHistory {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+impl EditHistory {
+    /// Construct an empty history with the given capacity (clamped to ≥ 1).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            past: Vec::new(),
+            future: Vec::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record `snapshot` as a pre-change state. Clears the redo stack
+    /// (branching from an undone state). Evicts the oldest entry when the
+    /// past stack would exceed `capacity`.
+    pub fn record(&mut self, snapshot: Template) {
+        self.future.clear();
+        self.past.push(snapshot);
+        if self.past.len() > self.capacity {
+            // Drain the leading overflow (usually exactly 1 entry).
+            let excess = self.past.len() - self.capacity;
+            self.past.drain(0..excess);
+        }
+    }
+
+    /// Pop the most recent snapshot from the past stack and return it. The
+    /// caller passes its CURRENT template state in `current`; that state is
+    /// pushed onto the redo stack so Ctrl+Y can restore it. Returns `None`
+    /// (no undo available) when the past stack is empty.
+    pub fn undo(&mut self, current: Template) -> Option<Template> {
+        let prev = self.past.pop()?;
+        self.future.push(current);
+        Some(prev)
+    }
+
+    /// Inverse of [`Self::undo`]. Pops the most recent entry from the redo
+    /// stack and returns it; `current` is pushed back onto the past stack.
+    pub fn redo(&mut self, current: Template) -> Option<Template> {
+        let next = self.future.pop()?;
+        self.past.push(current);
+        Some(next)
+    }
+
+    /// `true` when Ctrl+Z would have an effect.
+    pub fn can_undo(&self) -> bool {
+        !self.past.is_empty()
+    }
+
+    /// `true` when Ctrl+Y / Ctrl+Shift+Z would have an effect.
+    pub fn can_redo(&self) -> bool {
+        !self.future.is_empty()
+    }
+
+    /// Number of past snapshots currently stored (test helper).
+    #[doc(hidden)]
+    pub fn past_len(&self) -> usize {
+        self.past.len()
+    }
+
+    /// Number of redo snapshots currently stored (test helper).
+    #[doc(hidden)]
+    pub fn future_len(&self) -> usize {
+        self.future.len()
+    }
+}
+
 /// Draft state for the "+ Add Trail" 3D modal.
 #[derive(Debug, Clone, Default)]
 pub struct TrailDraft {
@@ -369,11 +579,35 @@ pub fn apply_trail_draft(tpl: &mut Template, draft: &TrailDraft) -> Result<(), S
 /// For each store key matching `<base>[i]`, the BASE is also included so
 /// vector / magnitude / attitude_rpy primitives can be added without
 /// requiring the operator to know the wire format.
+///
+/// v0.11.0 — [`KNOWN_HVN_SITL_KEYS`] is merged in FIRST so the picker shows
+/// the standard HVN-SITL vocabulary (including AP MAVLink mirrors that
+/// haven't streamed yet) even when the stores are empty or the autopilot is
+/// still booting. Observed keys are added on top, so custom dialects /
+/// non-HVN sources still surface every channel they emit.
+/// Additionally, every observed-key BASE (e.g. `ap_attitude` for
+/// `ap_attitude[0]`) is registered even when the value is `None` — see
+/// [`TraceStore::null_keys`] for the schema-only registration used by
+/// `dt_runner`-emitted-as-None channels.
 pub fn collect_source_keys<'a, I>(stores: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a TraceStore>,
 {
     let mut all: BTreeSet<String> = BTreeSet::new();
+    // v0.11.0 — opinionated HVN-SITL defaults first so the picker is never
+    // empty before the first envelope and AP MAVLink keys are addressable
+    // immediately at startup.
+    for k in KNOWN_HVN_SITL_KEYS {
+        all.insert((*k).to_string());
+        // Also register the base (`accel` for `accel[0]`) — vector primitives
+        // need it.
+        if let Some(idx) = k.rfind('[') {
+            let base = &k[..idx];
+            if !base.is_empty() {
+                all.insert(base.to_string());
+            }
+        }
+    }
     for s in stores {
         for k in s.keys() {
             all.insert(k.clone());
@@ -384,6 +618,15 @@ where
                     all.insert(base.to_string());
                 }
             }
+        }
+        // v0.11.0 — schema-only "observed but always-None" keys: the store
+        // saw an envelope key but the value flowed in as `null` (the
+        // dt_runner emits AP MAVLink mirrors this way until AP wakes up).
+        // Register the base name so users can pre-build templates against
+        // it; the renderer paints "waiting for data..." until a real
+        // value lands.
+        for k in s.null_keys() {
+            all.insert(k.clone());
         }
     }
     all.into_iter().collect()

@@ -58,6 +58,15 @@ fn apply_action(
             // Edit just opens the modal — no state mutation here.
             false
         }
+        // v0.11.0 — drag-to-reorder actions; not exercised by this test file
+        // (covered by `drag_reorder_test.rs`), but the match must stay
+        // exhaustive.
+        CellMenuAction::SwapTo { from, to } => {
+            profiler_render::swap_cells(tpl, *from, *to).is_ok()
+        }
+        CellMenuAction::MoveTo { from, to } => {
+            profiler_render::relocate_cell(tpl, *from, *to).is_ok()
+        }
     }
 }
 

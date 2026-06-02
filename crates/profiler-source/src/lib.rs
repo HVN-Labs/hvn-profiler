@@ -36,6 +36,25 @@ pub use fault_publisher::{encode_command, FaultCommand, FaultPublisher};
 
 // ─── Sample / trait ────────────────────────────────────────────────────────
 
+/// v0.11.0 — sentinel value carried in `Sample.value` for schema-only
+/// channels: ones the envelope advertised with a `null` payload (e.g. AP
+/// MAVLink mirrors before ArduPilot streams). The render loop's drain path
+/// recognises this sentinel (via [`Sample::is_schema_only`]) and routes the
+/// key to `TraceStore::note_null_key` instead of `push`. NaN was chosen so
+/// older consumers that ignore it simply drop the sample (NaN can't plot).
+pub const SCHEMA_ONLY_SENTINEL: f64 = f64::NAN;
+
+impl Sample {
+    /// `true` when this sample is a schema-only registration (the envelope
+    /// said the channel exists but had `null` for its value). Such samples
+    /// MUST NOT be pushed into a numeric trace buffer — the App's drain
+    /// path calls `TraceStore::note_null_key` for them so the editor can
+    /// surface the key without plotting noise.
+    pub fn is_schema_only(&self) -> bool {
+        self.value.is_nan()
+    }
+}
+
 /// A single flattened telemetry sample. One envelope from the streamer
 /// fans out into many `Sample`s (one per scalar leaf of `values`).
 #[derive(Debug, Clone, PartialEq)]
@@ -428,6 +447,21 @@ pub fn flatten_msgpack(bytes: &[u8]) -> Result<Vec<Sample>> {
     Ok(flatten_envelope(&env))
 }
 
+/// v0.11.0 — variant of [`flatten_msgpack`] that ALSO returns the list of
+/// channel names whose values came in as `null` (top-level `Nil`).
+///
+/// Used by the App's drain path to register schema-only keys with
+/// `TraceStore::note_null_key`, so the editor's source-key picker surfaces
+/// channels (e.g. `ap_attitude`) that the streamer announces but ArduPilot
+/// hasn't yet populated.
+///
+/// Only TOP-LEVEL nulls are reported — null elements inside an array still
+/// drop silently (the array's other indices come through as samples).
+pub fn flatten_msgpack_with_nulls(bytes: &[u8]) -> Result<(Vec<Sample>, Vec<String>)> {
+    let env: Envelope = rmp_serde::from_slice(bytes).context("decoding msgpack envelope")?;
+    Ok(flatten_envelope_with_nulls(&env))
+}
+
 /// Flatten an already-decoded envelope. Split out from [`flatten_msgpack`]
 /// so unit tests can exercise the schema logic without round-tripping bytes.
 ///
@@ -435,13 +469,20 @@ pub fn flatten_msgpack(bytes: &[u8]) -> Result<Vec<Sample>> {
 /// (the `ZmqSource` seen-drones set, the Faults panel target dropdown) can
 /// trace each scalar back to the producing sim without re-decoding.
 pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
+    flatten_envelope_with_nulls(env).0
+}
+
+/// v0.11.0 — like [`flatten_envelope`] but ALSO returns the names of channels
+/// whose top-level value was `null`. See [`flatten_msgpack_with_nulls`].
+pub fn flatten_envelope_with_nulls(env: &Envelope) -> (Vec<Sample>, Vec<String>) {
     let mut out = Vec::new();
+    let mut nulls = Vec::new();
     let ts = env.ts;
     // v0.10.1 — one Arc<str> allocation, cloned (refcount bump) per sample.
     let drone_name: Option<Arc<str>> = env.drone_name.as_deref().map(Arc::from);
     let map = match env.values.as_map() {
         Some(m) => m,
-        None => return out,
+        None => return (out, nulls),
     };
     for (k, v) in map {
         let key = match k.as_str() {
@@ -449,7 +490,12 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
             None => continue, // streamer always uses string keys; skip otherwise.
         };
         match v {
-            rmpv::Value::Nil => continue,
+            rmpv::Value::Nil => {
+                // v0.11.0 — surface the channel name for schema-only
+                // registration in the editor's source-key picker.
+                nulls.push(key.to_string());
+                continue;
+            }
             rmpv::Value::Boolean(b) => out.push(Sample {
                 ts,
                 key: key.to_string(),
@@ -495,7 +541,7 @@ pub fn flatten_envelope(env: &Envelope) -> Vec<Sample> {
             _ => continue,
         }
     }
-    out
+    (out, nulls)
 }
 
 fn scalar_to_f64(v: &rmpv::Value) -> Option<f64> {

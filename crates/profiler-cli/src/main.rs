@@ -30,10 +30,10 @@ use std::collections::HashMap;
 
 use profiler_render::{
     apply_panel_draft, apply_trail_draft, collect_source_keys, compact_cells, group_source_keys,
-    remove_cell_at, replace_cell_at, render_faults_panel, render_gen_panel,
-    render_template_grid_full, render_view3d_with_override, CellMenuAction, FaultsPanelState,
-    GeneratorPanelState, GridRenderOptions, LabelOverride, PanelDraft, PanelState, PendingCommand,
-    SeenDrones, TraceStore, TrailDraft, View3dState,
+    relocate_cell, remove_cell_at, replace_cell_at, render_faults_panel, render_gen_panel,
+    render_template_grid_full, render_view3d_with_override, swap_cells, CellMenuAction, EditHistory,
+    FaultsPanelState, GeneratorPanelState, GridRenderOptions, LabelOverride, PanelDraft,
+    PanelState, PendingCommand, SeenDrones, TraceStore, TrailDraft, View3dState,
 };
 use profiler_source::{
     multi_from_uris_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
@@ -449,6 +449,27 @@ struct App {
     /// `true` when the loaded template has been mutated since the last save.
     /// Toolbar paints a `●` next to the template name. Ctrl+S clears it.
     template_dirty: bool,
+    /// v0.11.0 — undo/redo history. Every editor mutation records the
+    /// pre-change template; Ctrl+Z / Ctrl+Y walk back and forth. Capacity
+    /// defaults to 64 snapshots; oldest evicted on overflow.
+    history: EditHistory,
+    /// v0.11.0 — per-category collapsed state for the editor's grouped
+    /// source-key dropdown. Shared across every `source_key_combo` widget
+    /// (Add Panel, Edit Panel, Add Trail) so toggling "DT physics" in one
+    /// form also collapses it in the next — matches the operator's mental
+    /// model and avoids re-toggling on every modal open.
+    ///
+    /// Replaces the v0.10.2 `egui::CollapsingHeader` inside the ComboBox
+    /// popup, which dismissed the entire popup whenever the operator clicked
+    /// the ▶/▼ arrow.
+    editor_combo_collapse: profiler_render::ComboCollapseState,
+    /// v0.11.0 — when the window is too narrow for a 50/50 Split layout
+    /// (< RESPONSIVE_3D_COLLAPSE_W), the 3D view is rendered as a floating
+    /// overlay instead. This flag tracks whether the overlay is currently
+    /// open. Defaults `true` so the user sees the 3D view at least once on
+    /// first narrow-window launch; the operator can close it to reclaim
+    /// pixels for the 2D grid.
+    split_3d_overlay_open: bool,
 }
 
 /// v0.10.0 — what the modal editor is currently doing.
@@ -524,6 +545,9 @@ impl App {
             editor: None,
             editor_source_keys_cache: Vec::new(),
             template_dirty: false,
+            history: EditHistory::default(),
+            editor_combo_collapse: profiler_render::ComboCollapseState::default(),
+            split_3d_overlay_open: true,
         }
     }
 
@@ -550,7 +574,17 @@ impl App {
                         .stores
                         .entry(drone_key.clone())
                         .or_default();
-                    store.push(s.ts, &s.key, s.value);
+                    // v0.11.0 — a schema-only sample (sentinel NaN value)
+                    // registers the channel name in the store's null-key
+                    // set without polluting the trace buffer. Lets the
+                    // editor's source-key picker show e.g. `ap_attitude`
+                    // before ArduPilot starts streaming, even though the
+                    // envelope carries `null` for that channel.
+                    if s.is_schema_only() {
+                        store.note_null_key(&s.key);
+                    } else {
+                        store.push(s.ts, &s.key, s.value);
+                    }
                     if is_new {
                         self.discovered_drones.push(drone_key.clone());
                         log::info!(
@@ -617,9 +651,31 @@ impl eframe::App for App {
             self.handle_save_in_place();
         }
 
+        // v0.11.0 — Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) undo / redo. Captured
+        // before the toolbar renders so the click never accidentally triggers
+        // an Add Panel modal via the editor sink.
+        let (ctrl_z, ctrl_y) = ui.ctx().input(|i| {
+            let modifiers = i.modifiers;
+            let z = modifiers.command && !modifiers.shift && i.key_pressed(egui::Key::Z);
+            let y = (modifiers.command && i.key_pressed(egui::Key::Y))
+                || (modifiers.command && modifiers.shift && i.key_pressed(egui::Key::Z));
+            (z, y)
+        });
+        if ctrl_z {
+            self.apply_undo();
+        } else if ctrl_y {
+            self.apply_redo();
+        }
+
         // ── Top toolbar: status + view-mode switch ────────────────────────
+        //
+        // v0.11.0 — `horizontal_wrapped` lets the toolbar overflow onto a
+        // second line when the window is narrow rather than truncating. We
+        // also reduce the inter-button spacing so each row fits a few more
+        // buttons before wrapping.
         let mut picker_action: Option<TemplateAction> = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.heading(format!("hvn-profiler v{}", env!("CARGO_PKG_VERSION")));
             ui.separator();
             // v0.8.0 — template picker dropdown.
@@ -641,6 +697,20 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.mode, ViewMode::Grid, "2D grid");
                 ui.selectable_value(&mut self.mode, ViewMode::View3d, "3D view");
                 ui.selectable_value(&mut self.mode, ViewMode::Split, "Split");
+                // v0.11.0 — manual 3D side-panel toggle. Only meaningful in
+                // Split mode (in 2D-grid mode there's no 3D pane to hide).
+                if self.mode == ViewMode::Split {
+                    let icon = if self.split_3d_overlay_open { "3D ◧ on" } else { "3D ◧ off" };
+                    if ui
+                        .button(icon)
+                        .on_hover_text(
+                            "Toggle the 3D pane in Split view (lets you reclaim the full window for 2D plots).",
+                        )
+                        .clicked()
+                    {
+                        self.split_3d_overlay_open = !self.split_3d_overlay_open;
+                    }
+                }
             }
 
             // Labels override (v0.5.0). Always available when a template is loaded.
@@ -663,6 +733,27 @@ impl eframe::App for App {
                 if has_3d && ui.button("+ Add Trail").clicked() {
                     self.refresh_editor_source_keys();
                     self.editor = Some(EditorMode::AddTrail(TrailDraft::default()));
+                }
+                // v0.11.0 — Undo / Redo (Ctrl+Z / Ctrl+Y).
+                let undo_btn = ui.add_enabled(
+                    self.history.can_undo(),
+                    egui::Button::new("⟲ Undo"),
+                );
+                if undo_btn
+                    .on_hover_text("Undo last edit (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.apply_undo();
+                }
+                let redo_btn = ui.add_enabled(
+                    self.history.can_redo(),
+                    egui::Button::new("⟳ Redo"),
+                );
+                if redo_btn
+                    .on_hover_text("Redo last undone edit (Ctrl+Y)")
+                    .clicked()
+                {
+                    self.apply_redo();
                 }
                 // Hidden-panels button: only visible when at least one cell
                 // is currently hidden via the runtime override map.
@@ -758,11 +849,41 @@ impl eframe::App for App {
                     v3d_log = self.render_3d(ui);
                 }
                 ViewMode::Split => {
-                    // Left/right split via equal columns: 2D grid | 3D view.
-                    ui.columns(2, |cols| {
-                        grid_log = Some(self.render_grid(&mut cols[0]));
-                        v3d_log = self.render_3d(&mut cols[1]);
-                    });
+                    // v0.11.0 — responsive: at narrow window widths the
+                    // 50/50 split squeezes both views below usable. Below
+                    // RESPONSIVE_3D_COLLAPSE_W (1100 px) we fall back to a
+                    // grid-only view and render the 3D scene as a floating
+                    // overlay window the operator can toggle with the
+                    // toolbar's "view: 3D view" button.
+                    let avail_w = ui.available_rect_before_wrap().width();
+                    if avail_w < profiler_render::RESPONSIVE_3D_COLLAPSE_W {
+                        grid_log = Some(self.render_grid(ui));
+                        // 3D in a floating window — closeable via the X.
+                        // Stored visibility flag is sticky so the operator
+                        // re-opens once and it stays.
+                        let ctx = ui.ctx().clone();
+                        let mut open = self.split_3d_overlay_open;
+                        if open {
+                            egui::Window::new("3D view")
+                                .open(&mut open)
+                                .default_size([720.0, 520.0])
+                                .default_pos([avail_w * 0.5 - 360.0, 80.0])
+                                .resizable(true)
+                                .show(&ctx, |ui| {
+                                    v3d_log = self.render_3d(ui);
+                                });
+                        }
+                        self.split_3d_overlay_open = open;
+                    } else if self.split_3d_overlay_open {
+                        // Left/right split via equal columns: 2D grid | 3D view.
+                        ui.columns(2, |cols| {
+                            grid_log = Some(self.render_grid(&mut cols[0]));
+                            v3d_log = self.render_3d(&mut cols[1]);
+                        });
+                    } else {
+                        // Operator chose to hide 3D pane → full-width 2D grid.
+                        grid_log = Some(self.render_grid(ui));
+                    }
                 }
             }
         }
@@ -963,6 +1084,9 @@ impl App {
                 EMPTY.get_or_init(TraceStore::default)
             }
         };
+        // v0.11.0 — stable_dt is the egui-smoothed frame delta; clamped
+        // by the renderer to skip stale frames after a window-minimise pause.
+        let frame_dt = ui.ctx().input(|i| i.stable_dt);
         let opts = GridRenderOptions {
             panel_states: Some(&mut self.panel_states),
             menu_sink: Some(&mut self.pending_cell_actions),
@@ -971,6 +1095,10 @@ impl App {
             // default. The override map still drives WHAT is hidden, but the
             // renderer no longer reserves a blank slot for it.
             compact_hidden: true,
+            // v0.11.0 — drag-to-reorder + animated reflow ON by default.
+            drag_to_reorder: true,
+            animate_reflow: true,
+            frame_dt,
         };
         let stats = render_template_grid_full(
             ui,
@@ -1457,6 +1585,7 @@ impl App {
                 self.editor = Some(EditorMode::EditPanel { row, col, draft });
             }
             CellMenuAction::HideToggle { row, col } => {
+                self.record_history();
                 let cur = self
                     .cell_visibility_override
                     .get(&(row, col))
@@ -1471,6 +1600,7 @@ impl App {
                 }
             }
             CellMenuAction::SetLabelMode { row, col, mode } => {
+                self.record_history();
                 self.cell_label_override.insert((row, col), mode);
                 // Also mutate the template's own cell so the renderer
                 // (which honours `cell.label_mode` when LabelOverride::Respect
@@ -1485,6 +1615,7 @@ impl App {
                 self.template_dirty = true;
             }
             CellMenuAction::Delete { row, col } => {
+                self.record_history();
                 if let Some(tpl) = self.template.as_mut() {
                     if remove_cell_at(tpl, row, col).is_ok() {
                         // v0.10.2 — reflow the remaining cells so the grid
@@ -1494,6 +1625,78 @@ impl App {
                     }
                     self.template_dirty = true;
                 }
+            }
+            // v0.11.0 — drag-to-reorder: swap occupied target.
+            CellMenuAction::SwapTo { from, to } => {
+                self.record_history();
+                if let Some(tpl) = self.template.as_mut() {
+                    if swap_cells(tpl, from, to).is_ok() {
+                        compact_cells(tpl);
+                        self.template_dirty = true;
+                        self.last_template_action = Some(format!(
+                            "Swapped ({}, {}) ↔ ({}, {})",
+                            from.0, from.1, to.0, to.1,
+                        ));
+                    }
+                }
+            }
+            // v0.11.0 — drag-to-reorder: drop onto an empty slot.
+            CellMenuAction::MoveTo { from, to } => {
+                self.record_history();
+                if let Some(tpl) = self.template.as_mut() {
+                    if relocate_cell(tpl, from, to).is_ok() {
+                        compact_cells(tpl);
+                        self.template_dirty = true;
+                        self.last_template_action = Some(format!(
+                            "Moved ({}, {}) → ({}, {})",
+                            from.0, from.1, to.0, to.1,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// v0.11.0 — snapshot the current template into the undo history before
+    /// any editor mutation. No-op when no template is loaded.
+    fn record_history(&mut self) {
+        if let Some(tpl) = self.template.as_ref() {
+            self.history.record(tpl.clone());
+        }
+    }
+
+    /// v0.11.0 — apply an undo. Swaps the current template with the most
+    /// recent past snapshot; the displaced state goes on the redo stack.
+    /// Marks dirty so the operator notices the change wasn't saved.
+    fn apply_undo(&mut self) {
+        let Some(current) = self.template.take() else {
+            return;
+        };
+        match self.history.undo(current.clone()) {
+            Some(prev) => {
+                self.template = Some(prev);
+                self.template_dirty = true;
+                self.last_template_action = Some("Undo".into());
+            }
+            None => {
+                self.template = Some(current);
+            }
+        }
+    }
+
+    /// v0.11.0 — apply a redo. Symmetric inverse of [`Self::apply_undo`].
+    fn apply_redo(&mut self) {
+        let Some(current) = self.template.take() else {
+            return;
+        };
+        match self.history.redo(current.clone()) {
+            Some(next) => {
+                self.template = Some(next);
+                self.template_dirty = true;
+                self.last_template_action = Some("Redo".into());
+            }
+            None => {
+                self.template = Some(current);
             }
         }
     }
@@ -1519,12 +1722,14 @@ impl App {
             EditorMode::AddPanel(mut draft) => {
                 let mut commit = false;
                 let mut cancel = false;
+                let source_keys = &self.editor_source_keys_cache;
+                let collapse = &mut self.editor_combo_collapse;
                 egui::Window::new("+ Add Panel")
                     .collapsible(false)
                     .resizable(true)
                     .default_width(360.0)
                     .show(ctx, |ui| {
-                        panel_form(ui, &mut draft, &self.editor_source_keys_cache);
+                        panel_form(ui, &mut draft, source_keys, collapse);
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Add").clicked() {
@@ -1536,6 +1741,10 @@ impl App {
                         });
                     });
                 if commit {
+                    // v0.11.0 — snapshot pre-mutation for undo. Done before
+                    // the apply so a failed apply still leaves history clean
+                    // (we re-emit the editor below on Err).
+                    self.record_history();
                     if let Some(tpl) = self.template.as_mut() {
                         match apply_panel_draft(tpl, &draft) {
                             Ok(()) => {
@@ -1545,6 +1754,9 @@ impl App {
                                 ));
                             }
                             Err(e) => {
+                                // Drop the snapshot we just took — apply was
+                                // a no-op, no undo entry needed.
+                                let _ = self.history.undo(tpl.clone());
                                 self.last_template_action = Some(format!("Add failed: {e}"));
                                 // Keep the modal open so operator can fix.
                                 next = Some(EditorMode::AddPanel(draft));
@@ -1560,12 +1772,14 @@ impl App {
             EditorMode::EditPanel { row, col, mut draft } => {
                 let mut commit = false;
                 let mut cancel = false;
+                let source_keys = &self.editor_source_keys_cache;
+                let collapse = &mut self.editor_combo_collapse;
                 egui::Window::new(format!("Edit panel ({row}, {col})"))
                     .collapsible(false)
                     .resizable(true)
                     .default_width(360.0)
                     .show(ctx, |ui| {
-                        panel_form(ui, &mut draft, &self.editor_source_keys_cache);
+                        panel_form(ui, &mut draft, source_keys, collapse);
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Apply").clicked() {
@@ -1577,6 +1791,7 @@ impl App {
                         });
                     });
                 if commit {
+                    self.record_history();
                     if let Some(tpl) = self.template.as_mut() {
                         match replace_cell_at(tpl, row, col, &draft) {
                             Ok(()) => {
@@ -1610,12 +1825,14 @@ impl App {
             EditorMode::AddTrail(mut draft) => {
                 let mut commit = false;
                 let mut cancel = false;
+                let source_keys = &self.editor_source_keys_cache;
+                let collapse = &mut self.editor_combo_collapse;
                 egui::Window::new("+ Add Trail (3D)")
                     .collapsible(false)
                     .resizable(true)
                     .default_width(360.0)
                     .show(ctx, |ui| {
-                        trail_form(ui, &mut draft, &self.editor_source_keys_cache);
+                        trail_form(ui, &mut draft, source_keys, collapse);
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Add").clicked() {
@@ -1627,6 +1844,7 @@ impl App {
                         });
                     });
                 if commit {
+                    self.record_history();
                     if let Some(tpl) = self.template.as_mut() {
                         match apply_trail_draft(tpl, &draft) {
                             Ok(()) => {
@@ -1696,7 +1914,12 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
 
 /// Shared form widget for both Add Panel and Edit Panel modals — mutates a
 /// [`PanelDraft`] in place. Renders one labelled row per field.
-fn panel_form(ui: &mut egui::Ui, draft: &mut PanelDraft, source_keys: &[String]) {
+fn panel_form(
+    ui: &mut egui::Ui,
+    draft: &mut PanelDraft,
+    source_keys: &[String],
+    collapse: &mut profiler_render::ComboCollapseState,
+) {
     use profiler_template::{LabelMode, Primitive};
 
     egui::Grid::new("panel_form_grid")
@@ -1733,7 +1956,7 @@ fn panel_form(ui: &mut egui::Ui, draft: &mut PanelDraft, source_keys: &[String])
             ui.end_row();
 
             ui.label("Source key:");
-            source_key_combo(ui, "panel_form_src", &mut draft.source_key, source_keys);
+            source_key_combo(ui, "panel_form_src", &mut draft.source_key, source_keys, collapse);
             ui.end_row();
 
             ui.label("Fallback:");
@@ -1780,7 +2003,12 @@ fn panel_form(ui: &mut egui::Ui, draft: &mut PanelDraft, source_keys: &[String])
 }
 
 /// Form widget for the Add Trail modal.
-fn trail_form(ui: &mut egui::Ui, draft: &mut TrailDraft, source_keys: &[String]) {
+fn trail_form(
+    ui: &mut egui::Ui,
+    draft: &mut TrailDraft,
+    source_keys: &[String],
+    collapse: &mut profiler_render::ComboCollapseState,
+) {
     egui::Grid::new("trail_form_grid")
         .num_columns(2)
         .spacing([8.0, 4.0])
@@ -1809,13 +2037,13 @@ fn trail_form(ui: &mut egui::Ui, draft: &mut TrailDraft, source_keys: &[String])
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label("Accel base:");
-                source_key_combo(ui, "trail_form_accel", &mut draft.accel_key, source_keys);
+                source_key_combo(ui, "trail_form_accel", &mut draft.accel_key, source_keys, collapse);
                 ui.end_row();
                 ui.label("Quat base:");
-                source_key_combo(ui, "trail_form_quat", &mut draft.quat_key, source_keys);
+                source_key_combo(ui, "trail_form_quat", &mut draft.quat_key, source_keys, collapse);
                 ui.end_row();
                 ui.label("Seed-from base:");
-                source_key_combo(ui, "trail_form_seed", &mut draft.seed_key, source_keys);
+                source_key_combo(ui, "trail_form_seed", &mut draft.seed_key, source_keys, collapse);
                 ui.end_row();
             });
     } else {
@@ -1824,13 +2052,13 @@ fn trail_form(ui: &mut egui::Ui, draft: &mut TrailDraft, source_keys: &[String])
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label("X (East) key:");
-                source_key_combo(ui, "trail_form_x", &mut draft.x_key, source_keys);
+                source_key_combo(ui, "trail_form_x", &mut draft.x_key, source_keys, collapse);
                 ui.end_row();
                 ui.label("Y (North) key:");
-                source_key_combo(ui, "trail_form_y", &mut draft.y_key, source_keys);
+                source_key_combo(ui, "trail_form_y", &mut draft.y_key, source_keys, collapse);
                 ui.end_row();
                 ui.label("Z (NED-down) key:");
-                source_key_combo(ui, "trail_form_z", &mut draft.z_neg_key, source_keys);
+                source_key_combo(ui, "trail_form_z", &mut draft.z_neg_key, source_keys, collapse);
                 ui.end_row();
             });
     }
@@ -1839,10 +2067,24 @@ fn trail_form(ui: &mut egui::Ui, draft: &mut TrailDraft, source_keys: &[String])
 /// Free-form text input + dropdown to pick from observed source keys.
 ///
 /// v0.10.2 — the dropdown is grouped by category (DT physics, AP MAVLink,
-/// Position (NED), Timing, Other). Each group is a `CollapsingHeader` so the
-/// operator can collapse the categories they don't care about. Within a
-/// group, keys keep the alphabetical order returned by `collect_source_keys`.
-fn source_key_combo(ui: &mut egui::Ui, salt: &str, value: &mut String, source_keys: &[String]) {
+/// Position (NED), Timing, Other). Within a group, keys keep the alphabetical
+/// order returned by `collect_source_keys`.
+///
+/// v0.11.0 — the per-category header is a MANUAL ▶/▼ toggle (rather than
+/// `egui::CollapsingHeader`), because the latter's click interaction escaped
+/// the `ComboBox` popup-rect tracking and dismissed the entire popup on
+/// every collapse / expand. The toggle now only flips
+/// `category_collapsed[category]` in the editor state — the popup stays open
+/// and the operator can keep browsing. Collapsed state is held by the caller
+/// via [`profiler_render::ComboCollapseState`] so it persists across re-opens
+/// of the SAME modal.
+fn source_key_combo(
+    ui: &mut egui::Ui,
+    salt: &str,
+    value: &mut String,
+    source_keys: &[String],
+    collapse: &mut profiler_render::ComboCollapseState,
+) {
     ui.horizontal(|ui| {
         ui.text_edit_singleline(value);
         egui::ComboBox::from_id_salt(salt)
@@ -1854,16 +2096,31 @@ fn source_key_combo(ui: &mut egui::Ui, salt: &str, value: &mut String, source_ke
                 let limited: Vec<String> = source_keys.iter().take(256).cloned().collect();
                 let grouped = group_source_keys(&limited);
                 for (group, keys) in grouped {
-                    egui::CollapsingHeader::new(group)
-                        .id_salt(format!("{salt}_{group}"))
-                        .default_open(true)
-                        .show(ui, |ui| {
+                    let collapsed = collapse.is_collapsed(group);
+                    // Manual toggle row: label `▶ Category` / `▼ Category`.
+                    // We deliberately render only a `Label` (no Button, no
+                    // CollapsingHeader) so the click stays inside the
+                    // ComboBox's popup-rect interaction tracking and does
+                    // NOT dismiss the popup.
+                    let icon = if collapsed { "▶" } else { "▼" };
+                    let header = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{icon}  {group}")).strong(),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if header.clicked() {
+                        collapse.toggle(group);
+                    }
+                    if !collapsed {
+                        ui.indent(format!("{salt}_{group}_body"), |ui| {
                             for k in &keys {
                                 if ui.selectable_label(value == k, k).clicked() {
                                     *value = k.clone();
                                 }
                             }
                         });
+                    }
                 }
             });
     });

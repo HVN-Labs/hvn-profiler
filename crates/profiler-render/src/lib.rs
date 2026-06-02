@@ -8,7 +8,7 @@
 //! each `push` against the latest observed timestamp, so the store is
 //! self-trimming without a background thread.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 pub mod editor;
 pub mod faults;
@@ -18,7 +18,8 @@ pub mod panels;
 pub mod view3d;
 pub use editor::{
     apply_panel_draft, apply_trail_draft, categorize_key, collect_source_keys, compact_cells,
-    group_source_keys, remove_cell_at, replace_cell_at, PanelDraft, TrailDraft, KEY_GROUPS,
+    group_source_keys, relocate_cell, remove_cell_at, replace_cell_at, swap_cells,
+    ComboCollapseState, EditHistory, PanelDraft, TrailDraft, KEY_GROUPS, KNOWN_HVN_SITL_KEYS,
 };
 pub use faults::{
     default_drone_choices, render_faults_panel, FaultsPanelState, PendingCommand, SeenDrones,
@@ -28,8 +29,9 @@ pub use generators::{Generator, Waveform};
 pub use panels::{
     build_label_text, compute_overlay_pos, format_value_pub, layout_cell_rects,
     overlay_box_size, render_template_grid, render_template_grid_full,
-    render_template_grid_with_override, CellMenuAction, GridRenderOptions, GridStats,
-    LabelOverride, PanelState,
+    render_template_grid_with_override, responsive_cell_rects, responsive_grid_dims,
+    CellMenuAction, GridRenderOptions, GridStats, LabelOverride, PanelState,
+    RESPONSIVE_3D_COLLAPSE_W, RESPONSIVE_MIN_CELL_W, RESPONSIVE_SINGLE_COL_W,
 };
 pub use view3d::{render_view3d, render_view3d_with_override, OrbitCamera, View3dState, View3dStats};
 
@@ -59,6 +61,13 @@ pub struct TraceStore {
     traces: HashMap<String, VecDeque<[f64; 2]>>,
     /// Most recent timestamp observed across all channels.
     latest_ts: f64,
+    /// v0.11.0 — schema-only key set: channel names the envelope advertised
+    /// with a `null` value (`dt_runner` does this for AP MAVLink mirrors
+    /// until ArduPilot starts streaming). These keys have NO points stored
+    /// in `traces`; they exist purely so the editor's source-key picker can
+    /// surface them. As soon as a non-null value arrives, [`Self::push`]
+    /// pulls the key out of this set and into `traces`.
+    null_keys: BTreeSet<String>,
 }
 
 impl Default for TraceStore {
@@ -74,6 +83,7 @@ impl TraceStore {
             window_s,
             traces: HashMap::new(),
             latest_ts: f64::NEG_INFINITY,
+            null_keys: BTreeSet::new(),
         }
     }
 
@@ -82,6 +92,9 @@ impl TraceStore {
         if t > self.latest_ts {
             self.latest_ts = t;
         }
+        // v0.11.0 — a real value supersedes any schema-only "null"
+        // registration for this key.
+        self.null_keys.remove(key);
         let buf = self
             .traces
             .entry(key.to_string())
@@ -140,6 +153,30 @@ impl TraceStore {
         let mut k: Vec<String> = self.traces.keys().cloned().collect();
         k.sort();
         k
+    }
+
+    /// v0.11.0 — register a channel name observed with a `null` value.
+    ///
+    /// No-op if the key already has stored points (real data trumps the
+    /// schema-only marker). Used by the App's drain path when the streamer
+    /// emits e.g. `ap_attitude: null` so the editor's source-key picker can
+    /// surface `ap_attitude` (and `ap_attitude[0..2]` after expansion in
+    /// [`crate::collect_source_keys`]) before ArduPilot wakes up.
+    pub fn note_null_key(&mut self, key: &str) {
+        if self.traces.contains_key(key) {
+            return;
+        }
+        if !self.null_keys.contains(key) {
+            self.null_keys.insert(key.to_string());
+        }
+    }
+
+    /// v0.11.0 — schema-only "null" key set: channels observed but never
+    /// (yet) given a real value. The editor's source-key picker merges these
+    /// into the dropdown so templates can be authored against
+    /// dt_runner-emitted-as-None mirrors before they start streaming.
+    pub fn null_keys(&self) -> &BTreeSet<String> {
+        &self.null_keys
     }
 
     /// Pick the trace with the most stored points (ties broken alphabetically).

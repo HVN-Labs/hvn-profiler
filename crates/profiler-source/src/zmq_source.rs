@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
-use crate::{flatten_msgpack, Sample, Source};
+use crate::{flatten_msgpack_with_nulls, Sample, Source, SCHEMA_ONLY_SENTINEL};
 
 /// Shared set of drone names this source has seen on the wire so far. Cloned
 /// into the Faults panel state so the Target dropdown can populate from real
@@ -144,7 +144,7 @@ async fn run_loop(endpoint: &str, tx: &Sender<Sample>, seen: &SeenDrones) -> Res
             buf
         };
 
-        let samples = match flatten_msgpack(&payload) {
+        let (samples, null_keys) = match flatten_msgpack_with_nulls(&payload) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("ZmqSource: failed to decode envelope: {e}");
@@ -152,7 +152,25 @@ async fn run_loop(endpoint: &str, tx: &Sender<Sample>, seen: &SeenDrones) -> Res
             }
         };
 
-        for s in samples {
+        // v0.11.0 — surface schema-only channels (envelope key + `null`
+        // value) as sentinel-valued samples. The App's drain path detects
+        // `Sample::is_schema_only` and routes them to
+        // `TraceStore::note_null_key` so the editor's source-key picker
+        // shows AP MAVLink mirrors before AP starts streaming.
+        let drone_name_hint = samples
+            .first()
+            .and_then(|s| s.drone_name.clone());
+        let null_samples: Vec<Sample> = null_keys
+            .into_iter()
+            .map(|key| Sample {
+                ts: samples.first().map(|s| s.ts).unwrap_or(0.0),
+                key,
+                value: SCHEMA_ONLY_SENTINEL,
+                drone_name: drone_name_hint.clone(),
+            })
+            .collect();
+
+        for s in samples.into_iter().chain(null_samples) {
             // Drone-name discovery (v0.7.0). Take the read lock first to
             // avoid the write lock on the hot path when the name is
             // already known.
