@@ -36,7 +36,7 @@ use profiler_render::{
     PanelState, PendingCommand, SeenDrones, TraceStore, TrailDraft, View3dState,
 };
 use profiler_source::{
-    multi_from_uris_with_discovery_opts, FaultCommand, FaultPublisher, MavlinkConfig, Source,
+    FaultCommand, FaultPublisher, MavlinkConfig, Source, SourceListEntry, SourceRegistry,
     Value as SampleValue,
 };
 use profiler_template::{
@@ -226,11 +226,24 @@ fn main() -> anyhow::Result<()> {
         // envelope's own `drone_name`; this only applies to MAVLink legs.
         drone_name_override: cli.drone.clone(),
     };
-    // v0.9.0 — multi-source fan-in. Single-URI is the fast path
-    // (preserves v0.8.0 behaviour bit-for-bit); >1 URI wraps every leg into
-    // a MultiSource with a merged SeenDrones set.
-    let (source, seen_drones) = multi_from_uris_with_discovery_opts(&cli.source, mav_cfg)?;
-    let source_desc = source.describe();
+    // v0.15.0 — `SourceRegistry` replaces `MultiSource` as the runtime
+    // source container. CLI-supplied URIs are added at startup; the in-app
+    // Sources dropdown can add/remove more after that. ZMQ sources are
+    // routed through `add_zmq` so the toolbar can read the live
+    // `last_drone_name` slot for the dropdown's "this is eric_1" label.
+    let mut registry = SourceRegistry::new(mav_cfg.clone());
+    for uri in &cli.source {
+        let res = if uri.starts_with("zmq://") {
+            registry.add_zmq(uri)
+        } else {
+            registry.add(uri)
+        };
+        if let Err(e) = res {
+            log::warn!("failed to open startup source '{uri}': {e}");
+        }
+    }
+    let seen_drones = Some(registry.merged_seen_drones());
+    let source_desc = registry.describe();
 
     // --generators on implies --fault-panel on (generators feed the Faults
     // publisher). Resolve the effective fault_panel state up-front so the
@@ -379,7 +392,7 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(App::new(
-                source,
+                registry,
                 source_desc,
                 template,
                 cli.labels,
@@ -417,8 +430,23 @@ enum ViewMode {
 const UNNAMED_DRONE: &str = "(unnamed)";
 
 struct App {
-    source: Box<dyn Source>,
+    /// v0.15.0 — runtime-mutable source registry. Replaces the v0.9.0
+    /// `Box<dyn Source>` (MultiSource) so the toolbar Sources dropdown can
+    /// add/remove sources after startup. The drain loop calls
+    /// `registry.try_recv()` exactly as before.
+    registry: SourceRegistry,
     source_desc: String,
+    /// v0.15.0 — last status message from the Sources toolbar (Add /
+    /// Remove). Shown briefly next to the Sources button. Cleared when the
+    /// next action runs.
+    last_source_action: Option<String>,
+    /// v0.15.0 — `+ Add Source...` dialog: in-progress URI text. `None`
+    /// means the dialog is closed.
+    add_source_uri: Option<String>,
+    /// v0.15.0 — most recent template-fallback warning. Set whenever a
+    /// cell's declared `source_uri` doesn't match any connected source;
+    /// the toolbar paints it next to the source counter.
+    template_fallback_warning: Option<String>,
     /// v0.9.0: per-drone trace storage. Keyed by `Sample.drone_name`. Each
     /// drone gets its own ring buffer so cross-drone keys don't collide
     /// (every drone has its own `accel[0]`, `pos_ekf_ned[i]`, etc.).
@@ -532,7 +560,7 @@ enum EditorMode {
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        source: Box<dyn Source>,
+        registry: SourceRegistry,
         source_desc: String,
         template: Option<Template>,
         label_arg: LabelArg,
@@ -563,8 +591,11 @@ impl App {
             ..Default::default()
         };
         Self {
-            source,
+            registry,
             source_desc,
+            last_source_action: None,
+            add_source_uri: None,
+            template_fallback_warning: None,
             stores: std::collections::HashMap::new(),
             view_drone: None,
             discovered_drones: Vec::new(),
@@ -608,7 +639,7 @@ impl App {
     fn drain(&mut self) {
         let mut n = 0;
         while n < MAX_DRAIN_PER_FRAME {
-            match self.source.try_recv() {
+            match self.registry.try_recv() {
                 Some(s) => {
                     // v0.10.1 — Sample.drone_name is `Arc<str>`; route via a
                     // single `to_string()` for the HashMap key.
@@ -773,6 +804,12 @@ impl eframe::App for App {
         // also reduce the inter-button spacing so each row fits a few more
         // buttons before wrapping.
         let mut picker_action: Option<TemplateAction> = None;
+        // v0.15.0 — Sources toolbar action accumulators. The Sources popup
+        // and Add Source dialog mutate `self.registry`, but the borrow
+        // checker forbids that inside the `horizontal_wrapped` closure
+        // (which already borrows `self`). We collect actions here and apply
+        // them after the closure exits.
+        let mut source_action: Option<SourceAction> = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.heading(format!("hvn-profiler v{}", env!("CARGO_PKG_VERSION")));
@@ -785,7 +822,10 @@ impl eframe::App for App {
             self.render_drone_selector(ui);
             ui.label(format!("t = {elapsed:7.2} s"));
             ui.separator();
-            ui.label(&self.source_desc);
+            // v0.15.0 — Sources toolbar button + popup. Replaces the static
+            // source description (`self.source_desc`) so the operator can
+            // add/remove sources at runtime.
+            source_action = self.render_sources_toolbar(ui);
             ui.separator();
             ui.label(format!("samples={}", self.drained_total));
 
@@ -927,6 +967,10 @@ impl eframe::App for App {
         // load / save handlers).
         if let Some(action) = picker_action {
             self.handle_template_action(action);
+        }
+        // v0.15.0 — Sources toolbar action (Add / Remove / open dialog).
+        if let Some(action) = source_action {
+            self.handle_source_action(action);
         }
         ui.separator();
 
@@ -1119,6 +1163,22 @@ impl eframe::App for App {
             self.render_editor_modal(&ctx);
         }
 
+        // ── v0.15.0 — in-app Add Source modal. Open / closed via
+        // `self.add_source_uri`; the Connect / Cancel buttons return an
+        // action we then apply through the same plumbing as the toolbar.
+        if self.add_source_uri.is_some() {
+            let ctx = ui.ctx().clone();
+            if let Some(action) = self.render_add_source_modal(&ctx) {
+                self.handle_source_action(action);
+            }
+        }
+
+        // ── v0.15.0 — template fallback warning. Re-scanned each frame
+        // because the connected source list can change underneath us. We
+        // compute the warning AFTER any add/remove from this frame so the
+        // toolbar reflects the resolution that's about to happen.
+        self.recompute_template_fallback_warning();
+
         // 1 Hz status log — proof-of-life when running headless. The smoke
         // test greps for `view3d:` (3D modes) and `grid:` (2D / split).
         let now = Instant::now();
@@ -1282,6 +1342,25 @@ impl App {
     }
 }
 
+// ─── v0.15.0 in-app source management ────────────────────────────────────
+
+/// Action requested by the Sources toolbar dropdown — applied by `App`
+/// after the toolbar closure exits (so we can borrow `self.registry` mutably).
+#[derive(Debug, Clone)]
+enum SourceAction {
+    /// Open the `+ Add Source...` modal with an empty URI buffer.
+    OpenAddDialog,
+    /// Operator clicked `[Connect]` in the dialog with the given URI.
+    Connect(String),
+    /// Operator cancelled the `+ Add Source...` dialog.
+    CancelAdd,
+    /// Operator clicked `[×]` next to the given URI.
+    Remove(String),
+}
+
+/// Live-threshold (seconds) for the `●`/`◌` indicator in the Sources popup.
+const SOURCES_LIVE_THRESHOLD_S: f64 = 3.0;
+
 // ─── v0.8.0 template picker + save / save-as plumbing ─────────────────────
 
 /// Action requested by the template picker dropdown — applied by `App` after
@@ -1299,6 +1378,252 @@ enum TemplateAction {
 }
 
 impl App {
+    /// v0.15.0 — render the toolbar's Sources button + connected-source list.
+    ///
+    /// Always shows `[ Sources (N) ▾ ]` with `N` = number of connected
+    /// sources. Clicking the button toggles a popup that lists each source's
+    /// `(● live | ◌ stale)` indicator, drone-name (auto-detected from
+    /// envelope), URI, and a `[×]` removal button. The popup footer offers
+    /// `+ Add source...` which opens the modal dialog.
+    ///
+    /// Returns the action the operator triggered (or `None` if they only
+    /// hovered) so the caller can mutate `self.registry` outside the
+    /// borrow-locked closure body.
+    fn render_sources_toolbar(&mut self, ui: &mut egui::Ui) -> Option<SourceAction> {
+        let mut action: Option<SourceAction> = None;
+
+        let n = self.registry.len();
+        let warning_open = self.template_fallback_warning.is_some();
+        let last_status = self.last_source_action.clone();
+
+        // v0.15.0 — use a ComboBox-style popup for the Sources dropdown.
+        // ComboBox's selected_text shows the count and its `show_ui` body is
+        // the popup interior. This dodges the egui 0.34 `popup_below_widget`
+        // API churn while still giving us the click-to-open + click-outside-
+        // to-close behaviour the spec asks for.
+        let btn_label = format!("Sources ({n}) ▾");
+        egui::ComboBox::from_id_salt("hvn-profiler-sources-popup")
+            .selected_text(btn_label)
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new("Connected sources").strong());
+                ui.separator();
+                let entries = self.registry.list(SOURCES_LIVE_THRESHOLD_S);
+                if entries.is_empty() {
+                    ui.weak("(no sources connected)");
+                } else {
+                    for e in &entries {
+                        ui.horizontal(|ui: &mut egui::Ui| {
+                            // Live / stale indicator.
+                            let (glyph, color) = if e.is_live {
+                                (
+                                    "●",
+                                    egui::Color32::from_rgb(80, 200, 120),
+                                )
+                            } else {
+                                ("◌", egui::Color32::from_gray(140))
+                            };
+                            ui.label(
+                                egui::RichText::new(glyph).color(color).strong(),
+                            );
+                            ui.label(&e.uri);
+                            ui.weak(
+                                e.drone_name
+                                    .as_ref()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| {
+                                        format!("({})", e.fallback_name)
+                                    }),
+                            );
+                            // Spacer so the [×] button right-aligns.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui: &mut egui::Ui| {
+                                    if ui
+                                        .button("×")
+                                        .on_hover_text(format!("Remove {}", e.uri))
+                                        .clicked()
+                                    {
+                                        action = Some(SourceAction::Remove(e.uri.clone()));
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+                ui.separator();
+                if ui.button("+ Add source...").clicked() {
+                    action = Some(SourceAction::OpenAddDialog);
+                }
+            });
+        // Status message — fades by being overwritten on the next action.
+        if let Some(txt) = &last_status {
+            ui.weak(txt);
+        }
+        if warning_open {
+            if let Some(w) = &self.template_fallback_warning {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {w}"))
+                        .color(egui::Color32::from_rgb(240, 180, 60)),
+                )
+                .on_hover_text("A template cell pinned to a source URI that isn't connected; rendering from the first available source.");
+            }
+        }
+
+        action
+    }
+
+    /// v0.15.0 — scan the loaded template for cell sources that declare a
+    /// `source_uri` not matching any currently-connected source. When at
+    /// least one such cell exists, set `template_fallback_warning` so the
+    /// toolbar paints a `⚠` next to the Sources button.
+    ///
+    /// Called every frame after source mutations are applied, so the
+    /// indicator stays in sync as the operator adds / removes sources.
+    fn recompute_template_fallback_warning(&mut self) {
+        let connected: Vec<String> = self.registry.uris();
+        let mut missing: Vec<String> = Vec::new();
+        if let Some(tpl) = &self.template {
+            for cell in &tpl.cells {
+                for src in &cell.sources {
+                    if let Some(uri) = &src.source_uri {
+                        if !connected.iter().any(|c| c == uri)
+                            && !missing.iter().any(|m| m == uri)
+                        {
+                            missing.push(uri.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.template_fallback_warning = if missing.is_empty() {
+            None
+        } else if missing.len() == 1 {
+            Some(format!(
+                "Template references source `{}` which isn't connected — using first available.",
+                missing[0],
+            ))
+        } else {
+            Some(format!(
+                "Template references {} sources that aren't connected — using first available.",
+                missing.len(),
+            ))
+        };
+    }
+
+    /// v0.15.0 — apply a `SourceAction` collected by the toolbar closure.
+    /// Mutates `self.registry` and surfaces status messages.
+    fn handle_source_action(&mut self, action: SourceAction) {
+        match action {
+            SourceAction::OpenAddDialog => {
+                self.add_source_uri = Some(String::new());
+            }
+            SourceAction::CancelAdd => {
+                self.add_source_uri = None;
+            }
+            SourceAction::Connect(uri) => {
+                let uri = uri.trim().to_string();
+                self.add_source_uri = None;
+                if uri.is_empty() {
+                    self.last_source_action =
+                        Some("Connect failed: URI must not be empty".into());
+                    return;
+                }
+                let res = if uri.starts_with("zmq://") {
+                    self.registry.add_zmq(&uri)
+                } else {
+                    self.registry.add(&uri)
+                };
+                match res {
+                    Ok(()) => {
+                        self.last_source_action = Some(format!("Connected to {uri}"));
+                        // Refresh source_desc so the title-bar / status row
+                        // reflects the new set.
+                        self.source_desc = self.registry.describe();
+                    }
+                    Err(e) => {
+                        self.last_source_action =
+                            Some(format!("Connect failed: {e}"));
+                    }
+                }
+            }
+            SourceAction::Remove(uri) => {
+                let removed = self.registry.remove(&uri);
+                if removed {
+                    self.last_source_action = Some(format!("Removed {uri}"));
+                } else {
+                    self.last_source_action =
+                        Some(format!("Remove failed: {uri} not in list"));
+                }
+                self.source_desc = self.registry.describe();
+            }
+        }
+    }
+
+    /// v0.15.0 — render the `+ Add Source...` modal dialog. Driven by
+    /// `self.add_source_uri`: `None` means the dialog is closed; `Some(buf)`
+    /// keeps it open and tracks the in-progress URI text.
+    fn render_add_source_modal(&mut self, ctx: &egui::Context) -> Option<SourceAction> {
+        let buf_owned = self.add_source_uri.clone()?;
+        let mut buf = buf_owned;
+        let mut connect_clicked = false;
+        let mut cancel_clicked = false;
+        egui::Window::new("+ Add Source")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("add_source_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("URI:");
+                        ui.text_edit_singleline(&mut buf);
+                        ui.end_row();
+                        ui.label("Type:");
+                        let scheme_hint = if buf.starts_with("zmq://") {
+                            "ZMQ (HVN-SITL streamer)"
+                        } else if buf.starts_with("mavlink://") {
+                            "MAVLink UDP (udpin / listen)"
+                        } else if buf.starts_with("mavlinkout://") {
+                            "MAVLink UDP (udpout / send-first)"
+                        } else if buf.starts_with("mock://") {
+                            "Synthetic (sine wave)"
+                        } else if buf.is_empty() {
+                            "(auto-detected from URI scheme)"
+                        } else {
+                            "(unrecognised scheme — will default to mock://)"
+                        };
+                        ui.weak(scheme_hint);
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.label(egui::RichText::new("Examples:").weak());
+                ui.label("  zmq://127.0.0.1:9005       (HVN-SITL)");
+                ui.label("  mavlink://127.0.0.1:14550  (ArduPilot)");
+                ui.label("  mock://                    (synthetic)");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                    if ui.button("Connect").clicked() {
+                        connect_clicked = true;
+                    }
+                });
+            });
+        // Persist the in-progress text back into self so future frames see it.
+        self.add_source_uri = Some(buf.clone());
+        if connect_clicked {
+            return Some(SourceAction::Connect(buf));
+        }
+        if cancel_clicked {
+            return Some(SourceAction::CancelAdd);
+        }
+        None
+    }
+
     /// Render the toolbar's template picker. Returns the user's choice, if
     /// any — applied after the toolbar closure exits.
     fn render_template_picker(&mut self, ui: &mut egui::Ui) -> Option<TemplateAction> {
@@ -1817,6 +2142,11 @@ impl App {
         // message in `last_template_action`; success branches let it drop.
         let mut next: Option<EditorMode> = None;
 
+        // v0.15.0 — snapshot the connected source list ONCE per modal frame
+        // so the closure body doesn't need to borrow `self.registry`.
+        let connected_sources: Vec<SourceListEntry> =
+            self.registry.list(SOURCES_LIVE_THRESHOLD_S);
+
         match mode {
             EditorMode::AddPanel(mut draft) => {
                 let mut commit = false;
@@ -1839,6 +2169,7 @@ impl App {
                 let collapse = &mut self.editor_combo_collapse;
                 let last_seen = &self.last_seen_keys;
                 let filter = &mut self.picker_filter;
+                let sources_ref: &[SourceListEntry] = &connected_sources;
                 egui::Window::new("+ Add Panel")
                     .collapsible(false)
                     .resizable(true)
@@ -1850,7 +2181,14 @@ impl App {
                             filter,
                             observed: &observed_keys,
                         };
-                        panel_form(ui, &mut draft, source_keys, collapse, Some(&mut pctx));
+                        panel_form(
+                            ui,
+                            &mut draft,
+                            source_keys,
+                            collapse,
+                            Some(&mut pctx),
+                            Some(sources_ref),
+                        );
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Add").clicked() {
@@ -1907,6 +2245,7 @@ impl App {
                 let collapse = &mut self.editor_combo_collapse;
                 let last_seen = &self.last_seen_keys;
                 let filter = &mut self.picker_filter;
+                let sources_ref: &[SourceListEntry] = &connected_sources;
                 egui::Window::new(format!("Edit panel ({row}, {col})"))
                     .collapsible(false)
                     .resizable(true)
@@ -1918,7 +2257,14 @@ impl App {
                             filter,
                             observed: &observed_keys,
                         };
-                        panel_form(ui, &mut draft, source_keys, collapse, Some(&mut pctx));
+                        panel_form(
+                            ui,
+                            &mut draft,
+                            source_keys,
+                            collapse,
+                            Some(&mut pctx),
+                            Some(sources_ref),
+                        );
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Apply").clicked() {
@@ -2052,12 +2398,19 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // v0.15.0 — preserve the cell's source_uri pin (if any) into the draft.
+    let source_uri = cell
+        .sources
+        .first()
+        .and_then(|s| s.source_uri.clone())
+        .unwrap_or_default();
     PanelDraft {
         row: cell.row,
         col: cell.col,
         primitive: cell.primitive,
         title: cell.title.clone(),
         source_key,
+        source_uri,
         fallback,
         minus,
         color,
@@ -2080,12 +2433,20 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
 /// the operator picks a source key whose [`ValueShape`] is known and the
 /// existing primitive default matches `Scalar`, the form auto-selects the
 /// inferred primitive (the user can still change it via the dropdown).
+///
+/// v0.15.0 — `connected_sources` carries the list of currently-connected
+/// source URIs (with their drone names) so the form can render a source
+/// dropdown ABOVE the key dropdown. The operator picks `(any)` (the empty
+/// default) to defer source binding to render time, or a specific URI to pin
+/// the cell to one source. Passing `None` hides the source row entirely
+/// (used by tests and the legacy single-source flow).
 fn panel_form(
     ui: &mut egui::Ui,
     draft: &mut PanelDraft,
     source_keys: &[String],
     collapse: &mut profiler_render::ComboCollapseState,
     picker: Option<&mut PickerContext<'_>>,
+    connected_sources: Option<&[SourceListEntry]>,
 ) {
     use profiler_template::{LabelMode, Primitive};
 
@@ -2123,6 +2484,35 @@ fn panel_form(
                     }
                 });
             ui.end_row();
+
+            // v0.15.0 — source dropdown row appears ABOVE the source-key
+            // row when the caller supplies a list of connected sources.
+            // Empty `draft.source_uri` (`""`) renders as `(any)`; a
+            // non-empty value pins the cell to that URI.
+            if let Some(sources) = connected_sources {
+                ui.label("Source:");
+                egui::ComboBox::from_id_salt("panel_form_source_uri")
+                    .selected_text(format_source_combo_label(&draft.source_uri, sources))
+                    .show_ui(ui, |ui| {
+                        // `(any)` first — defer binding to render time.
+                        let selected = draft.source_uri.is_empty();
+                        if ui
+                            .selectable_label(selected, "(any)")
+                            .on_hover_text("Use the first connected source at render time")
+                            .clicked()
+                        {
+                            draft.source_uri.clear();
+                        }
+                        for entry in sources {
+                            let label = format_source_combo_entry(entry);
+                            let selected = draft.source_uri == entry.uri;
+                            if ui.selectable_label(selected, label).clicked() {
+                                draft.source_uri = entry.uri.clone();
+                            }
+                        }
+                    });
+                ui.end_row();
+            }
 
             ui.label("Source key:");
             // v0.12.0 — capture the source key BEFORE the combo runs so we
@@ -2288,6 +2678,32 @@ fn panel_form(
             }
         }
     }
+}
+
+/// v0.15.0 — format the selected source-URI as the dropdown's button face.
+fn format_source_combo_label(uri: &str, sources: &[SourceListEntry]) -> String {
+    if uri.is_empty() {
+        return "(any)".to_string();
+    }
+    for e in sources {
+        if e.uri == uri {
+            return format_source_combo_entry(e);
+        }
+    }
+    // URI doesn't match any connected source — surface it as a missing pin
+    // so the operator notices.
+    format!("{uri} (not connected)")
+}
+
+/// v0.15.0 — render one entry in the source-URI dropdown.
+fn format_source_combo_entry(e: &SourceListEntry) -> String {
+    let name = e
+        .drone_name
+        .as_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("({})", e.fallback_name));
+    let live = if e.is_live { "●" } else { "◌" };
+    format!("{live} {} — {name}", e.uri)
 }
 
 /// Form widget for the Add Trail modal.

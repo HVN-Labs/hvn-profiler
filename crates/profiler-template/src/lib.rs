@@ -303,6 +303,18 @@ pub struct CellSource {
     /// Primary trace key, e.g. `"ap_raw_imu[0]"` or a vector base `"mag_xyz"`.
     #[serde(default)]
     pub key: String,
+    /// v0.15.0 — optional source URI this trace is pinned to (e.g.
+    /// `"zmq://127.0.0.1:9005"`). When set, the renderer reads the trace
+    /// from the [`profiler_source::SourceRegistry`] entry whose URI matches.
+    /// When `None` (the `(any)` default), the renderer falls back to the
+    /// first connected source — supports cross-fleet templates where the
+    /// caller doesn't want to hardcode a specific source.
+    ///
+    /// Templates without this field load unchanged (v0.14.0 contract).
+    /// The render layer surfaces a toolbar warning when a non-`None`
+    /// `source_uri` doesn't match any currently-connected source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
     /// Fallback key used when `key` has no data in the store.
     #[serde(default)]
     pub fallback: Option<String>,

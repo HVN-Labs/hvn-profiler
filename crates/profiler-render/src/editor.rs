@@ -422,6 +422,12 @@ pub struct PanelDraft {
     /// renderer reads `base[0..2]`). For scalar/overlay/diff this is a fully-
     /// qualified key (e.g. `"ap_attitude[0]"`).
     pub source_key: String,
+    /// v0.15.0 — optional source URI to pin this cell to. Empty string means
+    /// `(any)` (the default): the renderer uses the first connected source
+    /// at draw time. Non-empty values are written out as
+    /// [`CellSource::source_uri`] so the JSON round-trip preserves the
+    /// per-cell selection.
+    pub source_uri: String,
     /// Optional fallback (when `source_key` has no data, plot this instead).
     pub fallback: String,
     /// For `Diff` only: the subtrahend key (`source_key − minus`).
@@ -452,6 +458,9 @@ impl Default for PanelDraft {
             primitive: Primitive::Scalar,
             title: String::new(),
             source_key: String::new(),
+            // v0.15.0 — empty == "(any)" — defer source binding to the first
+            // connected leg at render time.
+            source_uri: String::new(),
             fallback: String::new(),
             minus: String::new(),
             color: "#1f77b4".to_string(),
@@ -507,8 +516,13 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
     }
 
     // Primary source.
+    // v0.15.0 — `source_uri` is written ONLY when the operator picked a
+    // specific source in the form (non-empty string). The `(any)` default
+    // leaves the field as `None` so existing templates round-trip unchanged.
+    let source_uri = non_empty(&draft.source_uri);
     let mut sources: Vec<CellSource> = vec![CellSource {
         key: draft.source_key.trim().to_string(),
+        source_uri: source_uri.clone(),
         fallback: non_empty(&draft.fallback),
         minus: if draft.primitive == Primitive::Diff {
             non_empty(&draft.minus)
@@ -525,6 +539,10 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
             if !k.trim().is_empty() {
                 sources.push(CellSource {
                     key: k.trim().to_string(),
+                    // v0.15.0 — overlay extras inherit the cell's
+                    // source_uri. Multi-source overlays will get
+                    // per-source pins in a later release.
+                    source_uri: source_uri.clone(),
                     ..Default::default()
                 });
             }
@@ -1043,6 +1061,58 @@ where
         }
     }
     all.into_iter().collect()
+}
+
+/// v0.15.0 — resolve a cell's declared `source_uri` against the currently-
+/// connected source list.
+///
+/// Returns the URI the renderer should actually use, plus a flag indicating
+/// whether a fallback was applied (i.e. the declared URI was not connected
+/// AND a different source was substituted). The toolbar surfaces a status
+/// warning when this fires.
+///
+/// Rules:
+/// 1. `declared = None` → use first connected URI (or `None` if no sources).
+///    `fallback_applied = false` (operator asked for `(any)`).
+/// 2. `declared = Some(uri)` AND `uri` is connected → honour it exactly.
+///    `fallback_applied = false`.
+/// 3. `declared = Some(uri)` AND `uri` is NOT connected → first connected
+///    URI (or `None`); `fallback_applied = true`.
+pub fn resolve_source_uri(
+    declared: Option<&str>,
+    connected: &[String],
+) -> ResolvedSource {
+    match declared {
+        None => ResolvedSource {
+            uri: connected.first().cloned(),
+            fallback_applied: false,
+        },
+        Some(d) => {
+            if connected.iter().any(|c| c == d) {
+                ResolvedSource {
+                    uri: Some(d.to_string()),
+                    fallback_applied: false,
+                }
+            } else {
+                ResolvedSource {
+                    uri: connected.first().cloned(),
+                    fallback_applied: true,
+                }
+            }
+        }
+    }
+}
+
+/// v0.15.0 — return value of [`resolve_source_uri`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSource {
+    /// The URI the renderer should use, or `None` when no sources are
+    /// connected at all. Callers paint "waiting for data..." in the latter
+    /// case (same as the v0.10.0 no-data path).
+    pub uri: Option<String>,
+    /// `true` when a non-`None` declared URI was substituted because the
+    /// declared one isn't currently connected. Drives the toolbar warning.
+    pub fallback_applied: bool,
 }
 
 fn non_empty(s: &str) -> Option<String> {

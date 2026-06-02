@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub mod zmq_source;
-pub use zmq_source::{SeenDrones, ZmqSource};
+pub use zmq_source::{LastDroneName, SeenDrones, ZmqSource};
 
 #[cfg(feature = "mavlink-source")]
 pub mod mavlink_source;
@@ -399,6 +399,318 @@ pub struct MultiSource {
     subs: Vec<MultiSubSource>,
     /// Round-robin cursor — the leg we try first on the next call.
     rr_cursor: usize,
+}
+
+// ─── v0.15.0 SourceRegistry — runtime-mutable source list ──────────────────
+
+/// v0.15.0 — one entry in a [`SourceRegistry`]: a connected source plus the
+/// metadata the toolbar Sources dropdown needs.
+///
+/// The `drone_name` slot is populated for ZMQ sources (which carry the name
+/// on the envelope, see [`ZmqSource::last_drone_name`]) and `None` otherwise.
+/// Reads are lock-free read-locks under the hood; the worker only takes a
+/// write-lock when the name actually changes.
+pub struct RegistryEntry {
+    /// Source URI as the operator typed it (`zmq://127.0.0.1:9005`, etc.).
+    /// Used as the stable handle for `[×]` removal and per-cell pin lookup.
+    pub uri: String,
+    /// The underlying [`Source`] implementation — boxed so the registry can
+    /// hold heterogeneous backends (ZMQ + MAVLink + mock) in one Vec.
+    inner: Box<dyn Source>,
+    /// Stamped on samples whose `drone_name` is `None` (mavlink / mock) so
+    /// downstream per-drone routing has a fallback identity.
+    fallback_name: Arc<str>,
+    /// Most-recently-seen drone name (ZMQ only). Updated by the ZMQ worker
+    /// thread; `None` for non-ZMQ sources OR before the first envelope.
+    last_drone_name: Option<LastDroneName>,
+    /// Monotonic seconds (since registry creation) when the last sample
+    /// arrived. Used for the `●` (live) vs `◌` (stale) UI indicator.
+    /// `f64::NEG_INFINITY` until the first sample.
+    last_sample_at: f64,
+    /// Optional native-discovery handle (currently ZMQ only). Merged into
+    /// the registry's union `SeenDrones` so the Faults panel target dropdown
+    /// reflects every connected source.
+    inner_seen: Option<SeenDrones>,
+    /// v0.10.1 cache for the merge-into-shared `SeenDrones` fast path.
+    last_seen_len: usize,
+}
+
+impl RegistryEntry {
+    /// `true` when a sample has arrived in the last `live_threshold_s` seconds
+    /// of registry time (`now_s` is the registry's own monotonic clock).
+    pub fn is_live(&self, now_s: f64, live_threshold_s: f64) -> bool {
+        (now_s - self.last_sample_at) < live_threshold_s
+    }
+
+    /// Latest observed drone name (read-lock; cheap). `None` for non-ZMQ
+    /// sources OR before the first envelope.
+    pub fn drone_name(&self) -> Option<Arc<str>> {
+        self.last_drone_name
+            .as_ref()
+            .and_then(|h| h.read().ok().and_then(|g| g.clone()))
+    }
+}
+
+/// v0.15.0 — runtime-mutable registry of telemetry sources.
+///
+/// Replaces the v0.9.0 `MultiSource` for the in-app source-management flow:
+/// callers can [`add`](Self::add) / [`remove`](Self::remove) sources after
+/// startup. The registry implements [`Source`] so the existing render-loop
+/// drain path is unchanged — it round-robins across every connected leg the
+/// same way `MultiSource` did.
+///
+/// Removal sets the underlying source's stop flag (for ZMQ, the worker
+/// thread exits within ~5 ms) and drops the boxed source so the file
+/// descriptor is released. Removed sources are NOT preserved — the operator
+/// can re-add the URI to re-open the connection.
+pub struct SourceRegistry {
+    entries: Vec<RegistryEntry>,
+    rr_cursor: usize,
+    /// Shared union `SeenDrones` across all legs. Cloned into the Faults
+    /// panel state so its target dropdown reflects every connected source.
+    merged_seen: SeenDrones,
+    /// Monotonic clock the registry stamps onto each sample's
+    /// `RegistryEntry::last_sample_at`. Counted in seconds since the registry
+    /// was created.
+    started: Instant,
+    /// MAVLink-specific config applied when [`Self::add`] opens a mavlink://
+    /// URI. Captured at registry construction so the in-app `+ Add source...`
+    /// dialog gets the same CLI-supplied passive/drone_name_override settings.
+    mavlink_cfg: MavlinkConfig,
+}
+
+impl Default for SourceRegistry {
+    fn default() -> Self {
+        Self::new(MavlinkConfig::default())
+    }
+}
+
+impl SourceRegistry {
+    /// Build an empty registry. `mavlink_cfg` is applied to every mavlink://
+    /// source added via [`Self::add`] so the CLI's `--mavlink-passive` and
+    /// `--drone` flags carry over to in-app source additions.
+    pub fn new(mavlink_cfg: MavlinkConfig) -> Self {
+        use std::collections::HashSet;
+        use std::sync::RwLock;
+        Self {
+            entries: Vec::new(),
+            rr_cursor: 0,
+            merged_seen: Arc::new(RwLock::new(HashSet::new())),
+            started: Instant::now(),
+            mavlink_cfg,
+        }
+    }
+
+    /// Build a registry pre-populated with `uris` (the `--source` CLI list).
+    /// Returns the registry plus a clone of the merged `SeenDrones` handle
+    /// for the Faults panel.
+    pub fn with_uris(uris: &[String], mavlink_cfg: MavlinkConfig) -> Result<(Self, SeenDrones)> {
+        let mut reg = Self::new(mavlink_cfg);
+        for uri in uris {
+            // Ignore add failures here so a single bad URI doesn't kill startup
+            // — the operator sees the error in the logs and can fix it via the
+            // in-app dropdown.
+            if let Err(e) = reg.add(uri) {
+                log::warn!("SourceRegistry: failed to add startup source '{uri}': {e}");
+            }
+        }
+        let seen = Arc::clone(&reg.merged_seen);
+        Ok((reg, seen))
+    }
+
+    /// Add a new source at runtime. Idempotent: if `uri` is already in the
+    /// registry, returns `Ok(())` without opening a second connection.
+    pub fn add(&mut self, uri: &str) -> Result<()> {
+        if self.entries.iter().any(|e| e.uri == uri) {
+            log::info!("SourceRegistry: '{uri}' already connected, ignoring add");
+            return Ok(());
+        }
+        let (src, seen_opt) =
+            from_uri_with_discovery_opts(uri, self.mavlink_cfg.clone())?;
+        // ZMQ exposes `last_drone_name`; other backends do not. We poke
+        // through the Box via downcast — but Box<dyn Source> is not
+        // downcastable, so instead we re-open the URI through the dedicated
+        // ZMQ helper when the scheme matches. Cleaner: from_uri_with_*
+        // already returned the boxed source, so we accept that non-ZMQ
+        // sources have `last_drone_name: None` (they don't update it). ZMQ
+        // sources still discover the name via the merged `SeenDrones` set.
+        let fallback_name: Arc<str> = Arc::from(fallback_drone_name_from_uri(uri, self.entries.len()));
+        let entry = RegistryEntry {
+            uri: uri.to_string(),
+            inner: src,
+            fallback_name,
+            last_drone_name: None, // populated by `add_zmq` for ZMQ paths
+            last_sample_at: f64::NEG_INFINITY,
+            inner_seen: seen_opt,
+            last_seen_len: 0,
+        };
+        log::info!("SourceRegistry: added '{uri}' (now {} sources)", self.entries.len() + 1);
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// v0.15.0 — add a ZMQ source whose `last_drone_name` slot can be read
+    /// by the Sources toolbar. Lets the CLI plumb the live drone-name slot
+    /// into the dropdown without downcasting through `Box<dyn Source>`.
+    pub fn add_zmq(&mut self, uri: &str) -> Result<()> {
+        if self.entries.iter().any(|e| e.uri == uri) {
+            return Ok(());
+        }
+        let endpoint = uri
+            .strip_prefix("zmq://")
+            .ok_or_else(|| anyhow::anyhow!("add_zmq called with non-zmq URI: {uri}"))?;
+        let tcp_endpoint = format!("tcp://{}", endpoint.trim_end_matches('/'));
+        let zmq = ZmqSource::connect(&tcp_endpoint)
+            .with_context(|| format!("opening ZMQ source at {tcp_endpoint}"))?;
+        let seen_opt = Some(zmq.seen_drones());
+        let last_name = Some(zmq.last_drone_name());
+        let fallback_name: Arc<str> = Arc::from(fallback_drone_name_from_uri(uri, self.entries.len()));
+        let entry = RegistryEntry {
+            uri: uri.to_string(),
+            inner: Box::new(zmq),
+            fallback_name,
+            last_drone_name: last_name,
+            last_sample_at: f64::NEG_INFINITY,
+            inner_seen: seen_opt,
+            last_seen_len: 0,
+        };
+        log::info!("SourceRegistry: added zmq '{uri}' (now {} sources)", self.entries.len() + 1);
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// Remove the source whose URI matches `uri`. The backing source is
+    /// dropped (its stop flag is set if it's a ZMQ source, so the worker
+    /// thread exits within ~5 ms). Returns `true` if a source was removed,
+    /// `false` if no source with that URI exists.
+    pub fn remove(&mut self, uri: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.uri != uri);
+        let removed = self.entries.len() != before;
+        if removed {
+            log::info!("SourceRegistry: removed '{uri}' (now {} sources)", self.entries.len());
+            // Keep cursor in bounds.
+            if self.rr_cursor >= self.entries.len().max(1) {
+                self.rr_cursor = 0;
+            }
+        }
+        removed
+    }
+
+    /// Snapshot of every connected source's `(uri, drone_name, is_live)` triple
+    /// for the toolbar Sources dropdown. `live_threshold_s` is the cutoff for
+    /// the `●` (live) vs `◌` (stale) UI indicator — typically 3.0 s.
+    pub fn list(&self, live_threshold_s: f64) -> Vec<SourceListEntry> {
+        let now_s = self.started.elapsed().as_secs_f64();
+        self.entries
+            .iter()
+            .map(|e| SourceListEntry {
+                uri: e.uri.clone(),
+                drone_name: e.drone_name(),
+                fallback_name: Arc::clone(&e.fallback_name),
+                is_live: e.is_live(now_s, live_threshold_s),
+            })
+            .collect()
+    }
+
+    /// Number of connected sources.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `true` when no sources are connected.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Shared `SeenDrones` set updated by every leg's discovery worker.
+    pub fn merged_seen_drones(&self) -> SeenDrones {
+        Arc::clone(&self.merged_seen)
+    }
+
+    /// Every connected source URI (insertion-ordered).
+    pub fn uris(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.uri.clone()).collect()
+    }
+}
+
+/// v0.15.0 — one row in the toolbar Sources dropdown. Snapshotted from a
+/// [`SourceRegistry`] via [`SourceRegistry::list`] each frame.
+#[derive(Debug, Clone)]
+pub struct SourceListEntry {
+    pub uri: String,
+    /// Most-recently observed drone name (ZMQ only). `None` until the first
+    /// envelope arrives, or for non-ZMQ sources.
+    pub drone_name: Option<Arc<str>>,
+    /// Fallback name stamped on samples whose `drone_name` is `None`.
+    /// Useful for showing a sensible identity in the UI before any envelope.
+    pub fallback_name: Arc<str>,
+    /// `●` when the last sample is within the live-threshold window;
+    /// `◌` otherwise.
+    pub is_live: bool,
+}
+
+impl Source for SourceRegistry {
+    fn try_recv(&mut self) -> Option<Sample> {
+        let n = self.entries.len();
+        if n == 0 {
+            return None;
+        }
+        // Round-robin across all legs, starting at the cursor. Cursor
+        // advances by one position per yielded sample (fair-merge).
+        for offset in 0..n {
+            let i = (self.rr_cursor + offset) % n;
+            let now_s = self.started.elapsed().as_secs_f64();
+            let leg = &mut self.entries[i];
+            if let Some(mut s) = leg.inner.try_recv() {
+                leg.last_sample_at = now_s;
+                if s.drone_name.is_none() {
+                    s.drone_name = Some(Arc::clone(&leg.fallback_name));
+                }
+                if let Some(name) = &s.drone_name {
+                    let known = self
+                        .merged_seen
+                        .read()
+                        .map(|g| g.contains(name.as_ref()))
+                        .unwrap_or(true);
+                    if !known {
+                        if let Ok(mut g) = self.merged_seen.write() {
+                            g.insert(name.to_string());
+                        }
+                    }
+                }
+                // Union leg's native discovery set into merged (grown-set check).
+                if let Some(inner) = &leg.inner_seen {
+                    let cur_len = inner.read().map(|g| g.len()).unwrap_or(0);
+                    if cur_len > leg.last_seen_len {
+                        let to_add: Vec<String> = inner
+                            .read()
+                            .map(|g| g.iter().cloned().collect())
+                            .unwrap_or_default();
+                        if !to_add.is_empty() {
+                            if let Ok(mut m) = self.merged_seen.write() {
+                                for n in to_add {
+                                    m.insert(n);
+                                }
+                            }
+                        }
+                        leg.last_seen_len = cur_len;
+                    }
+                }
+                self.rr_cursor = (i + 1) % n;
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    fn describe(&self) -> String {
+        if self.entries.is_empty() {
+            return "registry: (no sources)".to_string();
+        }
+        let parts: Vec<String> = self.entries.iter().map(|e| e.uri.clone()).collect();
+        format!("registry:[{}]", parts.join(" + "))
+    }
 }
 
 impl Source for MultiSource {
