@@ -88,6 +88,12 @@ pub const KNOWN_HVN_SITL_KEYS: &[(&str, ValueShape)] = &[
     ("ap_mag_xyz[0]", ValueShape::Scalar), ("ap_mag_xyz[1]", ValueShape::Scalar), ("ap_mag_xyz[2]", ValueShape::Scalar),
     ("ap_vfr_alt", ValueShape::Scalar),
     ("ap_vel_ned[0]", ValueShape::Scalar), ("ap_vel_ned[1]", ValueShape::Scalar), ("ap_vel_ned[2]", ValueShape::Scalar),
+    // v0.16.7 — AP-side GPS scalars. `gps_alt`/`gps_vn` (above, in DT physics)
+    // are DT-Python's truth values; `ap_gps_alt` is the autopilot's reported
+    // altitude (from GLOBAL_POSITION_INT / GPS_RAW_INT) and `ap_gps_speed` is
+    // the autopilot's reported ground-speed magnitude (NOT a north velocity —
+    // ap_vel_ned[0] is the actual N component).
+    ("ap_gps_alt", ValueShape::Scalar), ("ap_gps_speed", ValueShape::Scalar),
     // ── Position NED (truth / GPS sensor / EKF / target) ──────────────────
     ("pos_truth_ned[0]", ValueShape::Scalar), ("pos_truth_ned[1]", ValueShape::Scalar), ("pos_truth_ned[2]", ValueShape::Scalar),
     ("pos_gps_ned[0]", ValueShape::Scalar), ("pos_gps_ned[1]", ValueShape::Scalar), ("pos_gps_ned[2]", ValueShape::Scalar),
@@ -761,6 +767,7 @@ pub fn categorize_key(key: &str) -> &'static str {
             => "DT physics",
         // AP MAVLink mirrors (what the autopilot sees)
         "ap_attitude" | "ap_raw_imu" | "ap_vfr_alt" | "ap_vel_ned" | "ap_mag_xyz"
+        | "ap_gps_alt" | "ap_gps_speed"
             => "AP MAVLink",
         // Position channels (NED frames)
         k if k.starts_with("pos_") => "Position (NED)",

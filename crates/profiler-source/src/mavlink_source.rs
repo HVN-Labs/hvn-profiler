@@ -681,8 +681,8 @@ pub fn decode_to_samples_with_drone(
 /// | `LOCAL_POSITION_NED` | `pos_ekf_ned[0..2]`, `ap_vel_ned[0..2]` |
 /// | `POSITION_TARGET_LOCAL_NED` | `pos_target_ned[0..2]` |
 /// | `VFR_HUD` | `ap_vfr_alt` |
-/// | `GLOBAL_POSITION_INT` | `gps_alt`, `ap_vel_ned[0..2]`, `gps_lat`, `gps_lon` |
-/// | `GPS_RAW_INT` | `gps_alt`, `gps_lat`, `gps_lon`, `gps_vn`, `fix_type` |
+/// | `GLOBAL_POSITION_INT` | `ap_gps_alt`, `ap_vel_ned[0..2]`, `gps_lat`, `gps_lon` |
+/// | `GPS_RAW_INT` | `ap_gps_alt`, `gps_lat`, `gps_lon`, `ap_gps_speed`, `fix_type` |
 /// | `EKF_STATUS_REPORT` | `ekf_flags`, `ekf_velv`, `ekf_pos_horiz`, `ekf_pos_vert`, `ekf_compv`, `ekf_terralt` |
 /// | `AHRS2` | `ahrs2_roll`, `ahrs2_pitch`, `ahrs2_yaw`, `ahrs2_alt`, `ahrs2_lat`, `ahrs2_lng` |
 /// | `VIBRATION` | `vibex`, `vibey`, `vibez`, `vibeclip0..2` |
@@ -772,10 +772,13 @@ pub fn decode_to_samples_with_state(
             s("pos_target_ned[1]", d.y as f64),
             s("pos_target_ned[2]", d.z as f64),
         ],
-        // v0.8.0 — stock-stream messages.
+        // v0.8.0 — stock-stream messages. v0.16.7 — `gps_alt` renamed to
+        // `ap_gps_alt` to stop overwriting DT-Python's truth altitude
+        // (DT emits `gps_alt = state.lla[2]`). `gps_lat`/`gps_lon` are not
+        // emitted by DT in the streamer envelope, so keep them as-is for now.
         // GLOBAL_POSITION_INT: alt in mm, vx/vy/vz in cm/s, lat/lon * 1e7.
         MavMessage::GLOBAL_POSITION_INT(d) => vec![
-            s("gps_alt", d.alt as f64 / 1_000.0),
+            s("ap_gps_alt", d.alt as f64 / 1_000.0),
             s("ap_vel_ned[0]", d.vx as f64 / 100.0),
             s("ap_vel_ned[1]", d.vy as f64 / 100.0),
             s("ap_vel_ned[2]", d.vz as f64 / 100.0),
@@ -784,12 +787,17 @@ pub fn decode_to_samples_with_state(
         ],
         // GPS_RAW_INT: alt in mm, vel in cm/s, lat/lon * 1e7. v0.16.3 — also
         // surface `fix_type` so the status primitive can colour by lock
-        // quality (3=3D, 4=DGPS, 5=RTK float, 6=RTK fixed).
+        // quality (3=3D, 4=DGPS, 5=RTK float, 6=RTK fixed). v0.16.7 — also
+        // renamed `gps_vn` → `ap_gps_speed`: GPS_RAW_INT.vel is GROUND SPEED
+        // MAGNITUDE (cm/s), NOT a north velocity component. The old name was
+        // doubly wrong — collision with DT's truth `gps_vn = v_ned[0]` AND
+        // semantically misleading. Drone-direction velocity components live
+        // in `ap_vel_ned[0..2]` (from GLOBAL_POSITION_INT).
         MavMessage::GPS_RAW_INT(d) => vec![
-            s("gps_alt", d.alt as f64 / 1_000.0),
+            s("ap_gps_alt", d.alt as f64 / 1_000.0),
             s("gps_lat", d.lat as f64 / 1e7),
             s("gps_lon", d.lon as f64 / 1e7),
-            s("gps_vn", d.vel as f64 / 100.0),
+            s("ap_gps_speed", d.vel as f64 / 100.0),
             // `fix_type` is an enum on the wire; cast through u8 via the
             // bitflags-style `From` conversion the mavlink crate exposes for
             // every C-enum (`as u8` works because the discriminants are

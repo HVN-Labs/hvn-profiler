@@ -40,7 +40,15 @@ fn categorize_dt_physics_keys() {
 
 #[test]
 fn categorize_ap_mavlink_keys() {
-    for k in ["ap_attitude", "ap_raw_imu", "ap_vfr_alt", "ap_vel_ned", "ap_mag_xyz"] {
+    for k in [
+        "ap_attitude",
+        "ap_raw_imu",
+        "ap_vfr_alt",
+        "ap_vel_ned",
+        "ap_mag_xyz",
+        "ap_gps_alt",
+        "ap_gps_speed",
+    ] {
         assert_eq!(categorize_key(k), "AP MAVLink", "{k} should be AP MAVLink");
     }
 }

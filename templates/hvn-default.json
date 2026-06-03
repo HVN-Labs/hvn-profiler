@@ -57,7 +57,8 @@
       "title": "Altitude [m]",
       "primitive": "overlay",
       "sources": [
-        {"key": "gps_alt", "label": "GPS", "color": "C6", "lw": 1.0, "marker": ".", "markersize": 4},
+        {"key": "gps_alt", "label": "DT GPS", "color": "C6", "lw": 1.0, "marker": ".", "markersize": 4},
+        {"key": "ap_gps_alt", "label": "AP GPS", "color": "C9", "lw": 1.0, "marker": "x", "markersize": 4},
         {"key": "baro_alt", "label": "Baro", "color": "C8", "lw": 0.8},
         {"key": "state_alt", "fallback": "ap_vfr_alt", "label": "State", "color": "C3", "lw": 0.8, "linestyle": "--"}
       ],

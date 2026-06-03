@@ -56,7 +56,7 @@
       "title": "Altitude [m]",
       "primitive": "overlay",
       "sources": [
-        {"key": "gps_alt", "label": "GPS", "color": "C6", "lw": 1.0, "marker": ".", "markersize": 4},
+        {"key": "ap_gps_alt", "fallback": "gps_alt", "label": "GPS", "color": "C6", "lw": 1.0, "marker": ".", "markersize": 4},
         {"key": "baro_alt", "label": "Baro", "color": "C8", "lw": 0.8},
         {"key": "ap_vfr_alt", "fallback": "state_alt", "label": "VFR", "color": "C3", "lw": 0.8, "linestyle": "--"}
       ],
