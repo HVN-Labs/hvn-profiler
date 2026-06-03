@@ -315,6 +315,21 @@ pub struct CellSource {
     /// `source_uri` doesn't match any currently-connected source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
+    /// v0.16.8 — optional drone NAME this trace is pinned to (e.g. `"eric_1"`).
+    /// When set and the renderer has a store for that drone, the cell reads
+    /// from that drone's store regardless of the toolbar's view-drone
+    /// selection.
+    ///
+    /// Drone-level pinning is the operator's actual mental model ("pin this
+    /// panel to drone B") and is the source-of-truth pin when both
+    /// `source_drone` and `source_uri` are set. Drone-pin survives the
+    /// v0.16.4 shared MAVLink demux flow where a single URI carries N drones,
+    /// which is the case `source_uri` (v0.15.0) cannot resolve correctly.
+    ///
+    /// Templates without this field load unchanged. Bundled templates omit
+    /// it so they remain drone-agnostic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_drone: Option<String>,
     /// Fallback key used when `key` has no data in the store.
     #[serde(default)]
     pub fallback: Option<String>,

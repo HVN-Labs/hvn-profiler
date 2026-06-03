@@ -288,3 +288,182 @@ fn iter_all_stores_covers_single_store_in_single_mode() {
         "iter_all_stores in single mode yields exactly the wrapped store",
     );
 }
+
+// ─── v0.16.8 — drone-level pin (CellSource::source_drone) ───────────────────
+//
+// The v0.15.0 URI pin breaks for the v0.16.4 shared MAVLink demux flow
+// where one URI carries N drones (`uri_to_drone` only maps the URI to the
+// first drone seen). v0.16.8 adds `CellSource::source_drone` — a stable
+// drone-name pin — and reorders `StoresView::for_source` so drone-pin wins
+// over URI-pin.
+
+#[test]
+fn drone_pin_beats_view_drone() {
+    // Cell pinned to drone-B via `source_drone` while the toolbar view is
+    // on drone A → resolves to drone-B's store. Mirrors `source_uri` pin's
+    // cross-drone semantics but pins by NAME instead of URI.
+    let (stores, uri_to_drone, empty) = two_drone_setup();
+    let view = StoresView::multi(&stores, &uri_to_drone, "A", &empty);
+
+    let pinned = CellSource {
+        key: "ap_attitude[0]".into(),
+        source_drone: Some("B".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&pinned).latest("ap_attitude[0]"),
+        Some(2.0),
+        "drone-pin must route to drone-B's store regardless of view-drone",
+    );
+}
+
+#[test]
+fn drone_pin_beats_uri_pin() {
+    // Cell with BOTH `source_drone = "B"` and `source_uri = <A's URI>`.
+    // v0.16.8 precedence: drone-pin always wins. The legacy URI-pin path
+    // would have routed to A — the new precedence overrides that so the
+    // cell follows the operator's drone-level intent.
+    let (stores, uri_to_drone, empty) = two_drone_setup();
+    let view = StoresView::multi(&stores, &uri_to_drone, "A", &empty);
+
+    let pinned = CellSource {
+        key: "ap_attitude[0]".into(),
+        // URI points to A in `uri_to_drone` — confirm URI-pin would route to A
+        source_uri: Some("zmq://127.0.0.1:9005".into()),
+        // ...but drone-pin says B → drone-pin wins.
+        source_drone: Some("B".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&pinned).latest("ap_attitude[0]"),
+        Some(2.0),
+        "drone-pin must win over conflicting URI-pin",
+    );
+}
+
+#[test]
+fn shared_mavlink_demux_routes_by_drone() {
+    // The v0.16.4 shared MAVLink demux case: TWO drones (A and B) share one
+    // URI `mavlink://0.0.0.0:14560`. `uri_to_drone` only holds one entry per
+    // URI — it maps to A (the first drone seen on that port). A cell pinned
+    // to drone B via `source_drone` MUST still route to B's store. With only
+    // URI-pin available (the v0.15.0 path) this would have leaked drone A's
+    // data into the pinned cell — the v0.16.8 drone-pin saves us.
+    let mut stores: HashMap<String, TraceStore> = HashMap::new();
+    stores.insert("A".to_string(), make_store(1.0));
+    stores.insert("B".to_string(), make_store(2.0));
+    let mut uri_to_drone: HashMap<String, String> = HashMap::new();
+    // Only one entry possible: shared URI demuxes to whichever drone was
+    // observed first. URI-pin path would always return A.
+    uri_to_drone.insert(
+        "mavlink://0.0.0.0:14560".to_string(),
+        "A".to_string(),
+    );
+    let empty = TraceStore::default();
+    let view = StoresView::multi(&stores, &uri_to_drone, "A", &empty);
+
+    let pinned_to_b = CellSource {
+        key: "ap_attitude[0]".into(),
+        // Same URI as drone A — but drone-pin names B explicitly.
+        source_uri: Some("mavlink://0.0.0.0:14560".into()),
+        source_drone: Some("B".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&pinned_to_b).latest("ap_attitude[0]"),
+        Some(2.0),
+        "shared MAVLink port: drone-pin must route to B even though URI maps to A",
+    );
+}
+
+#[test]
+fn empty_drone_pin_falls_back_to_uri_pin() {
+    // Legacy template: only `source_uri` is set, `source_drone` is `None`.
+    // Resolution must walk through to the URI-pin path (drone-pin not
+    // applicable). This is the v0.15.0 backward-compat case.
+    let (stores, uri_to_drone, empty) = two_drone_setup();
+    let view = StoresView::multi(&stores, &uri_to_drone, "A", &empty);
+
+    let legacy_pin = CellSource {
+        key: "ap_attitude[0]".into(),
+        source_drone: None,
+        source_uri: Some("zmq://127.0.0.1:9006".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&legacy_pin).latest("ap_attitude[0]"),
+        Some(2.0),
+        "drone-pin None → URI-pin still resolves (v0.15.0 compat)",
+    );
+
+    // Same again but with empty-string drone-pin: must still be treated as
+    // unpinned and walk to URI-pin (matches the v0.15.0 empty-string contract).
+    let legacy_pin_empty = CellSource {
+        key: "ap_attitude[0]".into(),
+        source_drone: Some(String::new()),
+        source_uri: Some("zmq://127.0.0.1:9006".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&legacy_pin_empty)
+            .latest("ap_attitude[0]"),
+        Some(2.0),
+        "empty-string drone-pin treated as unpinned → URI-pin resolves",
+    );
+}
+
+#[test]
+fn both_empty_falls_back_to_view_drone() {
+    // Neither drone-pin nor URI-pin is set → cell follows the view-drone.
+    // Preserves the v0.16.1 (and earlier) behaviour exactly.
+    let (stores, uri_to_drone, empty) = two_drone_setup();
+    let view = StoresView::multi(&stores, &uri_to_drone, "B", &empty);
+
+    let unpinned = CellSource {
+        key: "ap_attitude[0]".into(),
+        source_drone: None,
+        source_uri: None,
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&unpinned).latest("ap_attitude[0]"),
+        Some(2.0),
+        "no pins → view-drone B's store",
+    );
+}
+
+#[test]
+fn unknown_drone_pin_falls_back_to_uri_pin_then_view() {
+    // Cell pinned to a drone NAME that isn't in `stores` yet (e.g. fleet
+    // hasn't published a sample for that drone yet, or the template is
+    // loaded against a fleet that doesn't include that drone). Should fall
+    // back to URI-pin if set, otherwise view-drone — never the empty store.
+    let (stores, uri_to_drone, empty) = two_drone_setup();
+    let view = StoresView::multi(&stores, &uri_to_drone, "A", &empty);
+
+    // (a) stale drone-pin, valid URI-pin → URI-pin wins
+    let stale_drone = CellSource {
+        key: "ap_attitude[0]".into(),
+        source_drone: Some("nonexistent".into()),
+        source_uri: Some("zmq://127.0.0.1:9006".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&stale_drone).latest("ap_attitude[0]"),
+        Some(2.0),
+        "stale drone-pin → URI-pin (drone-B) resolves",
+    );
+
+    // (b) stale drone-pin, no URI-pin → view-drone (A)
+    let stale_drone_no_uri = CellSource {
+        key: "ap_attitude[0]".into(),
+        source_drone: Some("nonexistent".into()),
+        source_uri: None,
+        ..Default::default()
+    };
+    assert_eq!(
+        view.for_source(&stale_drone_no_uri).latest("ap_attitude[0]"),
+        Some(1.0),
+        "stale drone-pin + no URI → view-drone A's store",
+    );
+}

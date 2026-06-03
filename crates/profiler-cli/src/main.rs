@@ -2809,6 +2809,10 @@ impl App {
                 let last_seen = &self.last_seen_keys;
                 let filter = &mut self.picker_filter;
                 let sources_ref: &[SourceListEntry] = &connected_sources;
+                // v0.16.8 — snapshot the discovered-drone list so the
+                // drone-pin dropdown in `panel_form` can offer the same
+                // entries the toolbar picker shows.
+                let drones_ref: &[String] = &self.discovered_drones;
                 egui::Window::new("+ Add Panel")
                     .collapsible(false)
                     .resizable(true)
@@ -2827,6 +2831,7 @@ impl App {
                             collapse,
                             Some(&mut pctx),
                             Some(sources_ref),
+                            Some(drones_ref),
                         );
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -2885,6 +2890,8 @@ impl App {
                 let last_seen = &self.last_seen_keys;
                 let filter = &mut self.picker_filter;
                 let sources_ref: &[SourceListEntry] = &connected_sources;
+                // v0.16.8 — see AddPanel above; same drone-pin dropdown plumb.
+                let drones_ref: &[String] = &self.discovered_drones;
                 egui::Window::new(format!("Edit panel ({row}, {col})"))
                     .collapsible(false)
                     .resizable(true)
@@ -2903,6 +2910,7 @@ impl App {
                             collapse,
                             Some(&mut pctx),
                             Some(sources_ref),
+                            Some(drones_ref),
                         );
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -3043,6 +3051,12 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
         .first()
         .and_then(|s| s.source_uri.clone())
         .unwrap_or_default();
+    // v0.16.8 — preserve the cell's drone-pin (if any) into the draft.
+    let source_drone = cell
+        .sources
+        .first()
+        .and_then(|s| s.source_drone.clone())
+        .unwrap_or_default();
     PanelDraft {
         row: cell.row,
         col: cell.col,
@@ -3050,6 +3064,7 @@ fn panel_draft_from_cell(cell: &profiler_template::Cell) -> PanelDraft {
         title: cell.title.clone(),
         source_key,
         source_uri,
+        source_drone,
         fallback,
         minus,
         color,
@@ -3086,6 +3101,11 @@ fn panel_form(
     collapse: &mut profiler_render::ComboCollapseState,
     picker: Option<&mut PickerContext<'_>>,
     connected_sources: Option<&[SourceListEntry]>,
+    // v0.16.8 — list of every drone NAME the CLI has discovered so far
+    // (insertion-ordered, matches the toolbar picker). `None` hides the
+    // "Drone" dropdown entirely; `Some(&[])` shows the dropdown with only
+    // `(any)` available (no discovered drones yet).
+    discovered_drones: Option<&[String]>,
 ) {
     use profiler_template::{LabelMode, Primitive};
 
@@ -3124,10 +3144,54 @@ fn panel_form(
                 });
             ui.end_row();
 
+            // v0.16.8 — drone dropdown row appears ABOVE both the source-key
+            // row and the source-URI row when the caller supplies a list of
+            // discovered drones. Drone-pin wins over URI-pin at render time
+            // (see `StoresView::for_source`), so the Drone row is shown first
+            // to match its precedence in the resolver. Empty
+            // `draft.source_drone` (`""`) renders as `(Any)`; a non-empty
+            // value pins the cell to that drone NAME (stable across runs).
+            //
+            // Why a dropdown and not free-text: a typo in a drone name would
+            // silently route to the view-drone (the operator's "(Any)" path)
+            // with no warning. Limiting selection to `discovered_drones`
+            // keeps the pin honest.
+            if let Some(drones) = discovered_drones {
+                ui.label("Drone:");
+                egui::ComboBox::from_id_salt("panel_form_source_drone")
+                    .selected_text(if draft.source_drone.is_empty() {
+                        "(Any)".to_string()
+                    } else {
+                        draft.source_drone.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        // `(Any)` first — defer to view-drone at render time.
+                        let selected = draft.source_drone.is_empty();
+                        if ui
+                            .selectable_label(selected, "(Any)")
+                            .on_hover_text("Follow the toolbar's view-drone selection")
+                            .clicked()
+                        {
+                            draft.source_drone.clear();
+                        }
+                        for name in drones {
+                            let selected = draft.source_drone == *name;
+                            if ui.selectable_label(selected, name).clicked() {
+                                draft.source_drone = name.clone();
+                            }
+                        }
+                    });
+                ui.end_row();
+            }
+
             // v0.15.0 — source dropdown row appears ABOVE the source-key
             // row when the caller supplies a list of connected sources.
             // Empty `draft.source_uri` (`""`) renders as `(any)`; a
             // non-empty value pins the cell to that URI.
+            //
+            // v0.16.8 — the Drone row above takes precedence at render time.
+            // This URI row is kept for backward compat with v0.15.0 templates
+            // and for the legacy single-drone case where URI-pin still works.
             if let Some(sources) = connected_sources {
                 ui.label("Source:");
                 egui::ComboBox::from_id_salt("panel_form_source_uri")

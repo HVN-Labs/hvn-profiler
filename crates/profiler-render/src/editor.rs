@@ -440,6 +440,12 @@ pub struct PanelDraft {
     /// [`CellSource::source_uri`] so the JSON round-trip preserves the
     /// per-cell selection.
     pub source_uri: String,
+    /// v0.16.8 — optional drone NAME to pin this cell to (e.g. `"eric_1"`).
+    /// Empty string means `(any)` — the renderer falls back to the toolbar's
+    /// view-drone at draw time. Non-empty values are written out as
+    /// [`CellSource::source_drone`]; the render layer resolves drone-pin
+    /// BEFORE URI-pin so a v0.15.0 URI pin is shadowed when both are set.
+    pub source_drone: String,
     /// Optional fallback (when `source_key` has no data, plot this instead).
     pub fallback: String,
     /// For `Diff` only: the subtrahend key (`source_key − minus`).
@@ -473,6 +479,8 @@ impl Default for PanelDraft {
             // v0.15.0 — empty == "(any)" — defer source binding to the first
             // connected leg at render time.
             source_uri: String::new(),
+            // v0.16.8 — empty == "(any)" — drone-pin off by default.
+            source_drone: String::new(),
             fallback: String::new(),
             minus: String::new(),
             color: "#1f77b4".to_string(),
@@ -531,10 +539,16 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
     // v0.15.0 — `source_uri` is written ONLY when the operator picked a
     // specific source in the form (non-empty string). The `(any)` default
     // leaves the field as `None` so existing templates round-trip unchanged.
+    // v0.16.8 — `source_drone` follows the same contract: only persist when
+    // the operator picked a specific drone in the form. The render layer
+    // resolves drone-pin BEFORE URI-pin so when both are set on a saved
+    // cell, the drone-pin wins.
     let source_uri = non_empty(&draft.source_uri);
+    let source_drone = non_empty(&draft.source_drone);
     let mut sources: Vec<CellSource> = vec![CellSource {
         key: draft.source_key.trim().to_string(),
         source_uri: source_uri.clone(),
+        source_drone: source_drone.clone(),
         fallback: non_empty(&draft.fallback),
         minus: if draft.primitive == Primitive::Diff {
             non_empty(&draft.minus)
@@ -555,6 +569,9 @@ pub fn apply_panel_draft(tpl: &mut Template, draft: &PanelDraft) -> Result<(), S
                     // source_uri. Multi-source overlays will get
                     // per-source pins in a later release.
                     source_uri: source_uri.clone(),
+                    // v0.16.8 — overlay extras inherit the cell's drone-pin
+                    // (same contract as source_uri).
+                    source_drone: source_drone.clone(),
                     ..Default::default()
                 });
             }

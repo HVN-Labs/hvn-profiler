@@ -232,17 +232,35 @@ impl<'a> StoresView<'a> {
 
     /// Resolve the [`TraceStore`] to read this cell-source from.
     ///
-    /// Rules (in order):
+    /// Rules (in order, v0.16.8):
     /// 1. Single-store mode → that one store, every time.
-    /// 2. `src.source_uri = Some(uri)` AND `uri_to_drone[uri]` is in `stores`
-    ///    → that drone's store. **This is the v0.15.0 cross-drone pin.**
-    /// 3. Otherwise → `view_drone`'s store, if known.
-    /// 4. Otherwise → the shared empty store (renderer treats it as
+    /// 2. `src.source_drone = Some(name)` AND `stores[name]` exists → that
+    ///    drone's store. **Drone-pin wins over URI-pin.** This is the
+    ///    operator's primary mental model and survives shared MAVLink ports
+    ///    that carry N drones on one URI (v0.16.4 demux flow).
+    /// 3. `src.source_uri = Some(uri)` AND `uri_to_drone[uri]` is in `stores`
+    ///    → that drone's store. **Legacy v0.15.0 URI pin** — kept for
+    ///    backward compat with templates that pinned by URI. Breaks for
+    ///    shared MAVLink demux (one URI → many drones, `uri_to_drone` only
+    ///    holds the first one seen), which is why drone-pin was added.
+    /// 4. Otherwise → `view_drone`'s store, if known.
+    /// 5. Otherwise → the shared empty store (renderer treats it as
     ///    "no data").
     pub fn for_source(&self, src: &CellSource) -> &TraceStore {
         if let Some(s) = self.single {
             return s;
         }
+        // v0.16.8 — drone-level pin wins over URI pin (URI pin breaks for
+        // shared MAVLink ports carrying multiple drones).
+        if let Some(drone) = src.source_drone.as_deref().filter(|d| !d.is_empty()) {
+            if let Some(map) = self.stores {
+                if let Some(store) = map.get(drone) {
+                    return store;
+                }
+            }
+        }
+        // v0.15.0 — URI pin (legacy). Kept for backward compat with templates
+        // that pin by URI. Cells with both fields set: drone-pin always wins.
         if let Some(uri) = src.source_uri.as_deref().filter(|u| !u.is_empty()) {
             if let Some(drone) = self.uri_to_drone.get(uri) {
                 if let Some(map) = self.stores {
@@ -258,6 +276,11 @@ impl<'a> StoresView<'a> {
     /// Resolve a store from a bare cell-level URI pin (used by primitives like
     /// `Status` whose source carries no `CellSource`). Same fallback ladder as
     /// [`Self::for_source`].
+    ///
+    /// v0.16.8 — Status primitives still pin by URI only (no drone-pin
+    /// surface for them yet); this method matches that constraint. When a
+    /// drone-pin is needed for status, [`Self::for_source`] is the right
+    /// entry-point.
     pub fn for_uri(&self, uri: Option<&str>) -> &TraceStore {
         if let Some(s) = self.single {
             return s;
