@@ -2,7 +2,7 @@
   "name": "hvn-default",
   "description": "HVN-SITL default 7x3 sensor grid + 3D trajectory panel. Mirrors the legacy hard-coded layout exactly: rows 0-4 are raw sensors (DT -> AP), rows 5-6 are drone outputs (AP estimate / controller). The right side hosts the 3D trajectory with truth/gps/ekf/dead-reckon trails.",
   "figsize": [19, 16],
-  "grid": {"rows": 7, "cols": 3},
+  "grid": {"rows": 8, "cols": 3},
   "subplots_adjust": {"left": 0.045, "right": 0.68, "top": 0.93, "bottom": 0.07, "hspace": 0.80, "wspace": 0.45},
   "sections": [
     {"label": "Raw Sensors  (DT → AP)", "anchor_row": 0, "anchor_col": 0, "color": "#345"},
@@ -185,6 +185,23 @@
       "sources": [{"key": "pos_target_ned[2]", "minus": "pos_ekf_ned[2]", "lw": 0.9, "color": "#ff7f0e"}],
       "zero_reference_line": true,
       "label_mode": "off"
+    },
+    {
+      "row": 7, "col": 0,
+      "title": "AP Mag [mGauss]",
+      "primitive": "vector",
+      "sources": [
+        {"key": "ap_mag_xyz", "scale": 1000.0,
+         "components": [
+           {"label": "mx", "color": "C3", "lw": 0.8},
+           {"label": "my", "color": "C4", "lw": 0.8},
+           {"label": "mz", "color": "C5", "lw": 0.8}
+         ]
+        }
+      ],
+      "legend": {"fontsize": 6, "loc": "upper left", "ncol": 3},
+      "label_mode": "off",
+      "label_metadata": {"source_path": "RAW_IMU.xmag/ymag/zmag", "units": "mGauss (AP readback)"}
     }
   ],
   "view_3d": {

@@ -6,8 +6,9 @@
 //!
 //! Pre-v0.10.1, the per-sample closure in `decode_to_samples_with_drone`
 //! cloned an owned `String` for every sample (originally 6 per `RAW_IMU`
-//! message; v0.16.5 raised this to 10 — 9 scalar indices + `mag_xyz`
-//! Vec[3]). With the `Arc<str>` migration, the same backing buffer is
+//! message; v0.16.5 raised this to 10 — 9 scalar indices + the mag Vec[3]
+//! key, renamed `mag_xyz` → `ap_mag_xyz` in v0.16.6). With the `Arc<str>`
+//! migration, the same backing buffer is
 //! refcount-bumped instead — verifiable via `Arc::strong_count` since every
 //! emitted sample's `drone_name` shares the same allocation as the one we
 //! passed in.
@@ -20,10 +21,11 @@ use profiler_source::mavlink_source::decode_to_samples_with_drone;
 
 #[test]
 fn decode_emits_arc_str_drone_names_with_shared_backing_buffer() {
-    // RAW_IMU expands to 10 samples per frame in v0.16.5 (9 scalar indices
-    // + `mag_xyz` Vec[3]) — the worst case for the pre-v0.10.1 String-clone
-    // loop. With Arc<str>, every emitted sample's `drone_name` refers to
-    // the SAME `Arc` instance we handed in.
+    // RAW_IMU expands to 10 samples per frame in v0.16.5+ (9 scalar indices
+    // + `ap_mag_xyz` Vec[3], renamed from `mag_xyz` in v0.16.6) — the worst
+    // case for the pre-v0.10.1 String-clone loop. With Arc<str>, every
+    // emitted sample's `drone_name` refers to the SAME `Arc` instance we
+    // handed in.
     let msg = MavMessage::RAW_IMU(RAW_IMU_DATA::default());
     let dn: Arc<str> = Arc::from("sysid_42");
     let strong_before = Arc::strong_count(&dn);
@@ -32,7 +34,7 @@ fn decode_emits_arc_str_drone_names_with_shared_backing_buffer() {
     assert_eq!(
         samples.len(),
         10,
-        "v0.16.5: RAW_IMU fans out into nine scalar indices + one mag_xyz vector",
+        "v0.16.6: RAW_IMU fans out into nine scalar indices + one ap_mag_xyz vector",
     );
 
     // Every emitted sample's `drone_name` is `Some(arc)` and `Arc::ptr_eq`
@@ -69,7 +71,7 @@ fn decode_without_drone_name_emits_none() {
     // Backwards compat: `None` in → `None` on every sample.
     let msg = MavMessage::RAW_IMU(RAW_IMU_DATA::default());
     let samples = decode_to_samples_with_drone(&msg, 0.0, None);
-    // v0.16.5: 9 scalars + mag_xyz Vec[3] = 10 emitted samples.
+    // v0.16.6: 9 scalars + ap_mag_xyz Vec[3] = 10 emitted samples.
     assert_eq!(samples.len(), 10);
     for s in &samples {
         assert!(s.drone_name.is_none());

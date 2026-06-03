@@ -76,6 +76,7 @@ fn known_keys_include_vector_bases() {
         "accel",
         "gyro",
         "mag_xyz",
+        "ap_mag_xyz",
         "ap_attitude",
         "ap_raw_imu",
         "ap_vel_ned",

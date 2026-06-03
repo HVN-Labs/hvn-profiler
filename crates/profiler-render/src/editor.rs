@@ -80,9 +80,12 @@ pub const KNOWN_HVN_SITL_KEYS: &[(&str, ValueShape)] = &[
     ("ap_attitude[0]", ValueShape::Scalar), ("ap_attitude[1]", ValueShape::Scalar), ("ap_attitude[2]", ValueShape::Scalar),
     ("ap_raw_imu[0]", ValueShape::Scalar), ("ap_raw_imu[1]", ValueShape::Scalar), ("ap_raw_imu[2]", ValueShape::Scalar),
     ("ap_raw_imu[3]", ValueShape::Scalar), ("ap_raw_imu[4]", ValueShape::Scalar), ("ap_raw_imu[5]", ValueShape::Scalar),
-    // v0.16.5 — mag indices 6..8 emit raw mGauss; `mag_xyz` Vec[3] (gauss) is
-    // already declared elsewhere in this table.
+    // v0.16.5 — mag indices 6..8 emit raw mGauss.
+    // v0.16.6 — `ap_mag_xyz` (Vec[3] gauss) is the AP-side magnetometer
+    // readback; the bare `mag_xyz` above stays bound to DT-Python's sim-side
+    // truth field. Both can coexist in HIL mode (side-by-side cells).
     ("ap_raw_imu[6]", ValueShape::Scalar), ("ap_raw_imu[7]", ValueShape::Scalar), ("ap_raw_imu[8]", ValueShape::Scalar),
+    ("ap_mag_xyz[0]", ValueShape::Scalar), ("ap_mag_xyz[1]", ValueShape::Scalar), ("ap_mag_xyz[2]", ValueShape::Scalar),
     ("ap_vfr_alt", ValueShape::Scalar),
     ("ap_vel_ned[0]", ValueShape::Scalar), ("ap_vel_ned[1]", ValueShape::Scalar), ("ap_vel_ned[2]", ValueShape::Scalar),
     // ── Position NED (truth / GPS sensor / EKF / target) ──────────────────
@@ -757,7 +760,7 @@ pub fn categorize_key(key: &str) -> &'static str {
         | "quat_wxyz" | "euler" | "gps_alt" | "gps_vn"
             => "DT physics",
         // AP MAVLink mirrors (what the autopilot sees)
-        "ap_attitude" | "ap_raw_imu" | "ap_vfr_alt" | "ap_vel_ned"
+        "ap_attitude" | "ap_raw_imu" | "ap_vfr_alt" | "ap_vel_ned" | "ap_mag_xyz"
             => "AP MAVLink",
         // Position channels (NED frames)
         k if k.starts_with("pos_") => "Position (NED)",

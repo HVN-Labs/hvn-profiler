@@ -100,19 +100,18 @@
     },
     {
       "row": 4, "col": 0,
-      "title": "Mag [mGauss]",
-      "primitive": "mag_interference",
+      "title": "AP Mag [mGauss]",
+      "primitive": "vector",
       "sources": [
-        {"key": "mag_xyz", "scale": 1000.0,
+        {"key": "ap_mag_xyz", "scale": 1000.0,
          "components": [
            {"label": "mx", "color": "C0", "lw": 0.8},
            {"label": "my", "color": "C1", "lw": 0.8},
            {"label": "mz", "color": "C2", "lw": 0.8}
-         ],
-         "magnitude": {"label": "|B|", "color": "k", "lw": 1.0}
+         ]
         }
       ],
-      "legend": {"fontsize": 6, "loc": "upper left", "ncol": 2},
+      "legend": {"fontsize": 6, "loc": "upper left", "ncol": 3},
       "label_mode": "off"
     },
     {

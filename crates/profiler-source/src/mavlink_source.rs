@@ -677,7 +677,7 @@ pub fn decode_to_samples_with_drone(
 /// | MAVLink | Key(s) |
 /// |---|---|
 /// | `ATTITUDE` | `ap_attitude[0..2]` |
-/// | `RAW_IMU` | `ap_raw_imu[0..8]` (raw counts), `mag_xyz` (Vec[3] gauss) |
+/// | `RAW_IMU` | `ap_raw_imu[0..8]` (raw counts), `ap_mag_xyz` (Vec[3] gauss) |
 /// | `LOCAL_POSITION_NED` | `pos_ekf_ned[0..2]`, `ap_vel_ned[0..2]` |
 /// | `POSITION_TARGET_LOCAL_NED` | `pos_target_ned[0..2]` |
 /// | `VFR_HUD` | `ap_vfr_alt` |
@@ -750,14 +750,17 @@ pub fn decode_to_samples_with_state(
             s("ap_raw_imu[5]", d.zgyro as f64),
             // v0.16.5 — primary magnetometer. AP RAW_IMU xmag/ymag/zmag are
             // emitted in mGauss (per ArduPilot convention). DT-Python's
-            // hil_bridge emits `mag_xyz` as a Vec[3] in *gauss*; we keep wire
-            // parity by converting mGauss → gauss here so the hvn-default
-            // `mag_interference` cell (scale=1000 → mGauss display) renders
-            // identically regardless of source.
+            // hil_bridge emits `mag_xyz` as a Vec[3] in *gauss* (sim-side truth
+            // field with interference applied — before AP sees it). We expose
+            // the AP-decoded readback under `ap_mag_xyz` (gauss) so HIL mode
+            // can render both sources side-by-side without key collision.
+            // v0.16.6 — renamed from `mag_xyz` → `ap_mag_xyz` to follow the
+            // `ap_` prefix convention (matches ap_raw_imu / ap_attitude /
+            // pos_ekf_ned vs DT-side accel/gyro/euler/pos_truth_ned pairs).
             s("ap_raw_imu[6]", d.xmag as f64),  // raw mGauss for parity with other indices
             s("ap_raw_imu[7]", d.ymag as f64),
             s("ap_raw_imu[8]", d.zmag as f64),
-            make("mag_xyz", Value::Vector(vec![
+            make("ap_mag_xyz", Value::Vector(vec![
                 d.xmag as f64 / 1000.0,
                 d.ymag as f64 / 1000.0,
                 d.zmag as f64 / 1000.0,
@@ -1143,10 +1146,12 @@ mod tests {
     }
 
     #[test]
-    fn raw_imu_maps_to_nine_indexed_keys_plus_mag_xyz_vector() {
+    fn raw_imu_maps_to_nine_indexed_keys_plus_ap_mag_xyz_vector() {
         // v0.16.5 — RAW_IMU now also exposes xmag/ymag/zmag at indices 6..8
-        // (raw mGauss) and a top-level `mag_xyz` Vec[3] in gauss. See
-        // `crates/profiler-source/tests/mavlink_mag_xyz_test.rs` for the
+        // (raw mGauss) and a top-level mag Vec[3] in gauss.
+        // v0.16.6 — Vec[3] key renamed `mag_xyz` → `ap_mag_xyz` to avoid
+        // colliding with DT-Python `hil_bridge`'s sim-side `mag_xyz`. See
+        // `crates/profiler-source/tests/mavlink_ap_mag_xyz_test.rs` for the
         // deeper contract; this in-module test just pins the unit shape.
         let d = RAW_IMU_DATA {
             xacc: 10,
@@ -1187,11 +1192,11 @@ mod tests {
             ]
         );
 
-        // And the `mag_xyz` Vec[3] in gauss (mGauss / 1000).
+        // And the `ap_mag_xyz` Vec[3] in gauss (mGauss / 1000).
         let mag = samples
             .iter()
-            .find(|s| s.key == "mag_xyz")
-            .expect("mag_xyz Vec[3] sample");
+            .find(|s| s.key == "ap_mag_xyz")
+            .expect("ap_mag_xyz Vec[3] sample");
         match &mag.value {
             Value::Vector(v) => {
                 assert_eq!(v.len(), 3);

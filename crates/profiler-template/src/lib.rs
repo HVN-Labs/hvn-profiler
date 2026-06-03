@@ -587,15 +587,19 @@ mod tests {
     fn loads_hvn_default() {
         let t = Template::from_path(fixture("hvn-default.json")).unwrap();
         assert_eq!(t.name, "hvn-default");
-        assert_eq!(t.grid.rows, 7);
+        // v0.16.6 — grid expanded 7 → 8 rows to host the new "AP Mag" cell
+        // at (7, 0), giving DT-side `mag_xyz` (interference view) and AP-side
+        // `ap_mag_xyz` (readback) their own panels.
+        assert_eq!(t.grid.rows, 8);
         assert_eq!(t.grid.cols, 3);
-        // 7x3 grid → 21 cells defined (one is visible:false).
-        assert_eq!(t.cells.len(), 21);
+        // 21 original cells + 1 new "AP Mag" cell = 22 cells defined
+        // (one of the originals is visible:false).
+        assert_eq!(t.cells.len(), 22);
         assert_eq!(t.sections.len(), 2);
         // The invisible placeholder cell at (2,2).
         let invisible = t.cells.iter().filter(|c| !c.visible).count();
         assert_eq!(invisible, 1);
-        assert_eq!(t.visible_cells().count(), 20);
+        assert_eq!(t.visible_cells().count(), 21);
         // view_3d parses with its trails.
         let v = t.view_3d.as_ref().expect("view_3d present");
         assert_eq!(v.trails.len(), 4);

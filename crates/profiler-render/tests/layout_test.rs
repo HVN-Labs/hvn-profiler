@@ -99,9 +99,10 @@ fn cell_count_matches_grid_dimensions() {
     let tpl = hvn_default();
     let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 900.0));
     let rects = layout_cell_rects(&tpl, window);
-    // 7 rows × 3 cols = 21 cells, even though some are marked
-    // `visible: false` (those still reserve their grid slot).
-    assert_eq!(rects.len(), 21);
+    // v0.16.6 — grid expanded to 8 rows × 3 cols = 24 cells for the new
+    // "AP Mag" cell at row=7 col=0. Some slots are marked `visible: false`
+    // but still reserve their grid slot.
+    assert_eq!(rects.len(), 24);
 }
 
 #[test]
