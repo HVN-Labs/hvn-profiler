@@ -26,8 +26,8 @@ fn is_synthetic_drone_name(name: &str, sysid: u8) -> bool {
 
 /// Mirror of `App::drain`'s sysid canonicalisation step. Given a sample
 /// + the current `sysid_to_drone` table, return the drone-key it should
-/// route under and update the table (upgrading a synthetic canonical to a
-/// meaningful one when ZMQ arrives after MAVLink).
+///   route under and update the table (upgrading a synthetic canonical to a
+///   meaningful one when ZMQ arrives after MAVLink).
 fn route(
     sysid_to_drone: &mut HashMap<u8, String>,
     raw_name: &str,

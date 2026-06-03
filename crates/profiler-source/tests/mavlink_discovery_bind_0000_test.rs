@@ -18,7 +18,7 @@
 
 use profiler_source::{
     canonicalise_source_uri, discover_localhost_sources, DiscoveryStatus,
-    SourceKind, DEFAULT_PROBE_MS,
+    SourceKind,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

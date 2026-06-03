@@ -98,6 +98,30 @@ const STATUSTEXT_MAX: usize = 8;
 /// (`0x80`); we keep the raw constant here for the bit-test fast path.
 const MAV_MODE_FLAG_SAFETY_ARMED: u8 = 0x80;
 
+/// v0.16.5 — non-drone MAVLink peer classification.
+///
+/// Any HEARTBEAT whose `mavtype` falls into one of these buckets is treated
+/// as a ground/aux station, NOT a drone:
+///
+/// * `MAV_TYPE_GCS` (6) — Mission Planner, MAVProxy, Skybrush, our own GCS
+///   heartbeat (sysid 255).
+/// * `MAV_TYPE_ONBOARD_CONTROLLER` (18) — companion computers (often share a
+///   sysid with the FCU; the heartbeat distinguishes them by `mavtype` only).
+/// * `MAV_TYPE_ANTENNA_TRACKER` (5) — auto-tracking ground antennas that
+///   share a serial link with the vehicle.
+///
+/// When we see one of these, we (a) skip emitting any samples for that
+/// sysid (so the picker doesn't grow a `drone_255` row), and (b) skip the
+/// per-sysid `REQUEST_DATA_STREAM` latch — a GCS doesn't stream telemetry.
+fn is_gcs_mav_type(mavtype: MavType) -> bool {
+    matches!(
+        mavtype,
+        MavType::MAV_TYPE_GCS
+            | MavType::MAV_TYPE_ONBOARD_CONTROLLER
+            | MavType::MAV_TYPE_ANTENNA_TRACKER
+    )
+}
+
 /// v0.16.3 — ArduCopter `HEARTBEAT.custom_mode` → flight-mode-name lookup.
 ///
 /// Copied verbatim from DT-Python's `hil_bridge.py:_COPTER_MODE_NAMES`. The
@@ -348,6 +372,12 @@ fn recv_worker_main(
     // crate's `update_reply_destination` routes our send back to the right
     // peer on the very next `send` after a recv from that sysid.
     let mut stream_requested_for: HashSet<u8> = HashSet::new();
+    // v0.16.5 — sysids classified as non-drones by a HEARTBEAT mavtype
+    // (Mission Planner, MAVProxy, Skybrush, our own GCS heartbeat at 255).
+    // Once a sysid lands here, every subsequent frame from it is dropped —
+    // it never reaches the picker as `drone_<n>`, and we never aim a
+    // REQUEST_DATA_STREAM at it.
+    let mut gcs_sysids: HashSet<u8> = HashSet::new();
     // Whether we've published anything to `peer` yet (informational only —
     // the v0.8.0 mutex slot is retained for backwards compatibility with
     // tests that read it).
@@ -382,6 +412,31 @@ fn recv_worker_main(
                 continue;
             }
         };
+
+        // v0.16.5 — classify the sender BEFORE anything else. A HEARTBEAT
+        // with `mavtype = MAV_TYPE_GCS` (Mission Planner / MAVProxy / our
+        // own outbound heartbeat at sysid 255) means "not a drone" — we
+        // remember the sysid, log it once, and never emit a sample or
+        // stream-request for it again. Other mavtype buckets we treat as
+        // non-drones live in `is_gcs_mav_type`.
+        if let MavMessage::HEARTBEAT(hb) = &msg {
+            if is_gcs_mav_type(hb.mavtype) && gcs_sysids.insert(header.system_id) {
+                log::info!(
+                    "MavlinkSource: ignoring non-drone sysid={} (mavtype={:?} heartbeat)",
+                    header.system_id,
+                    hb.mavtype,
+                );
+            }
+        }
+        // Drop every frame whose sysid is on the non-drone list. This
+        // catches the GCS's own HEARTBEAT *and* any other message it may
+        // emit on the shared port (PARAM_REQUEST_LIST, MISSION_REQUEST,
+        // etc.).  It also blocks the per-sysid stream-request latch below,
+        // so we never aim a REQUEST_DATA_STREAM at a GCS — pointless and a
+        // potential loopback source on shared ports.
+        if gcs_sysids.contains(&header.system_id) {
+            continue;
+        }
 
         // v0.16.4 — per-sysid stream-request latch (replaces v0.8.0's
         // one-shot single-peer behaviour). On EVERY newly seen sysid in
@@ -622,7 +677,7 @@ pub fn decode_to_samples_with_drone(
 /// | MAVLink | Key(s) |
 /// |---|---|
 /// | `ATTITUDE` | `ap_attitude[0..2]` |
-/// | `RAW_IMU` | `ap_raw_imu[0..5]` (raw counts) |
+/// | `RAW_IMU` | `ap_raw_imu[0..8]` (raw counts), `mag_xyz` (Vec[3] gauss) |
 /// | `LOCAL_POSITION_NED` | `pos_ekf_ned[0..2]`, `ap_vel_ned[0..2]` |
 /// | `POSITION_TARGET_LOCAL_NED` | `pos_target_ned[0..2]` |
 /// | `VFR_HUD` | `ap_vfr_alt` |
@@ -693,6 +748,20 @@ pub fn decode_to_samples_with_state(
             s("ap_raw_imu[3]", d.xgyro as f64),
             s("ap_raw_imu[4]", d.ygyro as f64),
             s("ap_raw_imu[5]", d.zgyro as f64),
+            // v0.16.5 — primary magnetometer. AP RAW_IMU xmag/ymag/zmag are
+            // emitted in mGauss (per ArduPilot convention). DT-Python's
+            // hil_bridge emits `mag_xyz` as a Vec[3] in *gauss*; we keep wire
+            // parity by converting mGauss → gauss here so the hvn-default
+            // `mag_interference` cell (scale=1000 → mGauss display) renders
+            // identically regardless of source.
+            s("ap_raw_imu[6]", d.xmag as f64),  // raw mGauss for parity with other indices
+            s("ap_raw_imu[7]", d.ymag as f64),
+            s("ap_raw_imu[8]", d.zmag as f64),
+            make("mag_xyz", Value::Vector(vec![
+                d.xmag as f64 / 1000.0,
+                d.ymag as f64 / 1000.0,
+                d.zmag as f64 / 1000.0,
+            ])),
         ],
         MavMessage::VFR_HUD(d) => vec![s("ap_vfr_alt", d.alt as f64)],
         MavMessage::POSITION_TARGET_LOCAL_NED(d) => vec![
@@ -1074,7 +1143,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_imu_maps_to_six_indexed_keys_raw_units() {
+    fn raw_imu_maps_to_nine_indexed_keys_plus_mag_xyz_vector() {
+        // v0.16.5 — RAW_IMU now also exposes xmag/ymag/zmag at indices 6..8
+        // (raw mGauss) and a top-level `mag_xyz` Vec[3] in gauss. See
+        // `crates/profiler-source/tests/mavlink_mag_xyz_test.rs` for the
+        // deeper contract; this in-module test just pins the unit shape.
         let d = RAW_IMU_DATA {
             xacc: 10,
             yacc: 20,
@@ -1082,13 +1155,25 @@ mod tests {
             xgyro: 1,
             ygyro: -2,
             zgyro: 3,
-            // mag fields should be ignored (we only emit indices 0..5).
             xmag: 999,
+            ymag: -42,
+            zmag: 7,
             ..Default::default()
         };
         let msg = MavMessage::RAW_IMU(d);
+        let samples = decode_to_samples(&msg, 1.0);
+
+        // Nine scalar indices (acc 0..2, gyro 3..5, mag 6..8).
+        let scalars: Vec<(String, f64)> = samples
+            .iter()
+            .filter(|s| matches!(s.value, Value::Scalar(_)))
+            .map(|s| {
+                assert_eq!(s.ts, 1.0);
+                (s.key.clone(), s.scalar())
+            })
+            .collect();
         assert_eq!(
-            pairs(decode_to_samples(&msg, 1.0), 1.0),
+            scalars,
             vec![
                 ("ap_raw_imu[0]".into(), 10.0),
                 ("ap_raw_imu[1]".into(), 20.0),
@@ -1096,8 +1181,26 @@ mod tests {
                 ("ap_raw_imu[3]".into(), 1.0),
                 ("ap_raw_imu[4]".into(), -2.0),
                 ("ap_raw_imu[5]".into(), 3.0),
+                ("ap_raw_imu[6]".into(), 999.0),
+                ("ap_raw_imu[7]".into(), -42.0),
+                ("ap_raw_imu[8]".into(), 7.0),
             ]
         );
+
+        // And the `mag_xyz` Vec[3] in gauss (mGauss / 1000).
+        let mag = samples
+            .iter()
+            .find(|s| s.key == "mag_xyz")
+            .expect("mag_xyz Vec[3] sample");
+        match &mag.value {
+            Value::Vector(v) => {
+                assert_eq!(v.len(), 3);
+                assert!((v[0] - 0.999).abs() < 1e-12);
+                assert!((v[1] - (-0.042)).abs() < 1e-12);
+                assert!((v[2] - 0.007).abs() < 1e-12);
+            }
+            other => panic!("expected Value::Vector, got {other:?}"),
+        }
     }
 
     #[test]
