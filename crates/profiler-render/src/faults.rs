@@ -30,17 +30,21 @@
 //!
 //! | section | param        | range            | unit     |
 //! |---------|--------------|------------------|----------|
-//! | GPS     | sigma_p      | 0 … 5            | m        |
-//! | GPS     | sigma_v      | 0 … 1            | m/s      |
-//! | GPS     | _e[N/E/D]    | ±20              | m        |
-//! | IMU     | b_a[x/y/z]   | ±2               | m/s²     |
-//! | IMU     | b_g[x/y/z]   | ±0.1             | rad/s    |
-//! | IMU     | sigma_a_n    | 0 … 0.05         |          |
-//! | IMU     | sigma_g_n    | 0 … 0.05         |          |
-//! | Mag     | hard_iron x/y/z | ±0.5          | G        |
-//! | Mag     | sigma x/y/z  | 0 … 0.05         | G        |
-//! | Baro    | bias_pa      | ±500             | Pa       |
-//! | Baro    | sigma_pa     | 0 … 20           | Pa       |
+//! | GPS     | sigma_p        | 0 … 5            | m        |
+//! | GPS     | sigma_v        | 0 … 1            | m/s      |
+//! | GPS     | _e[N/E/D]      | ±20              | m        |
+//! | GPS     | sats_base      | 0 … 40           |          |
+//! | GPS     | fix_override   | -1 … 6           | enum     |
+//! | GPS     | cep_pvt_h/v    | 0 … 10           | m        |
+//! | GPS     | cep_rtk_h/v    | 0 … 0.1          | m        |
+//! | IMU     | b_a[x/y/z]     | ±2               | m/s²     |
+//! | IMU     | b_g[x/y/z]     | ±0.1             | rad/s    |
+//! | IMU     | sigma_a_n      | 0 … 0.05         |          |
+//! | IMU     | sigma_g_n      | 0 … 0.05         |          |
+//! | Mag     | hard_iron x/y/z | ±0.5            | G        |
+//! | Mag     | sigma x/y/z    | 0 … 0.05         | G        |
+//! | Baro    | bias_pa        | ±500             | Pa       |
+//! | Baro    | sigma_pa_rms   | 0 … 20           | Pa       |
 //!
 //! These match the SITL UI's safety bounds. The brief asked for `±1e9` —
 //! we honour the request via `ui.add(DragValue)` next to each slider, so
@@ -109,6 +113,14 @@ pub struct FaultsPanelState {
     pub gps_bias_e: f32,
     pub gps_bias_d: f32,
 
+    // GPS — DT extended params (fault_schema.json)
+    pub gps_sats_base: f32,     // 0…40
+    pub gps_fix_override: i32,  // -1 (auto) … 6 (RTK fixed)
+    pub gps_cep_pvt_h: f32,     // 0…10 m
+    pub gps_cep_pvt_v: f32,     // 0…10 m
+    pub gps_cep_rtk_h: f32,     // 0…0.1 m
+    pub gps_cep_rtk_v: f32,     // 0…0.1 m
+
     // IMU sliders
     pub imu_b_a_x: f32,
     pub imu_b_a_y: f32,
@@ -129,7 +141,7 @@ pub struct FaultsPanelState {
 
     // Baro sliders
     pub baro_bias_pa: f32,
-    pub baro_sigma_pa: f32,
+    pub baro_sigma_pa_rms: f32,
 
     // Debounce bookkeeping: per-feature "dirty since" time. The render loop
     // pushes the section into `pending` once `now - dirty_since ≥ debounce`.
@@ -166,6 +178,12 @@ impl Default for FaultsPanelState {
             gps_bias_n: 0.0,
             gps_bias_e: 0.0,
             gps_bias_d: 0.0,
+            gps_sats_base: 32.0,
+            gps_fix_override: -1,
+            gps_cep_pvt_h: 1.5,
+            gps_cep_pvt_v: 2.0,
+            gps_cep_rtk_h: 0.01,
+            gps_cep_rtk_v: 0.02,
             imu_b_a_x: 0.0,
             imu_b_a_y: 0.0,
             imu_b_a_z: 0.0,
@@ -181,7 +199,7 @@ impl Default for FaultsPanelState {
             mag_sigma_y: 0.0,
             mag_sigma_z: 0.0,
             baro_bias_pa: 0.0,
-            baro_sigma_pa: 0.0,
+            baro_sigma_pa_rms: 0.0,
             gps_dirty_since: None,
             imu_dirty_since: None,
             mag_dirty_since: None,
@@ -263,6 +281,12 @@ impl FaultsPanelState {
                 Value::from(self.gps_bias_d as f64),
             ]),
         );
+        m.insert("sats_base".into(), Value::from(self.gps_sats_base as f64));
+        m.insert("fix_override".into(), Value::from(self.gps_fix_override as i64));
+        m.insert("cep_pvt_h".into(), Value::from(self.gps_cep_pvt_h as f64));
+        m.insert("cep_pvt_v".into(), Value::from(self.gps_cep_pvt_v as f64));
+        m.insert("cep_rtk_h".into(), Value::from(self.gps_cep_rtk_h as f64));
+        m.insert("cep_rtk_v".into(), Value::from(self.gps_cep_rtk_v as f64));
         m
     }
 
@@ -320,7 +344,7 @@ impl FaultsPanelState {
         // `solder_drift_pa` (the matplotlib panel's name). We send the
         // canonical `bias_pa`; the receiver merges by attribute name.
         m.insert("bias_pa".into(), Value::from(self.baro_bias_pa as f64));
-        m.insert("sigma_pa".into(), Value::from(self.baro_sigma_pa as f64));
+        m.insert("sigma_pa_rms".into(), Value::from(self.baro_sigma_pa_rms as f64));
         m
     }
 
@@ -415,6 +439,23 @@ pub fn render_faults_panel(
         dirty |= slider(ui, "bias N (m)", &mut state.gps_bias_n, -20.0, 20.0);
         dirty |= slider(ui, "bias E (m)", &mut state.gps_bias_e, -20.0, 20.0);
         dirty |= slider(ui, "bias D (m)", &mut state.gps_bias_d, -20.0, 20.0);
+        dirty |= slider(ui, "sats_base", &mut state.gps_sats_base, 0.0, 40.0);
+        ui.horizontal(|ui| {
+            ui.label("fix_override");
+            let r = ui.add(egui::DragValue::new(&mut state.gps_fix_override).range(-1..=6));
+            ui.label(
+                egui::RichText::new(fix_override_label(state.gps_fix_override))
+                    .small()
+                    .color(egui::Color32::from_gray(160)),
+            );
+            if r.changed() {
+                dirty = true;
+            }
+        });
+        dirty |= slider(ui, "cep_pvt_h (m)", &mut state.gps_cep_pvt_h, 0.0, 10.0);
+        dirty |= slider(ui, "cep_pvt_v (m)", &mut state.gps_cep_pvt_v, 0.0, 10.0);
+        dirty |= slider(ui, "cep_rtk_h (m)", &mut state.gps_cep_rtk_h, 0.0, 0.1);
+        dirty |= slider(ui, "cep_rtk_v (m)", &mut state.gps_cep_rtk_v, 0.0, 0.1);
         if dirty {
             FaultsPanelState::touch(&mut state.gps_dirty_since, now_s);
         }
@@ -428,6 +469,12 @@ pub fn render_faults_panel(
                 state.gps_bias_n = 0.0;
                 state.gps_bias_e = 0.0;
                 state.gps_bias_d = 0.0;
+                state.gps_sats_base = 32.0;
+                state.gps_fix_override = -1;
+                state.gps_cep_pvt_h = 1.5;
+                state.gps_cep_pvt_v = 2.0;
+                state.gps_cep_rtk_h = 0.01;
+                state.gps_cep_rtk_v = 0.02;
                 state.gps_dirty_since = None;
                 out.push(reset_cmd("gps", &state.drone));
             }
@@ -500,14 +547,14 @@ pub fn render_faults_panel(
     ui.collapsing("Barometer", |ui| {
         let mut dirty = false;
         dirty |= slider(ui, "bias (Pa)", &mut state.baro_bias_pa, -500.0, 500.0);
-        dirty |= slider(ui, "σ (Pa)", &mut state.baro_sigma_pa, 0.0, 20.0);
+        dirty |= slider(ui, "σ_pa_rms (Pa)", &mut state.baro_sigma_pa_rms, 0.0, 20.0);
         if dirty {
             FaultsPanelState::touch(&mut state.baro_dirty_since, now_s);
         }
         ui.horizontal(|ui| {
             if ui.button("Reset Baro").clicked() {
                 state.baro_bias_pa = 0.0;
-                state.baro_sigma_pa = 0.0;
+                state.baro_sigma_pa_rms = 0.0;
                 state.baro_dirty_since = None;
                 out.push(reset_cmd("baro", &state.drone));
             }
@@ -652,6 +699,19 @@ fn reset_cmd(feature: &str, drone: &str) -> PendingCommand {
         args: HashMap::new(),
         reset: true,
         label: format!("reset_{feature}"),
+    }
+}
+
+fn fix_override_label(v: i32) -> &'static str {
+    match v {
+        -1 => "auto",
+        0 | 1 => "no fix",
+        2 => "2D fix",
+        3 => "3D fix",
+        4 => "DGPS",
+        5 => "RTK Float",
+        6 => "RTK Fixed",
+        _ => "?",
     }
 }
 
