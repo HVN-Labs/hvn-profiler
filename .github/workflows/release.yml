@@ -66,8 +66,23 @@ jobs:
             zip -r ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
           fi
 
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=${{ github.ref_name }}" `
+            installer\hvn-profiler.iss
+          # produces dist\hvn-profiler-Setup-<tag>.exe
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.artifact }}.zip
+          # The Setup-*.exe glob only matches on the Windows job; other OSes
+          # skip it (fail_on_unmatched_files: false).
+          files: |
+            dist/${{ matrix.artifact }}.zip
+            dist/hvn-profiler-Setup-*.exe
+          fail_on_unmatched_files: false
           generate_release_notes: true
