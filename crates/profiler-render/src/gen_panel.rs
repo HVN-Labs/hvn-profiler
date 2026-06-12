@@ -117,7 +117,7 @@ pub fn apply_to_faults(target: &str, value: f32, s: &mut FaultsPanelState) {
         "mag.sigma.z" => s.mag_sigma_z = value,
         // Baro
         "baro.bias_pa" => s.baro_bias_pa = value,
-        "baro.sigma_pa" => s.baro_sigma_pa = value,
+        "baro.sigma_pa_rms" => s.baro_sigma_pa_rms = value,
         _ => {
             log::debug!("apply_to_faults: unknown target {target}");
         }
