@@ -41,8 +41,8 @@
 //! | IMU     | b_g[x/y/z]     | ±0.1             | rad/s    |
 //! | IMU     | sigma_a_n      | 0 … 0.05         |          |
 //! | IMU     | sigma_g_n      | 0 … 0.05         |          |
-//! | Mag     | hard_iron x/y/z | ±0.5            | G        |
-//! | Mag     | sigma x/y/z    | 0 … 0.05         | G        |
+//! | Mag     | hard_iron x/y/z | ±500            | mG       |
+//! | Mag     | sigma x/y/z    | 0 … 50           | mG       |
 //! | Baro    | bias_pa        | ±500             | Pa       |
 //! | Baro    | sigma_pa_rms   | 0 … 20           | Pa       |
 //!
@@ -517,12 +517,12 @@ pub fn render_faults_panel(
     // ── Mag ─────────────────────────────────────────────────────────
     ui.collapsing("Magnetometer", |ui| {
         let mut dirty = false;
-        dirty |= slider(ui, "hard-iron x (G)", &mut state.mag_hi_x, -0.5, 0.5);
-        dirty |= slider(ui, "hard-iron y (G)", &mut state.mag_hi_y, -0.5, 0.5);
-        dirty |= slider(ui, "hard-iron z (G)", &mut state.mag_hi_z, -0.5, 0.5);
-        dirty |= slider(ui, "σ x (G)", &mut state.mag_sigma_x, 0.0, 0.05);
-        dirty |= slider(ui, "σ y (G)", &mut state.mag_sigma_y, 0.0, 0.05);
-        dirty |= slider(ui, "σ z (G)", &mut state.mag_sigma_z, 0.0, 0.05);
+        dirty |= slider(ui, "hard-iron x (mG)", &mut state.mag_hi_x, -500.0, 500.0);
+        dirty |= slider(ui, "hard-iron y (mG)", &mut state.mag_hi_y, -500.0, 500.0);
+        dirty |= slider(ui, "hard-iron z (mG)", &mut state.mag_hi_z, -500.0, 500.0);
+        dirty |= slider(ui, "σ x (mG)", &mut state.mag_sigma_x, 0.0, 50.0);
+        dirty |= slider(ui, "σ y (mG)", &mut state.mag_sigma_y, 0.0, 50.0);
+        dirty |= slider(ui, "σ z (mG)", &mut state.mag_sigma_z, 0.0, 50.0);
         if dirty {
             FaultsPanelState::touch(&mut state.mag_dirty_since, now_s);
         }
@@ -671,7 +671,7 @@ fn imu_freeze_cmd(drone: &str) -> PendingCommand {
 }
 
 fn mag_spike_cmd(drone: &str) -> PendingCommand {
-    // Mag spike → step the X-axis hard-iron up by +1 G for 5 s.
+    // Mag spike → step the X-axis hard-iron up by +1000 mG (= 1 G) for 5 s.
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("target".into(), Value::from("mag"));
     args.insert("param".into(), Value::from("hard_iron"));
@@ -680,7 +680,7 @@ fn mag_spike_cmd(drone: &str) -> PendingCommand {
     args.insert("t_duration".into(), Value::from(5.0));
     args.insert("axis".into(), Value::from(0));
     let mut prof = serde_json::Map::new();
-    prof.insert("amp".into(), Value::from(1.0));
+    prof.insert("amp".into(), Value::from(1000.0));
     args.insert("params".into(), Value::Object(prof));
     PendingCommand {
         feature: "fault".into(),
