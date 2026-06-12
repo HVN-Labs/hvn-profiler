@@ -1,0 +1,57 @@
+{
+  "name": "mag-debug",
+  "description": "Magnetometer / EKF debug layout (v0.16.9). AP reports the field in GAUSS, so every mag source carries scale=1000.0 -> milligauss: a clean earth field reads ~490, calibration-inflated drones ~640-660. Attitude sources carry transform=rad_to_deg. Fallback keys (mag_xyz / euler) let the same layout work against the DT msgpack stream as well as direct MAVLink.",
+  "grid": {"rows": 2, "cols": 2},
+  "cells": [
+    {
+      "row": 0, "col": 0,
+      "title": "|MAG| total field [mGauss]",
+      "primitive": "magnitude",
+      "sources": [
+        {"key": "ap_mag_xyz", "fallback": "mag_xyz", "scale": 1000.0, "label": "|B|", "color": "C0", "lw": 1.0}
+      ],
+      "label_metadata": {"source_path": "RAW_IMU.xmag/ymag/zmag", "units": "mGauss (= gauss x 1000)"},
+      "label_mode": "off"
+    },
+    {
+      "row": 0, "col": 1,
+      "title": "AP Mag mx/my/mz [mGauss]",
+      "primitive": "vector",
+      "sources": [
+        {"key": "ap_mag_xyz", "fallback": "mag_xyz", "scale": 1000.0,
+         "components": [
+           {"label": "mx", "color": "C3", "lw": 0.8},
+           {"label": "my", "color": "C4", "lw": 0.8},
+           {"label": "mz", "color": "C5", "lw": 0.8}
+         ]
+        }
+      ],
+      "legend": {"fontsize": 6, "loc": "upper left", "ncol": 3},
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 0,
+      "title": "EKF compass variance",
+      "primitive": "scalar",
+      "sources": [{"key": "ekf_compv", "color": "C1", "lw": 1.0}],
+      "label_metadata": {"source_path": "EKF_STATUS_REPORT.compass_variance", "units": "normalised"},
+      "label_mode": "off"
+    },
+    {
+      "row": 1, "col": 1,
+      "title": "Attitude [deg]",
+      "primitive": "vector",
+      "sources": [
+        {"key": "ap_attitude", "fallback": "euler", "transform": "rad_to_deg",
+         "components": [
+           {"label": "roll",  "color": "C0", "lw": 0.9},
+           {"label": "pitch", "color": "C1", "lw": 0.9},
+           {"label": "yaw",   "color": "C2", "lw": 0.9}
+         ]
+        }
+      ],
+      "legend": {"fontsize": 6, "loc": "upper left", "ncol": 3},
+      "label_mode": "off"
+    }
+  ]
+}

@@ -40,6 +40,14 @@ pub const HVN_DEFAULT_JSON: &str =
 pub const REAL_DRONE_JSON: &str =
     include_str!("../../../templates/real-drone.json");
 
+/// v0.16.9 — Raw JSON for the mag-debug template (bundled). A 2x2 magnetometer
+/// / EKF debug layout: |MAG| total field + mx/my/mz (both scaled gauss->mGauss
+/// so a clean earth field reads ~490 and calibration-inflated drones ~640-660),
+/// EKF compass variance, and attitude in degrees. Built to investigate the
+/// calibration-vs-ambient-field mismatch class of incidents.
+pub const MAG_DEBUG_JSON: &str =
+    include_str!("../../../templates/mag-debug.json");
+
 /// v0.14.0 — Name of the implicit-default bundled template when no
 /// `--template` is supplied and no recently-used user template exists.
 /// Always present in [`BUNDLED`] and at index 0.
@@ -62,6 +70,10 @@ pub const BUNDLED: &[BundledTemplate] = &[
     BundledTemplate {
         name: "real-drone",
         json: REAL_DRONE_JSON,
+    },
+    BundledTemplate {
+        name: "mag-debug",
+        json: MAG_DEBUG_JSON,
     },
 ];
 
@@ -89,6 +101,7 @@ mod tests {
         assert!(by_name("tutorial").is_some());
         assert!(by_name("hvn-default").is_some());
         assert!(by_name("real-drone").is_some());
+        assert!(by_name("mag-debug").is_some());
         assert!(by_name("does-not-exist").is_none());
     }
 
